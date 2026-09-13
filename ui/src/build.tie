@@ -56,11 +56,18 @@ func touched(node: i64) -> bool {
     return g_touch[node] == 1
 }
 
-// 帧开始：清空父栈与触达标记（树须已 reset 或延续上帧树）
+// 帧开始：清空父栈与触达标记（树须已 reset 或延续上帧树）。
+// 树为空（reset 后尚未挂载）→ 同时清空上帧记录，避免跨场景节点 id 复用
+// 时与旧帧 (parent, slot) 错配。
 pub func begin() {
     g_pstack = table_new_i64()
     g_ptop = 0
     g_touch = table_new_i64()
+    if tiu_tree.root() < 0 {
+        g_prev_parent = table_new_i64()
+        g_prev_slot = table_new_i64()
+        g_prev_node = table_new_i64()
+    }
 }
 
 // 打开一个节点：在父栈栈顶下挂载/复用。首次调用创建根（父 = -1）。

@@ -1,0 +1,183 @@
+type tie<logic>
+// probe_layout: 布局引擎探针（约束传递 / flex row-column / 绝对定位 / 局部重排）
+import "../ui/src/build.tie"
+import "../ui/src/layout.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 矩形断言：id 的 rect == (x,y,w,h)
+func rect_eq(id: i64, x: i64, y: i64, w: i64, h: i64, label: string) {
+    var r = tiu_tree.rect(id)
+    if r.x == x && r.y == y && r.w == w && r.h == h {
+        println("PASS " + label)
+    } else {
+        println("FAIL " + label)
+        fails = fails + 1
+    }
+}
+
+func child_at(root: i64, n: i64) -> i64 {
+    var c = tiu_tree.first_child(root)
+    var k: i64 = 0
+    while k < n {
+        c = tiu_tree.next_sibling(c)
+        k = k + 1
+    }
+    return c
+}
+
+func main() {
+    // ---------- 1) 简单 Column：Text("AB") + Text("hello") ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 5, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    var root = tiu_tree.root()
+    var c1 = Constraints.loose()
+    tiu_layout.layout(root, c1)
+    rect_eq(root, 0, 0, 40, 32, "column loose: (0,0,40,32)")
+    rect_eq(child_at(root, 0), 0, 0, 16, 16, "column child0: (0,0,16,16)")
+    rect_eq(child_at(root, 1), 0, 16, 40, 16, "column child1: (0,16,40,16)")
+
+    // ---------- 2) 嵌套：Column > [Row > [Text, Text], Text] ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Row, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 3, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c2 = Constraints.loose()
+    tiu_layout.layout(root, c2)
+    var row = child_at(root, 0)
+    rect_eq(root, 0, 0, 24, 32, "nested column: (0,0,24,32)")
+    rect_eq(row, 0, 0, 16, 16, "nested row: (0,0,16,16)")
+    rect_eq(child_at(row, 0), 0, 0, 8, 16, "row child0: (0,0,8,16)")
+    rect_eq(child_at(row, 1), 8, 0, 8, 16, "row child1: (8,0,8,16)")
+    rect_eq(child_at(root, 1), 0, 16, 24, 16, "column child1: (0,16,24,16)")
+
+    // ---------- 3) flex 约束下传：Column(max_w=30) 内 Text(5) 被钳制 ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 5, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c30 = Constraints.loose()
+    c30.max_w = 30
+    tiu_layout.layout(root, c30)
+    rect_eq(root, 0, 0, 30, 16, "clamped column: (0,0,30,16)")
+    rect_eq(child_at(root, 0), 0, 0, 30, 16, "clamped text: (0,0,30,16)")
+
+    // ---------- 4) 绝对定位：Column > Absolute(20x10 @ 5,7) ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Absolute, 0, 1, 0, 5, 7, 20, 10)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c4 = Constraints.loose()
+    tiu_layout.layout(root, c4)
+    rect_eq(child_at(root, 0), 5, 7, 20, 10, "absolute child: (5,7,20,10)")
+
+    // ---------- 5) 固定约束（tight）：Text 显式 50x20 ----------
+    // 语义：Column 收到 tight(50,20) → 子宽下传 tight(50)、高自适应（内容 16）；
+    // Column 自身按 min 钳制到 20 高。
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c5 = Constraints.tight(50, 20)
+    tiu_layout.layout(root, c5)
+    rect_eq(root, 0, 0, 50, 20, "tight root: (0,0,50,20)")
+    rect_eq(child_at(root, 0), 0, 0, 50, 16, "tight text: (0,0,50,16)")
+
+    // ---------- 6) 幂等：同输入两次布局结果一致 ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Button, 0, 1, 3, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c6 = Constraints.loose()
+    tiu_layout.layout(root, c6)
+    var r1 = tiu_tree.rect(root)
+    tiu_layout.layout(root, c6)
+    var r2 = tiu_tree.rect(root)
+    check(r1.w == 40 && r1.h == 40, "button+text column (40x40)")
+    check(r1.x == r2.x && r1.y == r2.y && r1.w == r2.w && r1.h == r2.h,
+        "layout idempotent (same in -> same out)")
+    check(tiu_layout.laid_out(root) == 1, "layout cache version recorded")
+
+    // ---------- 7) 局部重排：改 Text(1)→Text(4)，只重算脏子树 ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 3, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    root = tiu_tree.root()
+    var c7 = Constraints.loose()
+    tiu_layout.layout(root, c7)
+    var ta = child_at(root, 0)
+    var tb = child_at(root, 1)
+    var rA = tiu_tree.rect(ta)
+    var rB = tiu_tree.rect(tb)
+    check(rA.w == 8 && rB.w == 24, "pre-edit rects (8, 24)")
+    // 修改 Text(1) → Text(4)（ver+1，data 4）
+    tiu_tree.set_props(ta, 2, 4, 0, 0, 0, 0)
+    var dirty = table_new_i64()
+    table_push(dirty, ta)
+    tiu_layout.layout_dirty(root, dirty)
+    var rA2 = tiu_tree.rect(ta)
+    var rB2 = tiu_tree.rect(tb)
+    var rRoot2 = tiu_tree.rect(root)
+    check(rA2.w == 32 && rA2.h == 16 && rA2.x == 0 && rA2.y == 0,
+        "dirty text re-measured: (0,0,32,16)")
+    check(rB2.x == 0 && rB2.y == 16 && rB2.w == 24 && rB2.h == 16,
+        "sibling text untouched: (0,16,24,16) (cached)")
+    check(rRoot2.w == 32 && rRoot2.h == 32, "column re-measured: (0,0,32,32)")
+
+    if fails > 0 {
+        println("PROBE_LAYOUT FAIL " + to_string(fails))
+        exit(1)
+    } else {
+        println("PROBE_LAYOUT PASS")
+    }
+}

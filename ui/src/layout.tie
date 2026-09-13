@@ -1,0 +1,319 @@
+type tie<class>
+// layout.tie —— tiu 组合式布局引擎（p.9.4.2 模块三）
+// EN: constraint-based composable layout — single-pass constraint propagation,
+// three constraint tiers, flex row/column + absolute, localized relayout.
+// ============================================================
+// 依据：docs/designs/tiu-ui-widgets.md §5（单趟约束传播、三档约束、局部重排、
+// 幂等、布局缓存）。
+// 语义：
+//   - 约束三档：宽松（内容自适应，上限 BIG）/ 紧凑 tight（min==max==显式）/
+//     固定（子节点 fw/fh > 0 覆盖约束）。
+//   - Row：子横排（内容宽累加），行高约束下传；Column：子纵排（内容高累加），
+//     列宽约束下传；Absolute：子按自身 ox/oy 偏移（尺寸靠 fw/fh 或父约束）。
+//   - 度量简化（本模块独占，不产字形）：Text 字宽 8/行高 16；Button 内容 + 内边距。
+//   - 局部重排：layout_dirty(root, c, dirty) 只重算脏节点及其祖先链；未脏子树
+//     整块沿用缓存矩形（零重算），帧间 O(变化)。
+//   - 幂等：同约束 + 同 props → 同布局（gold 断言）；布局结果只写骨架矩形，
+//     不回写 props。
+// 三趟：约束传播（前序）→ measure（后序，倒 DFS）→ place（前序）。
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\layout.tie（探针见 tests/）
+
+import "./tree.tie"
+
+const LAYOUT_BIG: i64 = 1000000
+
+// 约束（父给子的 [min, max] 区间；宽松 = 0..BIG）
+struct Constraints {
+    var min_w: i64 = 0
+    var max_w: i64 = 0
+    var min_h: i64 = 0
+    var max_h: i64 = 0
+}
+
+// ---- 布局状态（全局；帧复用）----
+var g_cminw: table<i64> = []   // 每节点输入约束（约束传播趟写）
+var g_cmaxw: table<i64> = []
+var g_cminh: table<i64> = []
+var g_cmaxh: table<i64> = []
+var g_reflow: table<i64> = []  // 重排标记（1 = 脏节点或其祖先，须重算）
+var g_lver: table<i64> = []    // 每节点上次布局时的 props 版本号（布局缓存）
+
+namespace Constraints {
+// 宽松：内容自适应（默认档）
+pub func loose() -> Constraints {
+    return Constraints(0, LAYOUT_BIG, 0, LAYOUT_BIG)
+}
+
+// 紧凑 / 固定：min == max == 显式尺寸
+pub func tight(w: i64, h: i64) -> Constraints {
+    return Constraints(w, w, h, h)
+}
+
+// 固定宽 + 宽松高
+pub func fixed_w(w: i64) -> Constraints {
+    return Constraints(w, w, 0, LAYOUT_BIG)
+}
+
+// 固定高 + 宽松宽
+pub func fixed_h(h: i64) -> Constraints {
+    return Constraints(0, LAYOUT_BIG, h, h)
+}
+}
+
+namespace tiu_layout {
+// 内部：读取节点输入约束
+func c_of(n: i64) -> Constraints {
+    return Constraints(g_cminw[n], g_cmaxw[n], g_cminh[n], g_cmaxh[n])
+}
+
+// 内部：扩展表长度至 idx（下标写安全）
+func ensure_len(t: ref table<i64>, idx: i64) {
+    while len(t) <= idx {
+        table_push(t, 0)
+    }
+}
+
+// 内部：标记节点及其全部祖先为重排
+func mark_reflow(n: i64) {
+    var cur = n
+    while cur >= 0 {
+        ensure_len(g_reflow, cur)
+        g_reflow[cur] = 1
+        cur = tiu_tree.parent_of(cur)
+    }
+}
+
+// 内部：由父类型为子生成约束（三档 + 固定覆盖）
+// 注：struct 形参在 tie 现行实现中不可链式传递，约束一律经全局表往返，
+// 本函数只返回单层 struct（调用处立即存变量）。
+func child_constraints(parent: i64, child: i64) -> Constraints {
+    var c = Constraints.loose()
+    var pty = tiu_tree.ty_of(parent)
+    if pty == 0 {
+        // Row：宽内容自适应；高继承父约束（行高下传）
+        var pc = c_of(parent)
+        c.min_h = pc.min_h
+        c.max_h = pc.max_h
+    } else if pty == 1 {
+        // Column：高内容自适应；宽继承父约束（列宽下传）
+        var pc = c_of(parent)
+        c.min_w = pc.min_w
+        c.max_w = pc.max_w
+    }
+    // 固定覆盖（显式 fw/fh 优先于父约束）
+    var fw = tiu_tree.fix_w(child)
+    var fh = tiu_tree.fix_h(child)
+    if fw > 0 {
+        c.min_w = fw
+        c.max_w = fw
+    }
+    if fh > 0 {
+        c.min_h = fh
+        c.max_h = fh
+    }
+    return Constraints(c.min_w, c.max_w, c.min_h, c.max_h)
+}
+
+// 内部：约束传播（前序 DFS；只处理重排节点；父先于子）。
+// 根约束已由 layout() 落全局表，本函数不再接收 Constraints 形参。
+func propagate(root: i64) {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        if n != root {
+            if g_reflow[n] == 1 {
+                var cc = child_constraints(tiu_tree.parent_of(n), n)
+                ensure_len(g_cminw, n)
+                ensure_len(g_cmaxw, n)
+                ensure_len(g_cminh, n)
+                ensure_len(g_cmaxh, n)
+                g_cminw[n] = cc.min_w
+                g_cmaxw[n] = cc.max_w
+                g_cminh[n] = cc.min_h
+                g_cmaxh[n] = cc.max_h
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 内部：measure（后序 = 倒 DFS；只处理重排节点；写尺寸 g_w/g_h）
+func measure(root: i64) {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = len(order) - 1
+    while i >= 0 {
+        var n = order[i]
+        if g_reflow[n] == 1 {
+            measure_node(n)
+        }
+        i = i - 1
+    }
+}
+
+// 内部：单节点内容尺寸解析 + 约束钳制（结果写 g_w/g_h）
+func measure_node(n: i64) {
+    var ty = tiu_tree.ty_of(n)
+    var c = c_of(n)
+    var cw: i64 = 0
+    var ch: i64 = 0
+    if ty == 2 {
+        // Text：简化度量 8/16（本模块独占，不产字形）
+        cw = 8 * tiu_tree.text_len(n)
+        ch = 16
+    } else if ty == 3 {
+        // Button：内容 + 内边距 8
+        cw = 8 * tiu_tree.text_len(n) + 16
+        ch = 24
+    } else if ty == 0 {
+        // Row：宽 = Σ子宽；高 = max 子高
+        var s: i64 = 0
+        var mx: i64 = 0
+        var k = tiu_tree.first_child(n)
+        while k >= 0 {
+            var rk = tiu_tree.rect(k)
+            s = s + rk.w
+            if rk.h > mx {
+                mx = rk.h
+            }
+            k = tiu_tree.next_sibling(k)
+        }
+        cw = s
+        ch = mx
+    } else if ty == 1 {
+        // Column：宽 = max 子宽；高 = Σ子高
+        var s: i64 = 0
+        var mx: i64 = 0
+        var k = tiu_tree.first_child(n)
+        while k >= 0 {
+            var rk = tiu_tree.rect(k)
+            if rk.w > mx {
+                mx = rk.w
+            }
+            s = s + rk.h
+            k = tiu_tree.next_sibling(k)
+        }
+        cw = mx
+        ch = s
+    }
+    // Absolute：内容 0（尺寸靠 fw/fh 或父约束钳制）
+    // 约束钳制 [min, max]
+    if cw < c.min_w {
+        cw = c.min_w
+    }
+    if cw > c.max_w {
+        cw = c.max_w
+    }
+    if ch < c.min_h {
+        ch = c.min_h
+    }
+    if ch > c.max_h {
+        ch = c.max_h
+    }
+    var r = tiu_tree.rect(n)
+    tiu_tree.set_rect(n, r.x, r.y, cw, ch)
+    ensure_len(g_lver, n)
+    g_lver[n] = tiu_tree.ver_of(n)
+}
+
+// 内部：place（前序 DFS；写子位置；非重排节点重写同值 = 幂等）
+// 定位规则：Absolute 子按自身 ox/oy 偏移定位（相对父内容区）；其余子按父
+// flex 规则（Row 横排 / Column 纵排）；父非 flex 容器（如 Absolute）时子也
+// 按自身偏移（默认 0）。
+func place(root: i64) {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        var ty = tiu_tree.ty_of(n)
+        var rn = tiu_tree.rect(n)
+        if ty == 0 {
+            // Row：横排，x 累加，y = 父 y
+            var cx: i64 = 0
+            var k = tiu_tree.first_child(n)
+            while k >= 0 {
+                var rk = tiu_tree.rect(k)
+                if tiu_tree.ty_of(k) == 4 {
+                    tiu_tree.set_rect(k, rn.x + tiu_tree.off_x(k), rn.y + tiu_tree.off_y(k), rk.w, rk.h)
+                } else {
+                    tiu_tree.set_rect(k, rn.x + cx, rn.y, rk.w, rk.h)
+                    cx = cx + rk.w
+                }
+                k = tiu_tree.next_sibling(k)
+            }
+        } else if ty == 1 {
+            // Column：纵排，y 累加，x = 父 x
+            var cy: i64 = 0
+            var k = tiu_tree.first_child(n)
+            while k >= 0 {
+                var rk = tiu_tree.rect(k)
+                if tiu_tree.ty_of(k) == 4 {
+                    tiu_tree.set_rect(k, rn.x + tiu_tree.off_x(k), rn.y + tiu_tree.off_y(k), rk.w, rk.h)
+                } else {
+                    tiu_tree.set_rect(k, rn.x, rn.y + cy, rk.w, rk.h)
+                    cy = cy + rk.h
+                }
+                k = tiu_tree.next_sibling(k)
+            }
+        } else if ty == 4 {
+            // Absolute 容器：子按自身 ox/oy 偏移
+            var k = tiu_tree.first_child(n)
+            while k >= 0 {
+                var rk = tiu_tree.rect(k)
+                tiu_tree.set_rect(k, rn.x + tiu_tree.off_x(k), rn.y + tiu_tree.off_y(k), rk.w, rk.h)
+                k = tiu_tree.next_sibling(k)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// 全量布局：根约束 c，根位于 (0, 0)。Constraints 仅在此单层接收（struct 形参
+// 不可链式传递的 tie 现行约束），随后经全局表驱动三趟。
+pub func layout(root: i64, c: Constraints) {
+    ensure_len(g_cminw, root)
+    ensure_len(g_cmaxw, root)
+    ensure_len(g_cminh, root)
+    ensure_len(g_cmaxh, root)
+    g_cminw[root] = c.min_w
+    g_cmaxw[root] = c.max_w
+    g_cminh[root] = c.min_h
+    g_cmaxh[root] = c.max_h
+    var dirty = table_new_i64()
+    layout_dirty(root, dirty)
+}
+
+// 局部重排：只重算脏节点及其祖先链；未脏子树整块沿用缓存矩形。
+// 根约束须先经 layout() 落全局表（或复用上次布局的根约束）。
+pub func layout_dirty(root: i64, dirty: table<i64>) {
+    // 1) 清重排标记
+    g_reflow = table_new_i64()
+    // 2) 标记：dirty 为空 = 全量（全部节点重排）；否则标记脏节点祖先链
+    if len(dirty) == 0 {
+        var order = tiu_tree.dfs_order()
+        var i: i64 = 0
+        while i < len(order) {
+            mark_reflow(order[i])
+            i = i + 1
+        }
+    } else {
+        var i: i64 = 0
+        while i < len(dirty) {
+            mark_reflow(dirty[i])
+            i = i + 1
+        }
+    }
+    // 3) 三趟（约束传播 → measure → place）
+    propagate(root)
+    measure(root)
+    place(root)
+}
+
+// 布局缓存版本：节点最近一次布局时的 props 版本号（0 = 从未布局）
+pub func laid_out(id: i64) -> i64 {
+    if id >= len(g_lver) {
+        return 0
+    }
+    return g_lver[id]
+}
+}

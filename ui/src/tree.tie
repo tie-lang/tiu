@@ -148,7 +148,8 @@ pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     return id
 }
 
-// 卸载：把 id 及其整个子树标记为 dead（迭代，无递归）。
+// 卸载：把 id 及其整个子树标记为 dead（迭代，无递归），并从父的兄弟链中摘除
+// （活节点兄弟链保持纯净——DFS/布局/命中只走活链）。
 pub func unmount(id: i64) {
     if id < 0 {
         return
@@ -161,17 +162,43 @@ pub func unmount(id: i64) {
     }
     var st = table_new_i64()
     var top: i64 = 0
-    table_push(st, id)
-    while top < len(st) {
+    table_push(st, -1)
+    st[0] = id
+    top = 1
+    while top > 0 {
+        top = top - 1
         var cur = st[top]
-        top = top + 1
         g_dead[cur] = 1
         var c = g_first[cur]
         while c >= 0 {
             if g_dead[c] == 0 {
-                table_push(st, c)
+                if top == len(st) {
+                    table_push(st, c)
+                } else {
+                    st[top] = c
+                }
+                top = top + 1
             }
             c = g_next[c]
+        }
+    }
+    // 从父的兄弟链摘除 id
+    var p = g_parents[id]
+    if p >= 0 {
+        var found: bool = false
+        var prev: i64 = -1
+        var sib = g_first[p]
+        while sib >= 0 && !found {
+            if sib == id {
+                if prev < 0 {
+                    g_first[p] = g_next[id]
+                } else {
+                    g_next[prev] = g_next[id]
+                }
+                found = true
+            }
+            prev = sib
+            sib = g_next[sib]
         }
     }
 }
@@ -234,6 +261,23 @@ pub func next_sibling(id: i64) -> i64 {
 
 pub func text_len(id: i64) -> i64 {
     return g_textlen[id]
+}
+
+// 绝对定位偏移 / 固定尺寸（布局引擎用）
+pub func off_x(id: i64) -> i64 {
+    return g_ox[id]
+}
+
+pub func off_y(id: i64) -> i64 {
+    return g_oy[id]
+}
+
+pub func fix_w(id: i64) -> i64 {
+    return g_fw[id]
+}
+
+pub func fix_h(id: i64) -> i64 {
+    return g_fh[id]
 }
 
 // ---- 属性写入 ----
