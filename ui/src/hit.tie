@@ -1,0 +1,56 @@
+type tie<class>
+// hit.tie —— tiu 事件轴对接（p.9.4.2 模块五）
+// EN: event-axis hookup — single-pass hit-testing over cached layout rects
+// (topmost first) + bubble path (leaf -> root).
+// ============================================================
+// 依据：docs/designs/tiu-event-system.md §4（命中测试：布局矩形 + 层序单趟只读、
+// 倒序查找顶层优先）、§5（路由：捕获 → 目标 → 冒泡）。
+// 语义：
+//   - 命中测试只读布局结果矩形（事件轴单趟，绝不进入绘制通道）；无事件无命中
+//     开销。
+//   - 绘制序 = DFS 序；后绘制者在上层 → 命中按倒 DFS 序查找，首个矩形包含点
+//     的活节点即目标（倒序天然取到最深命中）。
+//   - 冒泡 = leaf → root 链（事件轴路由的冒泡阶段输入）。
+//   - 滚动命中平移（O(1) 偏移）由上层消费；本模块输出命中目标与冒泡路径。
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\hit.tie（探针见 tests/）
+
+import "./tree.tie"
+
+namespace tiu_hit {
+// 命中测试：给定逻辑坐标 (px, py)，返回最上层命中的活节点 id；未命中 -1。
+// 单趟只读（倒 DFS 序，顶层优先）。
+pub func hit_test(px: i64, py: i64) -> i64 {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = len(order) - 1
+    while i >= 0 {
+        var n = order[i]
+        var r = tiu_tree.rect(n)
+        if Rect.contains(r, px, py) {
+            return n
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// 命中路径：目标节点及其祖先链（leaf -> root 冒泡顺序）。
+// 输入为 hit_test 结果；空树 / 非法 id 返回空表。
+pub func bubble(id: i64) -> table<i64> {
+    var out = table_new_i64()
+    var cur = id
+    while cur >= 0 {
+        if !tiu_tree.is_live(cur) {
+            return out
+        }
+        table_push(out, cur)
+        cur = tiu_tree.parent_of(cur)
+    }
+    return out
+}
+
+// 滚动命中：命中结果按滚动偏移平移（O(1)，不重布局）。
+// 语义：内容整体偏移 (dx, dy) 后，逻辑点 (px, py) 对应内容坐标 (px+dx, py+dy)。
+pub func hit_test_scrolled(px: i64, py: i64, dx: i64, dy: i64) -> i64 {
+    return hit_test(px + dx, py + dy)
+}
+}
