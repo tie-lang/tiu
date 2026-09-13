@@ -1,0 +1,97 @@
+type tie<class>
+// api/src/canvas.tie —— tiu 绘制 API：Canvas 会话（双模式入口）
+// ============================================================
+// Canvas = 一次绘制会话（实施计划 T3.1-T3.3）：目标 = 窗口/离屏/
+// 图像三种 Surface；属性 = 分辨率/DPI/色彩空间（固定引擎工作空间
+// sRGB，对齐引擎语义规范 SEM_WORKSPACE_SRGB=0）。
+//
+// 双模式（设计文档 §4，同一 IR 通道）：
+//   immediate = record() → 构建 DrawList → submit(dl)（编码下发）
+//   retained  = 同一 DrawList → replay(dl)（缓存重放）
+// submit/replay 产出**相同 IR 帧字节**（双模式等价，T3.3 探针）。
+// 所有权转移约定：submit/replay 后 DrawList 不再修改（tie 无 move
+// 语义，模块内以"冻结后只读"约定承载；实施计划 §3 能力缺口记录）。
+//
+// EN: Canvas session — record/submit/replay dual mode over one IR
+// channel; immediate == retained (byte-identical IR, T3.3 probe).
+
+import "./transform.tie"
+import "./drawlist.tie"
+import "./ir_enc.tie"
+import "./ir_cmp.tie"
+
+const CS_SRGB: i64 = 0      // 色彩空间：固定引擎工作空间（sRGB）
+
+const TGT_WINDOW: i64 = 0
+const TGT_OFFSCREEN: i64 = 1
+const TGT_IMAGE: i64 = 2
+
+struct Canvas {
+    var target: i64 = TGT_WINDOW
+    var w: i64 = 0
+    var h: i64 = 0
+    var dpi: f64 = 1.0
+    var cs: i64 = CS_SRGB
+    var view: Transform = Transform()
+}
+
+namespace cvs {
+
+// ---- 会话构建（三种目标） ----
+
+pub func new_window(w: i64, h: i64, dpi: f64) -> Canvas {
+    var c = Canvas()
+    c.target = TGT_WINDOW
+    c.w = w
+    c.h = h
+    c.dpi = dpi
+    return c
+}
+
+pub func new_offscreen(w: i64, h: i64, dpi: f64) -> Canvas {
+    var c = new_window(w, h, dpi)
+    c.target = TGT_OFFSCREEN
+    return c
+}
+
+pub func new_image(w: i64, h: i64, dpi: f64) -> Canvas {
+    var c = new_window(w, h, dpi)
+    c.target = TGT_IMAGE
+    return c
+}
+
+// 会话视图变换（视图级，整帧共用；对齐 IR 变换分级）。返回新 Canvas。
+pub func set_view(c: Canvas, t: Transform) -> Canvas {
+    var nc = c
+    nc.view = t
+    return nc
+}
+
+// ---- record：开启一次绘制（空绘制表） ----
+
+pub func record(c: Canvas) -> DrawList {
+    return dl.new(c.w, c.h, c.dpi)
+}
+
+// ---- submit：immediate 提交（编码整帧 IR 字节） ----
+
+pub func submit(c: Canvas, d: DrawList) -> table<i64> {
+    return frame_of(c, d)
+}
+
+// ---- replay：retained 重放（同一 IR，字节等价） ----
+
+pub func replay(c: Canvas, d: DrawList) -> table<i64> {
+    return frame_of(c, d)
+}
+
+// 会话并入绘制表（视图 + surface）后编码整帧。
+func frame_of(c: Canvas, d: DrawList) -> table<i64> {
+    var dl2 = dl.set_view(d, c.view)
+    dl2.sw = c.w
+    dl2.sh = c.h
+    dl2.dpi = c.dpi
+    return irenc.frame(dl2)
+}
+
+}
