@@ -1,0 +1,106 @@
+type tie<logic>
+// probe_tree: 组件树骨架探针（挂载/卸载/层级/DFS 序/路径前缀）
+import "../ui/src/tree.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 表相等比较（按序逐元素）
+func tbl_eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    // ---------- 1) 挂载：根 + 三个子（层级正确）----------
+    tiu_tree.reset()
+    var root = tiu_tree.mount(-1, 0, WidgetType.Column)
+    var a = tiu_tree.mount(root, 0, WidgetType.Text)
+    var b = tiu_tree.mount(root, 1, WidgetType.Button)
+    var c = tiu_tree.mount(root, 2, WidgetType.Row)
+    check(tiu_tree.root() == root, "mount root")
+    check(tiu_tree.count() == 4, "mount 4 live nodes")
+    check(tiu_tree.parent_of(a) == root && tiu_tree.parent_of(b) == root && tiu_tree.parent_of(c) == root,
+        "children parent == root")
+    check(tiu_tree.first_child(root) == a, "first child = a")
+    check(tiu_tree.next_sibling(a) == b && tiu_tree.next_sibling(b) == c && tiu_tree.next_sibling(c) == -1,
+        "sibling chain a->b->c->nil")
+    check(tiu_tree.ty_of(a) == 2 && tiu_tree.ty_of(b) == 3 && tiu_tree.ty_of(c) == 0,
+        "type codes (Text=2 Button=3 Row=0)")
+    check(tiu_tree.slot_of(a) == 0 && tiu_tree.slot_of(b) == 1 && tiu_tree.slot_of(c) == 2,
+        "slot ids")
+    check(tiu_tree.type_name(0) == "Row" && tiu_tree.type_name(4) == "Absolute",
+        "type_name lookup")
+
+    // ---------- 2) DFS 序：父先于子、兄弟按序 ----------
+    var d = tiu_tree.mount(a, 0, WidgetType.Text)
+    var e = tiu_tree.mount(a, 1, WidgetType.Text)
+    var order = tiu_tree.dfs_order()
+    var want: table<i64> = [root, a, d, e, b, c]
+    check(tbl_eq(order, want), "dfs order root,a,d,e,b,c")
+    check(tiu_tree.parent_of(d) == a && tiu_tree.next_sibling(d) == e, "nested children of a")
+
+    // ---------- 3) 路径前缀（slot 链）----------
+    check(tiu_tree.path_of(root) == "0", "path root = 0")
+    check(tiu_tree.path_of(d) == "0:0:0", "path d = 0:0:0")
+    check(tiu_tree.path_of(e) == "0:0:1", "path e = 0:0:1")
+    check(tiu_tree.path_of(c) == "0:2", "path c = 0:2")
+
+    // ---------- 4) 卸载：子树全部 dead，兄弟不受影响 ----------
+    tiu_tree.unmount(a)
+    check(!tiu_tree.is_live(a) && !tiu_tree.is_live(d) && !tiu_tree.is_live(e),
+        "unmount a marks subtree dead")
+    check(tiu_tree.is_live(root) && tiu_tree.is_live(b) && tiu_tree.is_live(c),
+        "siblings stay live")
+    check(tiu_tree.count() == 3, "live count = 3 after unmount")
+    var order2 = tiu_tree.dfs_order()
+    var want2: table<i64> = [root, b, c]
+    check(tbl_eq(order2, want2), "dfs order after unmount = root,b,c")
+    // 卸载根 = 空树
+    tiu_tree.unmount(root)
+    check(tiu_tree.count() == 0, "unmount root empties tree")
+
+    // ---------- 5) 重新挂载（同一树可重建）----------
+    var r2 = tiu_tree.mount(-1, 0, WidgetType.Row)
+    var x = tiu_tree.mount(r2, 0, WidgetType.Text)
+    check(tiu_tree.root() == r2 && tiu_tree.count() == 2, "remount after reset")
+
+    // ---------- 6) props 与矩形存取 ----------
+    tiu_tree.set_props(x, 7, 3, 0, 0, 0, 0)
+    check(tiu_tree.ver_of(x) == 7 && tiu_tree.text_len(x) == 3, "props set/get")
+    tiu_tree.set_rect(x, 10, 20, 100, 30)
+    var rx = tiu_tree.rect(x)
+    check(rx.x == 10 && rx.y == 20 && rx.w == 100 && rx.h == 30, "rect set/get")
+
+    // ---------- 7) Rect 工具 ----------
+    var ra = Rect(0, 0, 10, 10)
+    var rb = Rect(5, 5, 10, 10)
+    var ru = Rect.union(ra, rb)
+    check(ru.x == 0 && ru.y == 0 && ru.w == 15 && ru.h == 15, "rect union")
+    check(Rect.contains(ra, 9, 9) && !Rect.contains(ra, 10, 10) && !Rect.contains(ra, -1, 5),
+        "rect contains half-open")
+
+    if fails > 0 {
+        println("PROBE_TREE FAIL " + to_string(fails))
+        exit(1)
+    } else {
+        println("PROBE_TREE PASS")
+    }
+}
