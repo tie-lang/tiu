@@ -1,0 +1,302 @@
+type tie<class>
+// api/src/ir_enc.tie —— tiu 绘制 API：IR 编码器（record 布局冻结件）
+// ============================================================
+// 意图 → 绘制表记录编码（实施计划 T2.1/T2.2/T2.3）。本文件产出即
+// **冻结**（修订只走版本表回写，API/引擎双方同意）：
+//
+//   record = op(i64) key(i64) geo_len(i64) geo… paint_len(i64)
+//            paint… clip(i64) meta_len(i64) meta…
+//   key = fnv1a( op ‖ geo_hash ‖ paint_hash ‖ tx_hash )，其中
+//         geo_hash = fnv1a(geo 段)、paint_hash = fnv1a(paint 段)、
+//         tx_hash = fnv1a(逐项变换 6×Q16)。视图变换整帧共用，不进
+//         key（变换分级：视图级/逐项级 —— 引擎 §4）。
+//   geo 段 = 按 op 的几何参数（Q16 定点）‖ 文本内容（TEXT）‖
+//            path 命令序列（PATH）‖ tx 6×Q16（统一尾部）。
+//   paint 段 = fill‖color‖gx0..gy1‖stops_n‖stops…‖stroke_w‖cap‖
+//              join‖dash_n‖dash…‖alpha‖blend‖cm_n‖cm…‖blur‖shadow‖
+//              shx‖shy‖sh_color‖image（全部 Q16/整型，无 f64 位模式）。
+//   meta 不参与 key（调参用，不参与渲染语义）。
+// 增量段协议（T2.3 冻结件）：segment = prefix(i64) x y w h（Q16）
+//   rec_count(i64) records…；UI 层以「子树 key 前缀 + dirty rect 段」
+//   为唯一差分原语。
+//
+// EN: intent → draw-list record encoder (frozen, T2.1/T2.2/T2.3).
+// Records are self-contained: the same primitive always encodes to
+// identical bytes regardless of neighbours (isolation probe T2.4).
+
+import "./ir_bytes.tie"
+import "./ir_hash.tie"
+
+namespace irenc {
+
+// ---- key 派生 ----
+
+// 第 i 条图元的稳定 key。
+// key = fnv1a( op 8B ‖ geo_hash 8B ‖ paint_hash 8B )；geo_hash 含
+// 逐项变换（变换分级：视图级不进 key，逐项级经 geo_hash 进入）。
+pub func key_of(d: DrawList, i: i64) -> i64 {
+    var geo = geo_bytes(d, i)
+    var paint = paint_bytes(d, i)
+    var gh = irh.bytes(geo)
+    var ph = irh.bytes(paint)
+    var h = fold8(FNV_OFFSET, d.op[i])
+    h = fold8(h, gh)
+    h = fold8(h, ph)
+    return h
+}
+
+// 8 字节折叠进哈希（FNV-1a 字节序：低字节先）。
+func fold8(h: i64, v: i64) -> i64 {
+    var r = irh.step(h, v & 0xFF)
+    r = irh.step(r, (v >> 8) & 0xFF)
+    r = irh.step(r, (v >> 16) & 0xFF)
+    r = irh.step(r, (v >> 24) & 0xFF)
+    r = irh.step(r, (v >> 32) & 0xFF)
+    r = irh.step(r, (v >> 40) & 0xFF)
+    r = irh.step(r, (v >> 48) & 0xFF)
+    r = irh.step(r, (v >> 56) & 0xFF)
+    return r
+}
+
+// ---- record 编码 ----
+
+// 第 i 条图元 → 完整 record 字节段。
+pub func record(d: DrawList, i: i64) -> table<i64> {
+    var out = irb.new_out()
+    irb.put_i64(out, d.op[i])
+    irb.put_i64(out, key_of(d, i))
+    var geo = geo_bytes(d, i)
+    irb.put_i64(out, len(geo))
+    append_all(out, geo)
+    var paint = paint_bytes(d, i)
+    irb.put_i64(out, len(paint))
+    append_all(out, paint)
+    irb.put_i64(out, d.clip[i])
+    irb.put_str(out, d.meta[i])
+    return out
+}
+
+// ---- geo 段（含逐项变换尾部） ----
+
+func geo_bytes(d: DrawList, i: i64) -> table<i64> {
+    var g = irb.new_out()
+    var op = d.op[i]
+    if op == PO_RECT {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+    } else if op == PO_RRECT {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+        irb.put_q(g, d.rx[i]); irb.put_q(g, d.ry[i])
+    } else if op == PO_ELLIPSE {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+    } else if op == PO_ARC {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.a0[i]); irb.put_q(g, d.a1[i])
+    } else if op == PO_LINE {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+    } else if op == PO_PATH {
+        var pid = d.pth_id[i]
+        if pid < 0 {
+            irb.put_i64(g, 0)
+        } else {
+            var ofs = d.pth_cmd_ofs[pid]
+            var ncmd = d.pth_cmd_len[pid]
+            irb.put_i64(g, ncmd)
+            var k: i64 = 0
+            while k < ncmd {
+                var cop = d.pth_ops[ofs + k]
+                irb.put_i64(g, cop)
+                irb.put_i64(g, path.cmd_argc(cop))
+                var seg = path_args_at(d, ofs, k)
+                var j: i64 = 0
+                while j < len(seg) {
+                    irb.put_q(g, seg[j])
+                    j = j + 1
+                }
+                k = k + 1
+            }
+        }
+    } else if op == PO_TEXT {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.fs[i])
+        irb.put_str(g, d.txt[i])
+    } else if op == PO_IMAGE {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+        irb.put_i64(g, d.font[i])
+    } else if op == PO_SAVE_LAYER {
+        irb.put_q(g, d.x[i]); irb.put_q(g, d.y[i]); irb.put_q(g, d.w[i]); irb.put_q(g, d.h[i])
+    } else {
+        // PO_RESTORE_LAYER：无几何
+    }
+    // 逐项变换尾部（tx_hash 输入）
+    irb.put_q(g, d.tx0[i]); irb.put_q(g, d.tx1[i]); irb.put_q(g, d.tx2[i])
+    irb.put_q(g, d.tx3[i]); irb.put_q(g, d.tx4[i]); irb.put_q(g, d.tx5[i])
+    return g
+}
+
+// ---- paint 段 ----
+
+func paint_bytes(d: DrawList, i: i64) -> table<i64> {
+    var pid = d.p_id[i]
+    var p = irb.new_out()
+    var fill: i64 = 0
+    var colorv: i64 = 0
+    var gx0: f64 = 0.0
+    var gy0: f64 = 0.0
+    var gx1: f64 = 0.0
+    var gy1: f64 = 0.0
+    var st_ofs: i64 = 0
+    var st_len: i64 = 0
+    var dash_ofs: i64 = 0
+    var dash_len: i64 = 0
+    var stroke_w: f64 = 0.0
+    var cap: i64 = 0
+    var join: i64 = 0
+    var alpha: i64 = 255
+    var blend: i64 = 0
+    var blur: f64 = 0.0
+    var shadow: i64 = 0
+    var shx: f64 = 0.0
+    var shy: f64 = 0.0
+    var shcolor: i64 = 0
+    var image: i64 = 0
+    var cm_ofs: i64 = 0
+    var cm_len: i64 = 0
+    if pid >= 0 {
+        fill = d.pp_fill[pid]
+        colorv = d.pp_color[pid]
+        gx0 = d.pp_gx0[pid]
+        gy0 = d.pp_gy0[pid]
+        gx1 = d.pp_gx1[pid]
+        gy1 = d.pp_gy1[pid]
+        st_ofs = d.pp_st_ofs[pid]
+        st_len = d.pp_st_len[pid]
+        dash_ofs = d.pp_dash_ofs[pid]
+        dash_len = d.pp_dash_len[pid]
+        stroke_w = d.pp_stroke_w[pid]
+        cap = d.pp_cap[pid]
+        join = d.pp_join[pid]
+        alpha = d.pp_alpha[pid]
+        blend = d.pp_blend[pid]
+        blur = d.pp_blur[pid]
+        shadow = d.pp_shadow[pid]
+        shx = d.pp_shx[pid]
+        shy = d.pp_shy[pid]
+        shcolor = d.pp_shcolor[pid]
+        image = d.pp_image[pid]
+        cm_ofs = d.pp_cm_ofs[pid]
+        cm_len = d.pp_cm_len[pid]
+    }
+    irb.put_i64(p, fill)
+    irb.put_i64(p, colorv)
+    irb.put_q(p, gx0)
+    irb.put_q(p, gy0)
+    irb.put_q(p, gx1)
+    irb.put_q(p, gy1)
+    irb.put_i64(p, st_len / 5)
+    var k: i64 = 0
+    while k < st_len {
+        irb.put_i64(p, d.stops_pool[st_ofs + k])
+        k = k + 1
+    }
+    irb.put_q(p, stroke_w)
+    irb.put_i64(p, cap)
+    irb.put_i64(p, join)
+    irb.put_i64(p, dash_len)
+    var j2: i64 = 0
+    while j2 < dash_len {
+        irb.put_q(p, d.dash_pool[dash_ofs + j2])
+        j2 = j2 + 1
+    }
+    irb.put_i64(p, alpha)
+    irb.put_i64(p, blend)
+    irb.put_i64(p, cm_len)
+    var m2: i64 = 0
+    while m2 < cm_len {
+        irb.put_i64(p, d.cm_pool[cm_ofs + m2])
+        m2 = m2 + 1
+    }
+    irb.put_q(p, blur)
+    irb.put_i64(p, shadow)
+    irb.put_q(p, shx)
+    irb.put_q(p, shy)
+    irb.put_i64(p, shcolor)
+    irb.put_i64(p, image)
+    return p
+}
+
+// ---- 整帧 ----
+
+// 整帧字节：header + view + surface + count + records。
+pub func frame(d: DrawList) -> table<i64> {
+    var out = irb.new_out()
+    irb.put_u8(out, 84)   // 'T'
+    irb.put_u8(out, 73)   // 'I'
+    irb.put_u8(out, 85)   // 'U'
+    irb.put_u8(out, 49)   // '1'
+    irb.put_u16(out, 1)   // version
+    irb.put_u16(out, 0)   // flags
+    irb.put_q(out, d.view.a)
+    irb.put_q(out, d.view.b)
+    irb.put_q(out, d.view.c)
+    irb.put_q(out, d.view.d)
+    irb.put_q(out, d.view.e)
+    irb.put_q(out, d.view.f)
+    irb.put_i64(out, d.sw)
+    irb.put_i64(out, d.sh)
+    irb.put_q(out, d.dpi)
+    irb.put_i64(out, len(d.op))
+    var i: i64 = 0
+    while i < len(d.op) {
+        append_all(out, record(d, i))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 增量段协议（T2.3 冻结件） ----
+
+// 增量段：子树 key 前缀 + dirty rect + 部分图元 record 段。
+pub func segment(d: DrawList, prefix: i64, x: f64, y: f64, w: f64, h: f64, from: i64, to: i64) -> table<i64> {
+    var out = irb.new_out()
+    irb.put_i64(out, prefix)
+    irb.put_q(out, x)
+    irb.put_q(out, y)
+    irb.put_q(out, w)
+    irb.put_q(out, h)
+    var n = to - from
+    irb.put_i64(out, n)
+    var i = from
+    while i < to {
+        append_all(out, record(d, i))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 辅助 ----
+
+// 从 DrawList 的 path 平铺参数池取第 (base + k) 条命令的参数段。
+func path_args_at(d: DrawList, base: i64, k: i64) -> table<f64> {
+    var cnt: i64 = 0
+    var j: i64 = 0
+    while j < k {
+        cnt = cnt + path.cmd_argc(d.pth_ops[base + j])
+        j = j + 1
+    }
+    var argc = path.cmd_argc(d.pth_ops[base + k])
+    var out = table_new_f64()
+    var m: i64 = 0
+    while m < argc {
+        table_push(out, d.pth_args[cnt + m])
+        m = m + 1
+    }
+    return out
+}
+
+func append_all(out: table<i64>, src: table<i64>) {
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(out, src[i])
+        i = i + 1
+    }
+}
+
+}

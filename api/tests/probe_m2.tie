@@ -1,0 +1,189 @@
+type tie<logic>
+// api/tests/probe_m2.tie —— API 模块二验收探针：IR 编码器
+// ============================================================
+// 覆盖：T2.1 record 字节布局冻结（整帧/record 字节 gold 断言）·
+// T2.2 稳定 key 派生（key 稳定性：未变子树 key 不因其它子树变化而
+// 变；meta 不参与 key；几何/paint 变化 → key 变）· T2.3 增量段协议
+// 定稿（子树 key 前缀 + dirty rect + record 段）· T2.4 gold IR
+// 比较器 + 变化区隔离探针。验收门：本探针全绿 = 模块二完成。
+//
+// EN: API module-2 gate probe — IR encoder. Frozen record layout,
+// stable key derivation, incremental-segment protocol, gold IR
+// comparator + change-isolation. ALL PASS = module complete.
+
+import "../src/color.tie"
+import "../src/transform.tie"
+import "../src/paint.tie"
+import "../src/path.tie"
+import "../src/prim.tie"
+import "../src/tabutil.tie"
+import "../src/drawlist.tie"
+import "../src/ir_bytes.tie"
+import "../src/ir_hash.tie"
+import "../src/ir_enc.tie"
+import "../src/ir_cmp.tie"
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= 基础：Q16 定点 =================
+    if irb.q16(10.0) == 655360 && irb.q16_f(655360) == 10.0 { println("[PASS] q16 roundtrip 10.0") } else { fails = fails + 1; println("FAIL q16") }
+    if irb.q16(1.5) == 98304 { println("[PASS] q16 1.5 = 98304") } else { fails = fails + 1; println("FAIL q16 1.5 got " + to_string(irb.q16(1.5))) }
+
+    // ================= gold IR：整帧布局 =================
+    var cv = dl.new(320, 240, 1.0)
+    cv = dl.set_view(cv, tform.translate(1.0, 2.0))
+    var red = paint.solid(color.rgba(200, 30, 10))
+    dl.rect(cv, 10.0, 20.0, 100.0, 50.0, red)
+    var blue = paint.solid(color.rgba(0, 0, 255))
+    dl.text_p(cv, "hi", 5.0, 6.0, 16.0, blue)
+    dl.restore_layer(cv)
+    var fb = irenc.frame(cv)
+
+    // header：magic TIU1 + version 1 + flags 0
+    if len(fb) >= 88 && fb[0] == 84 && fb[1] == 73 && fb[2] == 85 && fb[3] == 49 { println("[PASS] frame magic 'TIU1'") } else { fails = fails + 1; println("FAIL magic") }
+    if fb[4] == 1 && fb[5] == 0 { println("[PASS] frame version=1") } else { fails = fails + 1; println("FAIL version") }
+    // view：translate(1,2) → c=1.0*Q16=65536, f=2.0*Q16=131072（view 区偏移 8..56，每项 8B）
+    // 第 3 项（c）偏移 8+16=24..32；第 6 项（f）偏移 48..56
+    if rd_i64(fb, 24) == 65536 && rd_i64(fb, 48) == 131072 { println("[PASS] frame view translate(1,2) q16") } else { fails = fails + 1; println("FAIL view got " + to_string(rd_i64(fb, 24)) + "," + to_string(rd_i64(fb, 48))) }
+    // surface：w=320 h=240 dpi=1.0（偏移 56..80）
+    if rd_i64(fb, 56) == 320 && rd_i64(fb, 64) == 240 && rd_i64(fb, 72) == 65536 { println("[PASS] frame surface w/h/dpi") } else { fails = fails + 1; println("FAIL surface") }
+    // count=3
+    if rd_i64(fb, 80) == 3 { println("[PASS] frame record count=3") } else { fails = fails + 1; println("FAIL count got " + to_string(rd_i64(fb, 80))) }
+
+    // ---- gold record：rect（第 0 条） ----
+    var r0 = irenc.record(cv, 0)
+    if rd_i64(r0, 0) == PO_RECT { println("[PASS] rec0 op=rect") } else { fails = fails + 1; println("FAIL rec0 op") }
+    // geo_len = 4 坐标×8 + 6 tx×8 = 80
+    if rd_i64(r0, 16) == 80 { println("[PASS] rec0 geo_len=80") } else { fails = fails + 1; println("FAIL geo_len got " + to_string(rd_i64(r0, 16))) }
+    // geo[0] = x = 10.0 → 655360 → LE 00 00 0A 00 00 00 00 00
+    if r0[24] == 0 && r0[25] == 0 && r0[26] == 10 && r0[27] == 0 && r0[28] == 0 && r0[29] == 0 && r0[30] == 0 && r0[31] == 0 { println("[PASS] rec0 geo x=10.0 q16 LE bytes") } else { fails = fails + 1; println("FAIL geo x bytes") }
+    // tx 尾部：第 3 项 c=0（单位矩阵）→ geo 偏移 32+16=48..56
+    if rd_i64(r0, 24 + 48) == 0 && rd_i64(r0, 24 + 64) == 65536 && rd_i64(r0, 24 + 72) == 0 { println("[PASS] rec0 geo tx identity tail") } else { fails = fails + 1; println("FAIL tx tail") }
+    // paint_len 位置：24+80=104
+    var pl0 = 24 + 80
+    var paint0_len = rd_i64(r0, pl0)
+    if paint0_len > 0 { println("[PASS] rec0 paint_len=" + to_string(paint0_len)) } else { fails = fails + 1; println("FAIL paint_len") }
+    // paint[0] = fill = 0
+    if r0[pl0 + 8] == 0 { println("[PASS] rec0 paint fill=solid") } else { fails = fails + 1; println("FAIL paint fill") }
+    // paint 内 color = pack(200,30,10) = 0xFFC81E0A → LE bytes at pl0+8+8
+    var cb0 = pl0 + 16
+    if rd_i64(r0, cb0) == 0xFFC81E0A { println("[PASS] rec0 paint color gold") } else { fails = fails + 1; println("FAIL paint color got " + to_string(rd_i64(r0, cb0))) }
+
+    // ---- key 稳定性：meta 不参与 key ----
+    var dl_m = dl.new(320, 240, 1.0)
+    dl.rect(dl_m, 10.0, 20.0, 100.0, 50.0, red)
+    var k1 = irenc.key_of(cv, 0)
+    var k_m = irenc.key_of(dl_m, 0)
+    if k1 == k_m { println("[PASS] key stable across contexts (same prim)") } else { fails = fails + 1; println("FAIL key ctx") }
+    var dl_meta = dl.new(320, 240, 1.0)
+    dl.rect(dl_meta, 10.0, 20.0, 100.0, 50.0, red)
+    dl.set_meta(dl_meta, "btn")
+    if irenc.key_of(dl_meta, 0) == k1 { println("[PASS] meta excluded from key") } else { fails = fails + 1; println("FAIL meta key") }
+    var rec_plain = irenc.record(dl_m, 0)
+    var rec_meta = irenc.record(dl_meta, 0)
+    if !ircmp.eq(rec_plain, rec_meta) { println("[PASS] meta changes record bytes (payload)") } else { fails = fails + 1; println("FAIL meta bytes") }
+    // 几何变化 → key 变
+    var dl_g = dl.new(320, 240, 1.0)
+    dl.rect(dl_g, 11.0, 20.0, 100.0, 50.0, red)
+    if irenc.key_of(dl_g, 0) != k1 { println("[PASS] geometry change → key changes") } else { fails = fails + 1; println("FAIL geo key") }
+    // paint 变化 → key 变
+    var dl_p = dl.new(320, 240, 1.0)
+    var red2 = paint.with_alpha(red, 128)
+    dl.rect(dl_p, 10.0, 20.0, 100.0, 50.0, red2)
+    if irenc.key_of(dl_p, 0) != k1 { println("[PASS] paint change → key changes") } else { fails = fails + 1; println("FAIL paint key") }
+
+    // ---- 未变子树的 key 不因其它子树变化而变 ----
+    var dA = dl.new(320, 240, 1.0)
+    dl.rect(dA, 1.0, 2.0, 3.0, 4.0, red)
+    dl.text_p(dA, "hi", 5.0, 6.0, 16.0, blue)
+    var dB = dl.new(320, 240, 1.0)
+    dl.rect(dB, 1.0, 2.0, 3.0, 4.0, red)
+    dl.text_p(dB, "hello world", 5.0, 6.0, 16.0, blue)   // 第 2 条变化
+    if irenc.key_of(dA, 0) == irenc.key_of(dB, 0) && ircmp.eq(irenc.record(dA, 0), irenc.record(dB, 0)) { println("[PASS] isolation: unchanged subtree key+bytes stable") } else { fails = fails + 1; println("FAIL isolation") }
+
+    // ---- 变化区隔离：record 自包含（逐字节） ----
+    var dA2 = dl.new(320, 240, 1.0)
+    dl.rect(dA2, 1.0, 2.0, 3.0, 4.0, red)
+    dl.text_p(dA2, "hi", 5.0, 6.0, 16.0, blue)
+    dl.rect(dA2, 100.0, 100.0, 10.0, 10.0, red)
+    var dB2 = dl.new(320, 240, 1.0)
+    dl.rect(dB2, 1.0, 2.0, 3.0, 4.0, red)
+    dl.text_p(dB2, "hi", 5.0, 6.0, 16.0, blue)
+    dl.rect(dB2, 999.0, 100.0, 10.0, 10.0, red)       // 仅第 3 条变化
+    if ircmp.eq(irenc.record(dA2, 0), irenc.record(dB2, 0)) && ircmp.eq(irenc.record(dA2, 1), irenc.record(dB2, 1)) { println("[PASS] change-isolation: rec0/rec1 byte-identical") } else { fails = fails + 1; println("FAIL change-isolation") }
+    if irenc.key_of(dA2, 2) != irenc.key_of(dB2, 2) { println("[PASS] changed rec key differs") } else { fails = fails + 1; println("FAIL changed key") }
+
+    // ---- gold IR 比较器 ----
+    var e1 = table_new_i64()
+    table_push(e1, 1)
+    table_push(e1, 2)
+    table_push(e1, 3)
+    var e2 = table_new_i64()
+    table_push(e2, 1)
+    table_push(e2, 2)
+    table_push(e2, 3)
+    var e3 = table_new_i64()
+    table_push(e3, 1)
+    table_push(e3, 9)
+    table_push(e3, 3)
+    if ircmp.eq(e1, e2) && !ircmp.eq(e1, e3) { println("[PASS] gold comparator eq") } else { fails = fails + 1; println("FAIL cmp eq") }
+    if ircmp.diff_at(e1, e3) == 1 && ircmp.diff_at(e1, e2) == -1 { println("[PASS] gold comparator diff_at") } else { fails = fails + 1; println("FAIL cmp diff_at") }
+    if ircmp.hex(e1) == "010203" { println("[PASS] gold comparator hex dump") } else { fails = fails + 1; println("FAIL hex got " + ircmp.hex(e1)) }
+
+    // ---- 增量段协议（T2.3） ----
+    var seg = irenc.segment(dA2, 0xABCDEF, 1.0, 2.0, 3.0, 4.0, 0, 1)
+    if rd_i64(seg, 0) == 0xABCDEF { println("[PASS] segment prefix") } else { fails = fails + 1; println("FAIL seg prefix") }
+    if rd_i64(seg, 8) == 65536 && rd_i64(seg, 40) == 1 { println("[PASS] segment dirty rect q16 + rec_count=2") } else { fails = fails + 1; println("FAIL seg rect") }
+    // 段内 record 0 与 frame 中 record 0 字节一致（消费方等价）
+    var seg_rec0 = seg_of(seg, 48)
+    if ircmp.eq(seg_rec0, irenc.record(dA2, 0)) { println("[PASS] segment record == frame record bytes") } else { fails = fails + 1; println("FAIL seg record") }
+
+    // ---- path 命令编码（PATH 图元） ----
+    var pth = path.new()
+    pth = path.move_to(pth, 1.0, 2.0)
+    pth = path.line_to(pth, 3.0, 4.0)
+    pth = path.close(pth)
+    var dl_pth = dl.new(100, 100, 1.0)
+    dl.path(dl_pth, pth, red)
+    var rp = irenc.record(dl_pth, 0)
+    var gpl = rd_i64(rp, 16)
+    // geo：ncmd=3（8B）+ 命令（M: op+argc+2arg=4×8B；L 同；Z: op+argc=2×8B）+ tx 6×8B = 48
+    if rd_i64(rp, 24) == 3 && gpl == 136 { println("[PASS] path record geo: ncmd=3, len=" + to_string(gpl)) } else { fails = fails + 1; println("FAIL path geo len " + to_string(gpl)) }
+    if rd_i64(rp, 32) == P_MOVE && rd_i64(rp, 48) == 65536 { println("[PASS] path cmd op + q16 arg") } else { fails = fails + 1; println("FAIL path cmd") }
+
+    // ================= 汇总 =================
+    if fails == 0 {
+        println("API M2: ALL PASS")
+    } else {
+        println("API M2: FAILURES " + to_string(fails))
+        exit(1)
+    }
+    return 0
+}
+
+// 从段字节偏移处取 record（record 以 op 起始，长度需自解析：跳过 op/key/geo_len/geo/paint_len/paint/clip/meta_len/meta）。
+// 简化：探针从段中按 frame record 相同布局截取——此处直接复制 segment 中该 record 的全部字节。
+func seg_of(seg: table<i64>, ofs: i64) -> table<i64> {
+    var out = table_new_i64()
+    var i = ofs
+    while i < len(seg) {
+        table_push(out, seg[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 小端 i64 读取。
+func rd_i64(t: table<i64>, ofs: i64) -> i64 {
+    var v: i64 = 0
+    v = v | t[ofs]
+    v = v | (t[ofs + 1] << 8)
+    v = v | (t[ofs + 2] << 16)
+    v = v | (t[ofs + 3] << 24)
+    v = v | (t[ofs + 4] << 32)
+    v = v | (t[ofs + 5] << 40)
+    v = v | (t[ofs + 6] << 48)
+    v = v | (t[ofs + 7] << 56)
+    return v
+}

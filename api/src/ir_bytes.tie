@@ -1,0 +1,73 @@
+type tie<class>
+// api/src/ir_bytes.tie —— tiu 绘制 API：IR 字节编码工具
+// ============================================================
+// 确定性小端字节序列化（输出 table<i64>，每元素 0-255）。record
+// 布局冻结件（实施计划 T2.1）：本模块即布局的唯一编码实现，API 库
+// 与渲染引擎同源消费（引擎侧 loader 按同一布局解析）。
+//
+// EN: deterministic little-endian byte serialization (table<i64>,
+// each 0-255). This module is the frozen record-layout encoder
+// (plan T2.1) consumed by both API library and render engine.
+
+const Q16: i64 = 65536
+
+namespace irb {
+
+// f64 → Q16 定点（round-half-away 简化：向零截断 + 0.5 偏移）。
+pub func q16(v: f64) -> i64 {
+    if v >= 0.0 {
+        return as_i64(v * as_f64(Q16) + 0.5)
+    }
+    return as_i64(v * as_f64(Q16) - 0.5)
+}
+
+// Q16 → f64。
+pub func q16_f(v: i64) -> f64 {
+    return as_f64(v) / as_f64(Q16)
+}
+
+// 追加 1 字节。
+pub func put_u8(out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+}
+
+// 追加 i64 小端 8 字节。
+pub func put_i64(out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+    table_push(out, (v >> 8) & 0xFF)
+    table_push(out, (v >> 16) & 0xFF)
+    table_push(out, (v >> 24) & 0xFF)
+    table_push(out, (v >> 32) & 0xFF)
+    table_push(out, (v >> 40) & 0xFF)
+    table_push(out, (v >> 48) & 0xFF)
+    table_push(out, (v >> 56) & 0xFF)
+}
+
+// 追加 u16 小端 2 字节。
+pub func put_u16(out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+    table_push(out, (v >> 8) & 0xFF)
+}
+
+// 追加字符串：len(i64) + UTF-8 字节（str_byte 内建逐字节）。
+pub func put_str(out: table<i64>, s: string) {
+    var n = str_len(s)
+    put_i64(out, n)
+    var i: i64 = 0
+    while i < n {
+        put_u8(out, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+// 追加 Q16 定点坐标（f64 → i64）。
+pub func put_q(out: table<i64>, v: f64) {
+    put_i64(out, q16(v))
+}
+
+// 空表 → 新字节流。
+pub func new_out() -> table<i64> {
+    return table_new_i64()
+}
+
+}
