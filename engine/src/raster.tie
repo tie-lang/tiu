@@ -1,0 +1,153 @@
+type tie<class>
+// engine/src/raster.tie —— tiu 渲染引擎：软件统一内核（模块一）
+// ============================================================
+// 软件图元光栅（渲染引擎实施计划 T1.2）：rect / 纯色 / 文本（位图
+// 字形）→ 软件帧缓冲。**唯一执行路径 = 渲染语义规范 v0**
+// （semantics.tie：sRGB 直通 + 非预乘 src-over + 覆盖率 0/1）。
+// v0 范围：纯色填充（fill=0）；视图级平移 + DPI 缩放；逐项变换
+// 与渐变/图像等 op 留待模块二/三（文档记录，非挂起）。
+//
+// EN: software raster core (module 1): rect / solid / text (bitmap
+// glyphs) → frame buffer; the only execution path is the render-
+// semantics spec v0.
+
+import "./semantics.tie"
+import "./glyph.tie"
+import "./ir_load.tie"
+import "./gold.tie"
+import "./utfmin.tie"
+
+struct FrameBuf {
+    var w: i64 = 0
+    var h: i64 = 0
+    var px: table<i64> = table_new_i64()
+}
+
+namespace erast {
+
+// 渲染整帧（Parsed → FrameBuf）。op 集合：RECT/RRECT(rx=0)/TEXT
+// 纯色填充；其余 op v0 跳过（文档记录：模块二/三）。
+pub func render(p: Parsed) -> FrameBuf {
+    var fb = FrameBuf()
+    fb.w = p.sw
+    fb.h = p.sh
+    fb.px = egold.fb_new(p.sw, p.sh)
+    var n = len(p.ops)
+    var i: i64 = 0
+    while i < n {
+        var op = p.ops[i]
+        var fill = p.fills[i]
+        var color = p.colors[i]
+        var alpha = p.alphas[i]
+        var eff_a = as_i64((as_f64(alpha) * as_f64(sem.ch_a(color)) / 255.0) + 0.5)
+        if op == E_OP_RECT || (op == E_OP_RRECT && p.rx[i] == 0.0) {
+            if fill == 0 {
+                rect_px(fb, p, i, color, eff_a)
+            }
+        } else if op == E_OP_TEXT {
+            if fill == 0 {
+                text_px(fb, p, i, color, eff_a)
+            }
+        }
+        i = i + 1
+    }
+    return fb
+}
+
+// ---- rect 纯色填充 ----
+
+func rect_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
+    var (dx0, dy0) = dev(p, p.x[i], p.y[i])
+    var (dx1, dy1) = dev(p, p.x[i] + p.w[i], p.y[i] + p.h[i])
+    var ix0 = i64_round(dx0)
+    var iy0 = i64_round(dy0)
+    var ix1 = i64_round(dx1)
+    var iy1 = i64_round(dy1)
+    if ix0 < 0 {
+        ix0 = 0
+    }
+    if iy0 < 0 {
+        iy0 = 0
+    }
+    if ix1 > fb.w {
+        ix1 = fb.w
+    }
+    if iy1 > fb.h {
+        iy1 = fb.h
+    }
+    var y = iy0
+    while y < iy1 {
+        var x = ix0
+        while x < ix1 {
+            put_px(fb, x, y, color, alpha)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// ---- 文本（5×7 位图字形 blit） ----
+
+func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
+    var (dx, dy) = dev(p, p.x[i], p.y[i])
+    var ox = i64_round(dx)
+    var oy = i64_round(dy)
+    var s = p.txt[i]
+    var n = str_len(s)
+    var ci: i64 = 0
+    while ci < n {
+        var ch = utfmin.to_cp(str_char(s, ci))   // 单字符 → 码点（ASCII 可打印）
+        var r = eglyph.rows(ch)
+        var j: i64 = 0
+        while j < GLYPH_H {
+            var row = r[j]
+            var k: i64 = 0
+            while k < GLYPH_W {
+                if ((row >> k) & 1) != 0 {
+                    put_px(fb, ox + ci * GLYPH_ADV + k, oy + j, color, alpha)
+                }
+                k = k + 1
+            }
+            j = j + 1
+        }
+        ci = ci + 1
+    }
+}
+
+// ---- 帧缓冲 / 混合 ----
+
+// 像素写入（src-over 混合，渲染语义唯一执行路径）。
+func put_px(fb: FrameBuf, x: i64, y: i64, color: i64, alpha: i64) {
+    if x < 0 || y < 0 || x >= fb.w || y >= fb.h {
+        return
+    }
+    var idx = y * fb.w + x
+    var dst = fb.px[idx]
+    var nr = sem.blend_ch(sem.ch_r(dst), sem.ch_r(color), alpha)
+    var ng = sem.blend_ch(sem.ch_g(dst), sem.ch_g(color), alpha)
+    var nb = sem.blend_ch(sem.ch_b(dst), sem.ch_b(color), alpha)
+    var na = sem.clamp_ch(sem.ch_a(dst) + ((255 - sem.ch_a(dst)) * alpha) / 255)
+    fb.px[idx] = sem.pack(nr, ng, nb, na)
+}
+
+// 逻辑 → 设备（视图平移 + DPI 缩放）。
+func dev(p: Parsed, lx: f64, ly: f64) -> (f64, f64) {
+    var vc = 0.0
+    var vf = 0.0
+    if len(p.view) >= 6 {
+        vc = p.view[2]
+        vf = p.view[5]
+    }
+    var dpx = (lx + vc) * p.dpi
+    var dpy = (ly + vf) * p.dpi
+    return (dpx, dpy)
+}
+
+func i64_round(v: f64) -> i64 {
+    if v >= 0.0 {
+        return as_i64(v + 0.5)
+    }
+    return as_i64(v - 0.5)
+}
+
+}

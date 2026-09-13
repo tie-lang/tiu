@@ -1,0 +1,42 @@
+type tie<class>
+// engine/src/utfmin.tie —— tiu 渲染引擎：最小 UTF-8 字符工具
+// ============================================================
+// tie 无「码点 → 任意字符」内建原语（std/utf.to_char 在 tiec 仓，
+// 引擎仓不引跨仓依赖）。可打印 ASCII 32..126 以固定表 + str_char
+// 映射（能力缺口如实记录；非可打印码点返回空串，不影响绘制表文本
+// 子集：文本位图字形仅消费 ASCII 可打印区）。
+//
+// EN: minimal code-point → char for ASCII printable (32..126) via a
+// fixed table (tie has no builtin; std/utf lives in the tiec repo).
+
+namespace utfmin {
+
+func ascii_tab() -> string {
+    return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+}
+
+// 码点 → 单字符字符串（32..126；越界返回空串）。
+pub func to_char(cp: i64) -> string {
+    if cp < 32 || cp > 126 {
+        return ""
+    }
+    return str_char(ascii_tab(), cp - 32)
+}
+
+// 单字符字符串 → 码点（32..126；非单字符/越界返回 0）。
+pub func to_cp(c: string) -> i64 {
+    if str_len(c) != 1 {
+        return 0
+    }
+    var tab = ascii_tab()
+    var i: i64 = 0
+    while i < 95 {
+        if str_char(tab, i) == c {
+            return i + 32
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+}

@@ -1,0 +1,64 @@
+type tie<class>
+// engine/src/semantics.tie —— tiu 渲染引擎：渲染语义规范（初版）
+// ============================================================
+// 渲染语义规范 v0（渲染引擎实施计划 T1.3）：软件内核唯一执行路径
+// 的语义定义（GPU 后端落地后同一份规范 → 双端一致，引擎文档 §8）。
+//
+//   §颜色工作空间：固定 sRGB（scene-linear 中间空间 + display
+//     transform 为后续版本；v0 直通——通道值即 sRGB 显示值，伽马
+//     不变换）。
+//   §混合：非预乘 src-over：out = (src·a + dst·(255−a)) / 255，
+//     逐通道整数运算（确定性，无浮点漂移）。
+//   §覆盖率：v0 为 0/1（纯色 rect 与二值位图字形；边缘 AA 覆盖率
+//     留待模块二/三，与 GPU 共用同一覆盖定义）。
+//   §合成：整帧直接光栅到帧缓冲（Frame Graph 离屏别名为模块二）。
+//
+// EN: render-semantics spec v0 — single raster-core definition:
+// sRGB pass-through workspace; non-premultiplied src-over blending
+// (integer math); 0/1 coverage. Every software path goes through
+// these functions only.
+
+const SEM_WORKSPACE_SRGB: i64 = 0
+
+namespace sem {
+
+// 通道 clamp 0-255。
+pub func clamp_ch(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    return v
+}
+
+// 非预乘 src-over：单通道混合。
+pub func blend_ch(dst: i64, src: i64, a: i64) -> i64 {
+    var aa = clamp_ch(a)
+    return (src * aa + dst * (255 - aa)) / 255
+}
+
+// 打包通道提取。
+pub func ch_r(p: i64) -> i64 {
+    return (p >> 16) & 0xFF
+}
+
+pub func ch_g(p: i64) -> i64 {
+    return (p >> 8) & 0xFF
+}
+
+pub func ch_b(p: i64) -> i64 {
+    return p & 0xFF
+}
+
+pub func ch_a(p: i64) -> i64 {
+    return (p >> 24) & 0xFF
+}
+
+// 打包 0xAARRGGBB。
+pub func pack(r: i64, g: i64, b: i64, a: i64) -> i64 {
+    return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+}
+
+}

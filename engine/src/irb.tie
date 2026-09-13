@@ -1,0 +1,86 @@
+type tie<class>
+// engine/src/irb.tie —— tiu 渲染引擎：IR 字节工具（冻结布局解析底座）
+// ============================================================
+// 引擎侧按 API 实施计划 T2.1 **冻结布局**的独立字节实现（与 API
+// 侧 ir_bytes.tie 同契约、双实现——互验 gold 字节一致性）。
+// 布局（T2.1 冻结件，见 api/src/ir_enc.tie 头注释）：
+//   frame = magic(4) ver(2) flags(2) view(6×i64 Q16) surf(3×i64)
+//           count(1×i64) records…
+//   record = op(8) key(8) geo_len(8) geo… paint_len(8) paint…
+//            clip(8) meta_len(8) meta…
+// 坐标/尺寸/变换一律 Q16 定点（×65536 取整），无 f64 位模式。
+//
+// EN: engine-side byte helpers implementing the frozen record layout
+// (API plan T2.1) — independent implementation of the same contract,
+// used to cross-verify gold IR bytes with the API encoder.
+
+const E_Q16: i64 = 65536
+
+namespace eirb {
+
+// Q16 → f64。
+pub func q16_f(v: i64) -> f64 {
+    return as_f64(v) / as_f64(E_Q16)
+}
+
+// 读 i64 小端（offset 起 8 字节）。
+pub func rd_i64(t: table<i64>, ofs: i64) -> i64 {
+    var v: i64 = 0
+    v = v | t[ofs]
+    v = v | (t[ofs + 1] << 8)
+    v = v | (t[ofs + 2] << 16)
+    v = v | (t[ofs + 3] << 24)
+    v = v | (t[ofs + 4] << 32)
+    v = v | (t[ofs + 5] << 40)
+    v = v | (t[ofs + 6] << 48)
+    v = v | (t[ofs + 7] << 56)
+    return v
+}
+
+// 读 u16 小端。
+pub func rd_u16(t: table<i64>, ofs: i64) -> i64 {
+    return t[ofs] | (t[ofs + 1] << 8)
+}
+
+// 追加 i64 小端 8 字节（构造测试字节用）。
+pub func put_i64(out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+    table_push(out, (v >> 8) & 0xFF)
+    table_push(out, (v >> 16) & 0xFF)
+    table_push(out, (v >> 24) & 0xFF)
+    table_push(out, (v >> 32) & 0xFF)
+    table_push(out, (v >> 40) & 0xFF)
+    table_push(out, (v >> 48) & 0xFF)
+    table_push(out, (v >> 56) & 0xFF)
+}
+
+// 追加 u8。
+pub func put_u8(out: table<i64>, v: i64) {
+    table_push(out, v & 0xFF)
+}
+
+// f64 → Q16（与 API 同 round 语义）。
+pub func q16(v: f64) -> i64 {
+    if v >= 0.0 {
+        return as_i64(v * as_f64(E_Q16) + 0.5)
+    }
+    return as_i64(v * as_f64(E_Q16) - 0.5)
+}
+
+// 追加 Q16 定点。
+pub func put_q(out: table<i64>, v: f64) {
+    put_i64(out, q16(v))
+}
+
+// 追加字符串：len + UTF-8 字节。
+pub func put_str(out: table<i64>, s: string) {
+    var n = str_len(s)
+    put_i64(out, n)
+    var i: i64 = 0
+    while i < n {
+        put_u8(out, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+}

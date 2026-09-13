@@ -1,0 +1,104 @@
+type tie<class>
+// engine/src/gold.tie —— tiu 渲染引擎：gold 图比较器（探针工具线 Z2）
+import "./semantics.tie"
+// ============================================================
+// 像素级 gold 比较：逐像素逐通道 |Δ| ≤ tol（引擎文档 §12 双端一致
+// 基准 ≤1/255，即每通道容差 1）。工具线随引擎模块一落地，全模块
+// 与 API 侧共用。
+//
+// EN: gold-frame comparator (probe tooling, Z2): per-pixel per-
+// channel |Δ| ≤ tol; the ≤1/255 dual-end consistency baseline.
+
+struct GoldResult {
+    var diff: i64 = 0       // 超差像素数
+    var max_delta: i64 = 0  // 最大通道差
+    var first: i64 = -1     // 首个超差像素下标
+}
+
+namespace egold {
+
+// 帧缓冲（每像素 0xAARRGGBB，初始全透明黑）。
+pub func fb_new(w: i64, h: i64) -> table<i64> {
+    var t = table_new_i64()
+    var n = w * h
+    var i: i64 = 0
+    while i < n {
+        table_push(t, 0)
+        i = i + 1
+    }
+    return t
+}
+
+// 逐像素比较（actual vs expect，w×h）。返回 GoldResult。
+pub func cmp_pixels(actual: table<i64>, expect: table<i64>, w: i64, h: i64, tol: i64) -> GoldResult {
+    var r = GoldResult()
+    var n = w * h
+    var nA = len(actual)
+    var nE = len(expect)
+    if nA != n || nE != n {
+        r.diff = -1
+        r.max_delta = 999
+        return r
+    }
+    var i: i64 = 0
+    while i < n {
+        var a = actual[i]
+        var e = expect[i]
+        var d = chan_max(a, e)
+        if d > r.max_delta {
+            r.max_delta = d
+        }
+        if d > tol {
+            r.diff = r.diff + 1
+            if r.first < 0 {
+                r.first = i
+            }
+        }
+        i = i + 1
+    }
+    return r
+}
+
+// 两像素四通道最大差。
+func chan_max(a: i64, e: i64) -> i64 {
+    var m: i64 = 0
+    var ar = sem.ch_r(a)
+    var er = sem.ch_r(e)
+    var d = ar - er
+    if d < 0 {
+        d = -d
+    }
+    if d > m {
+        m = d
+    }
+    var ag = sem.ch_g(a)
+    var eg = sem.ch_g(e)
+    d = ag - eg
+    if d < 0 {
+        d = -d
+    }
+    if d > m {
+        m = d
+    }
+    var ab = sem.ch_b(a)
+    var eb = sem.ch_b(e)
+    d = ab - eb
+    if d < 0 {
+        d = -d
+    }
+    if d > m {
+        m = d
+    }
+    var aa = sem.ch_a(a)
+    var ea = sem.ch_a(e)
+    d = aa - ea
+    if d < 0 {
+        d = -d
+    }
+    if d > m {
+        m = d
+    }
+    return m
+}
+
+}
