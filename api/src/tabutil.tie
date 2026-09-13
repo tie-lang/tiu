@@ -1,0 +1,69 @@
+type tie<class>
+// api/src/tabutil.tie —— tiu 绘制 API 共享表工具（不可变惯用法底座）
+// ============================================================
+// tie 表赋值 = 引用共享（非深拷贝）；"不可变更新"惯用法 =
+// 克隆（新副本）→ 修改 → 新记录。本模块提供确定性克隆/相等比较。
+// （tie 无内建表深拷贝，clone/copy 为用户层惯用名 —— 能力缺口如实
+// 记录：见 docs 收拢的实施计划 §3 与模块报告。）
+//
+// EN: shared table helpers — deterministic clone / equality used by
+// the immutable-record idiom (tie table assignment shares refs; an
+// update = clone → mutate → new record).
+
+namespace tabu {
+
+// table<i64> 深拷贝。
+pub func clone_i64(t: table<i64>) -> table<i64> {
+    var n = table_new_i64()
+    var i: i64 = 0
+    while i < len(t) {
+        table_push(n, t[i])
+        i = i + 1
+    }
+    return n
+}
+
+// table<f64> 深拷贝。
+pub func clone_f64(t: table<f64>) -> table<f64> {
+    var n = table_new_f64()
+    var i: i64 = 0
+    while i < len(t) {
+        table_push(n, t[i])
+        i = i + 1
+    }
+    return n
+}
+
+// table<i64> 深度相等。
+pub func eq_i64(a: table<i64>, b: table<i64>) -> bool {
+    var n = len(a)
+    if n != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// table<f64> 深度相等。
+pub func eq_f64(a: table<f64>, b: table<f64>) -> bool {
+    var n = len(a)
+    if n != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+}

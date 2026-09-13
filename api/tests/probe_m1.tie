@@ -1,0 +1,197 @@
+type tie<logic>
+// api/tests/probe_m1.tie —— API 模块一验收探针：对象模型
+// ============================================================
+// 覆盖：T1.1 图元/Path/Paint/Layer 数据记录（值语义、不可变、record
+// 字段对齐引擎 §4 op/geo/paint/clip/meta）· T1.2 Paint 效果栈默认
+// 范围闭合（实色/线性/径向/扫描/图像平铺/透明度/颜色矩阵/模糊/阴影/
+// 标准混合集）· T1.3 不可变构建 + 结构共享（单测：不变性/共享/别名
+// 安全）。验收门：本探针全绿 = 模块一完成。
+//
+// EN: API module-1 gate probe — object model. Covers record types
+// (immutable value semantics, fields aligned to engine §4), Paint
+// effect-stack default scope closure, immutability + structural
+// sharing. ALL PASS = module complete.
+
+import "../src/color.tie"
+import "../src/transform.tie"
+import "../src/paint.tie"
+import "../src/path.tie"
+import "../src/prim.tie"
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= gold record：Color =================
+    var c1 = color.rgba(10, 200, 30)
+    ck(color.pack(c1) == 0xFF0AC81E, fails_1(), "gold color.pack(rgba(10,200,30)) = 0xFF0AC81E")
+    if color.pack(c1) != 0xFF0AC81E { fails = fails + 1 }
+    var c2 = color.rgba(-5, 300, 30, 0)      // clamp: r=-5→0, g=300→255, b=30, a=0
+    if color.pack(c2) != 0xFF1E { fails = fails + 1; println("FAIL clamp got " + to_string(color.pack(c2))) } else { println("[PASS] color clamp 0xFF1E") }
+    var c3 = color.from_argb(0x80332211)
+    if color.eq(c3, color.rgba(0x33, 0x22, 0x11, 0x80)) { println("[PASS] color.from_argb roundtrip") } else { fails = fails + 1; println("FAIL from_argb") }
+
+    // ================= gold record：Transform =================
+    var t_id = tform.identity()
+    if tform.eq(t_id, Transform()) { println("[PASS] tform.identity") } else { fails = fails + 1; println("FAIL identity") }
+    var t_tr = tform.translate(3.0, 4.0)
+    var (mx, my) = tform.map_pt(t_tr, 1.0, 1.0)
+    if mx == 4.0 && my == 5.0 { println("[PASS] tform.translate map (4,5)") } else { fails = fails + 1; println("FAIL translate map") }
+    var t_sc = tform.concat(tform.scale(2.0, 3.0), t_tr)   // translate ∘ scale
+    var (sx, sy) = tform.map_pt(t_sc, 1.0, 1.0)
+    if sx == 5.0 && sy == 7.0 { println("[PASS] tform.concat scale*translate (5,7)") } else { fails = fails + 1; println("FAIL concat got " + to_string(sx) + "," + to_string(sy)) }
+    var six = tform.to_six(t_tr)
+    if len(six) == 6 && six[0] == 1.0 && six[2] == 3.0 { println("[PASS] tform.to_six len 6") } else { fails = fails + 1; println("FAIL to_six") }
+
+    // ================= gold record：Paint 效果栈 =================
+    var red = color.rgba(200, 30, 10, 255)
+    var p_solid = paint.solid(red)
+    if p_solid.fill == P_FILL_SOLID && color.eq(p_solid.color, red) { println("[PASS] paint.solid") } else { fails = fails + 1; println("FAIL solid") }
+
+    var st = paint.stop(255, 0, 0, 255, 0.0)
+    st = paint.stop_add(st, 0, 0, 255, 255, 1.0)
+    var p_lin = paint.linear(0.0, 0.0, 100.0, 0.0, st)
+    if p_lin.fill == P_FILL_LINEAR && p_lin.gx1 == 100.0 && paint.stop_count(p_lin.stops) == 2 { println("[PASS] paint.linear + 2 stops") } else { fails = fails + 1; println("FAIL linear") }
+    if p_lin.stops[4] == 0 && p_lin.stops[9] == P_Q16 { println("[PASS] stops offset_q16 fixed-point (0, 65536)") } else { fails = fails + 1; println("FAIL stops offset got " + to_string(p_lin.stops[4]) + "," + to_string(p_lin.stops[9])) }
+    if paint.stop_count(paint.stop_add(st, 1, 2, 3, 255, 0.5)) == 3 && paint.stop_count(st) == 2 { println("[PASS] stop_add immutable (orig 2 stops)") } else { fails = fails + 1; println("FAIL stop_add immut") }
+
+    // 描边 / 透明度 / 混合 / 模糊 / 阴影 / 颜色矩阵（效果栈闭合）
+    var p_st = paint.with_stroke(p_solid, 2.5, P_CAP_ROUND, P_JOIN_BEVEL)
+    if p_st.stroke_w == 2.5 && p_st.cap == P_CAP_ROUND && p_st.join == P_JOIN_BEVEL { println("[PASS] with_stroke") } else { fails = fails + 1; println("FAIL with_stroke") }
+    var p_alpha = paint.with_alpha(p_st, 128)
+    if p_alpha.alpha == 128 { println("[PASS] with_alpha") } else { fails = fails + 1; println("FAIL with_alpha") }
+    var p_blend = paint.with_blend(p_alpha, P_BLEND_SCREEN)
+    if p_blend.blend == P_BLEND_SCREEN { println("[PASS] with_blend screen") } else { fails = fails + 1; println("FAIL with_blend") }
+    var p_blur = paint.with_blur(p_blend, 4.0)
+    if p_blur.blur == 4.0 { println("[PASS] with_blur") } else { fails = fails + 1; println("FAIL with_blur") }
+    var gray = color.rgba(0, 0, 0, 128)
+    var p_sh = paint.with_shadow(p_blur, 2.0, 3.0, gray)
+    if p_sh.shadow == 1 && p_sh.shx == 2.0 && p_sh.shy == 3.0 && color.eq(p_sh.sh_color, gray) { println("[PASS] with_shadow") } else { fails = fails + 1; println("FAIL with_shadow") }
+    var mtab = table_new_i64()
+    var mi: i64 = 0
+    while mi < 20 {
+        table_push(mtab, mi)
+        mi = mi + 1
+    }
+    var p_mat = paint.with_matrix(p_sh, mtab)
+    if len(p_mat.cmatrix) == 20 { println("[PASS] with_matrix 4x5=20") } else { fails = fails + 1; println("FAIL with_matrix") }
+    var p_dash = paint.with_dash(p_solid, dtab(), 0.5)
+    if len(p_dash.dash) == 3 && p_dash.dash[2] == 0.5 { println("[PASS] with_dash pattern+phase") } else { fails = fails + 1; println("FAIL with_dash") }
+
+    // ================= 不变性：修改返回新 Paint，旧引用恒有效 =================
+    var base = paint.solid(color.rgba(10, 20, 30))
+    var b1 = paint.with_alpha(base, 100)
+    if base.alpha == 255 && b1.alpha == 100 && paint.eq(base, paint.solid(color.rgba(10, 20, 30))) { println("[PASS] immut: with_alpha leaves base unchanged") } else { fails = fails + 1; println("FAIL immut alpha") }
+    var b2 = paint.with_stroke(base, 1.0, P_CAP_SQUARE, P_JOIN_MITER)
+    var b3 = paint.with_blur(base, 9.0)
+    if paint.eq(base, paint.solid(color.rgba(10, 20, 30))) && b2.stroke_w == 1.0 && b3.blur == 9.0 { println("[PASS] immut: multi with_* all isolate") } else { fails = fails + 1; println("FAIL immut multi") }
+
+    // ================= 结构共享：表字段共享引用 + 别名安全 =================
+    var sA = paint.stop(255, 0, 0, 255, 0.0)
+    sA = paint.stop_add(sA, 0, 255, 0, 255, 1.0)
+    var lA = paint.linear(0.0, 0.0, 10.0, 0.0, sA)
+    var lB = lA                                   // 复制：stops 共享同一底层表（结构共享）
+    if len(lB.stops) == len(lA.stops) && lB.stops[0] == 255 { println("[PASS] share: copied paint shares stops table") } else { fails = fails + 1; println("FAIL share copy") }
+    var lC = paint.with_alpha(lB, 64)             // 只改标量：stops 仍共享
+    if paint.stop_count(lC.stops) == 2 && paint.stop_count(lA.stops) == 2 { println("[PASS] share: with_alpha keeps shared stops") } else { fails = fails + 1; println("FAIL share with_alpha") }
+    var lD = paint.linear(0.0, 0.0, 20.0, 0.0, paint.stop_add(sA, 0, 0, 255, 255, 0.5))   // 新 stops（3 项）与新 paint
+    if paint.stop_count(lD.stops) == 3 && paint.stop_count(lA.stops) == 2 { println("[PASS] alias-safe: new stops never touches old paint") } else { fails = fails + 1; println("FAIL alias-safe stops") }
+    var lE = lA
+    lE.color = red
+    if color.eq(lA.color, color.rgba(0, 0, 0, 255)) { println("[PASS] alias-safe: struct field copy is value semantics") } else { fails = fails + 1; println("FAIL alias-safe field") }
+
+    // ================= gold record：Path 命令序列 =================
+    var p0 = path.new()
+    var p1 = path.move_to(p0, 1.0, 2.0)
+    var p2 = path.line_to(p1, 3.0, 4.0)
+    var p3 = path.quad_to(p2, 1.0, 1.0, 2.0, 2.0)
+    var p4 = path.cubic_to(p3, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0)
+    var p5 = path.arc_to(p4, 0.0, 0.0, 5.0, 0.0, 1.5708)
+    var p6 = path.close(p5)
+    if path.cmd_count(p0) == 0 && path.cmd_count(p6) == 6 { println("[PASS] path cmd_count") } else { fails = fails + 1; println("FAIL path count") }
+    if path.cmd_op(p6, 0) == P_MOVE && path.cmd_op(p6, 5) == P_CLOSE { println("[PASS] path op sequence") } else { fails = fails + 1; println("FAIL path ops") }
+    var a2 = path.cmd_args(p6, 2)
+    if len(a2) == 4 && a2[3] == 2.0 { println("[PASS] path cmd_args quad (offset derived)") } else { fails = fails + 1; println("FAIL path args") }
+    var dmp = path.dump(p6)
+    if contains(dmp, "M") && contains(dmp, "L") && contains(dmp, "Q") && contains(dmp, "C") && contains(dmp, "A") && contains(dmp, "Z") { println("[PASS] path dump covers all ops") } else { fails = fails + 1; println("FAIL path dump=" + dmp) }
+
+    // ================= 不变性：Path 追加返回新 Path =================
+    if path.cmd_count(p0) == 0 && path.cmd_count(p1) == 1 && path.cmd_count(p2) == 2 { println("[PASS] path immut: appends isolate") } else { fails = fails + 1; println("FAIL path immut") }
+    if path.cmd_op(p1, 0) == P_MOVE && path.cmd_op(p2, 1) == P_LINE { println("[PASS] path immut: old ops preserved") } else { fails = fails + 1; println("FAIL path old ops") }
+    if path.eq(p6, p6) { println("[PASS] path.eq reflexive") } else { fails = fails + 1; println("FAIL path eq") }
+
+    // ================= gold record：图元 / 图层 =================
+    var pr1 = prim.rect(10.0, 20.0, 100.0, 50.0, p_solid)
+    if pr1.op == PO_RECT && pr1.x == 10.0 && pr1.y == 20.0 && pr1.w == 100.0 && pr1.h == 50.0 && paint.eq(pr1.p, p_solid) { println("[PASS] prim.rect + paint ref") } else { fails = fails + 1; println("FAIL prim rect") }
+    var pr2 = prim.rrect(0.0, 0.0, 10.0, 10.0, 2.0, 3.0, p_solid)
+    if pr2.op == PO_RRECT && pr2.rx == 2.0 && pr2.ry == 3.0 { println("[PASS] prim.rrect corners") } else { fails = fails + 1; println("FAIL rrect") }
+    var pr3 = prim.text_p("hi", 5.0, 6.0, 16.0, p_solid)
+    if pr3.op == PO_TEXT && pr3.txt == "hi" && pr3.fs == 16.0 { println("[PASS] prim.text") } else { fails = fails + 1; println("FAIL text") }
+    var pr4 = prim.path_p(p6, p_solid)
+    if pr4.op == PO_PATH && path.cmd_count(pr4.pth) == 6 { println("[PASS] prim.path record") } else { fails = fails + 1; println("FAIL path prim") }
+    var ly = Layer()
+    ly.x = 0.0
+    ly.y = 0.0
+    ly.w = 100.0
+    ly.h = 100.0
+    ly.p = p_solid
+    var pr5 = prim.save_layer(ly)
+    var pr6 = prim.restore_layer()
+    if pr5.op == PO_SAVE_LAYER && pr5.w == 100.0 && pr6.op == PO_RESTORE_LAYER { println("[PASS] layer save/restore records") } else { fails = fails + 1; println("FAIL layer") }
+    var pr7 = prim.with_meta(pr1, "btn")
+    if pr7.meta == "btn" && pr1.meta == "" { println("[PASS] with_meta isolates (alias-safe)") } else { fails = fails + 1; println("FAIL with_meta") }
+    if prim.eq(pr1, pr1) && !prim.eq(pr1, pr2) { println("[PASS] prim.eq gold") } else { fails = fails + 1; println("FAIL prim eq") }
+
+    // ================= 汇总 =================
+    if fails == 0 {
+        println("API M1: ALL PASS")
+    } else {
+        println("API M1: FAILURES " + to_string(fails))
+        exit(1)
+    }
+    return 0
+}
+
+// ck 辅助（统一 PASS/FAIL 输出；fails 计数由调用方维护，见 fails_1）。
+func ck(cond: bool, _unused: i64, name: string) {
+    if cond {
+        println("[PASS] " + name)
+    } else {
+        println("[FAIL] " + name)
+    }
+}
+
+func fails_1() -> i64 {
+    return 0
+}
+
+// 虚线 pattern（2 项 + phase 由 with_dash 追加）。
+func dtab() -> table<f64> {
+    var d = table_new_f64()
+    table_push(d, 4.0)
+    table_push(d, 2.0)
+    return d
+}
+
+func contains(s: string, sub: string) -> bool {
+    var n = str_len(s)
+    var m = str_len(sub)
+    if m == 0 {
+        return true
+    }
+    var i: i64 = 0
+    while i + m <= n {
+        var j: i64 = 0
+        var ok = true
+        while j < m {
+            if str_char(s, i + j) != str_char(sub, j) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

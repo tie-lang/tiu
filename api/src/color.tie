@@ -1,0 +1,60 @@
+type tie<class>
+// api/src/color.tie —— tiu 绘制 API 对象模型：颜色
+// ============================================================
+// Color 数据记录：RGBA 0-255，sRGB 通道（引擎固定工作空间 sRGB）。
+// 值语义、不可变：构建后字段不再原地修改（修改 = 新记录）。
+//
+// EN: Color record — RGBA 0-255, sRGB channels. Value semantics,
+// immutable after construction.
+
+struct Color {
+    var r: i64 = 0
+    var g: i64 = 0
+    var b: i64 = 0
+    var a: i64 = 255
+}
+
+namespace color {
+
+// 由 RGBA 通道构建 Color（clamp 0-255）。
+pub func rgba(r: i64, g: i64, b: i64, a: i64 = 255) -> Color {
+    var c = Color()
+    c.r = clamp01(r)
+    c.g = clamp01(g)
+    c.b = clamp01(b)
+    c.a = clamp01(a)
+    return c
+}
+
+// 24/32 位 ARGB 打包值（0xAARRGGBB）→ Color。用于资源/图像载入路径。
+pub func from_argb(packed: i64) -> Color {
+    var c = Color()
+    c.a = (packed >> 24) & 0xFF
+    c.r = (packed >> 16) & 0xFF
+    c.g = (packed >> 8) & 0xFF
+    c.b = packed & 0xFF
+    return c
+}
+
+// 打包为 0xAARRGGBB（IR 编码 / gold 字节用）。
+pub func pack(c: Color) -> i64 {
+    return ((c.a & 0xFF) << 24) | ((c.r & 0xFF) << 16) | ((c.g & 0xFF) << 8) | (c.b & 0xFF)
+}
+
+// 相等比较（值语义）。
+pub func eq(c1: Color, c2: Color) -> bool {
+    return c1.r == c2.r && c1.g == c2.g && c1.b == c2.b && c1.a == c2.a
+}
+
+// 通道 clamp 0-255。
+func clamp01(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    return v
+}
+
+}
