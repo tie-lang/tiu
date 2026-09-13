@@ -1,0 +1,420 @@
+type tie<class>
+// tree.tie —— tiu 组件树骨架（p.9.4.2 模块一）
+// EN: widget-tree skeleton — mount/unmount, hierarchy, DFS order.
+// ============================================================
+// 依据：docs/designs/tiu-ui-widgets.md §3（骨架/快照分层、紧凑存储）、§8（DFS 序）。
+// 本模块为 UI 层结构核心：以 SoA（结构数组）近似布局存树——类型/槽位/版本号/
+// 父/长子/兄弟/存活各一表，树遍历按 DFS 序连续内存。
+// 语义要点：
+//   - 挂载 = 追加节点（表尾分配 id），挂到父的兄弟链尾；根节点 parent = -1。
+//   - 卸载 = 子树 dead 标记（tie 无删除原语，不真删表元素；dead 节点不参与
+//     DFS 序 / 布局 / 命中 / 差分）。
+//   - 版本号 = props 单调版本（帧快照比较只看版本号，O(1)，见 widgets §8.1）。
+//   - 结构 key 前缀 = 根到节点的 slot 链（slot 是稳定兄弟定位符，widgets §4.2）。
+// 坐标：i64 逻辑坐标（逻辑空间，DPI 归一由运行时底座处理）。
+// 命名规范：命名空间内函数不加 tiu_tree_ 前缀。
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\tree.tie（探针见 tests/）
+
+// ---- 控件类型（enum 无 payload；存储为 i64 码）----
+enum WidgetType {
+    Row
+    Column
+    Text
+    Button
+    Absolute
+}
+
+// 布局矩形（值语义；方法放 Rect 命名空间，obj.method() 转发）
+struct Rect {
+    var x: i64 = 0
+    var y: i64 = 0
+    var w: i64 = 0
+    var h: i64 = 0
+}
+
+// ---- SoA 存储（顶层全局表，跨函数持久；tie 约定顶层 table 全局须 = []）----
+var g_types: table<i64> = []    // WidgetType 码
+var g_slots: table<i64> = []    // 槽位（兄弟定位符）
+var g_vers: table<i64> = []     // props 版本号
+var g_parents: table<i64> = []  // 父 id（根 = -1）
+var g_first: table<i64> = []    // 长子 id（-1 = 无）
+var g_next: table<i64> = []     // 下一兄弟 id（-1 = 无）
+var g_dead: table<i64> = []     // 0 = 活 / 1 = dead（卸载标记）
+var g_textlen: table<i64> = []  // Text/Button 内容长度（布局用；简化 props）
+var g_ox: table<i64> = []       // 绝对定位：相对父内容区 x 偏移
+var g_oy: table<i64> = []       // 绝对定位：相对父内容区 y 偏移
+var g_fw: table<i64> = []       // 固定宽（0 = 内容自适应）
+var g_fh: table<i64> = []       // 固定高（0 = 内容自适应）
+var g_x: table<i64> = []        // 布局结果矩形（布局模块写）
+var g_y: table<i64> = []
+var g_w: table<i64> = []
+var g_h: table<i64> = []
+var g_root: i64 = -1
+var g_next_id: i64 = 0
+
+namespace tiu_tree {
+// ---- 类型码转换 ----
+
+// WidgetType -> i64 码（0..4）
+pub func ty_code(ty: WidgetType) -> i64 {
+    var c: i64 = 0
+    switch ty {
+        case WidgetType.Row: c = 0
+        case WidgetType.Column: c = 1
+        case WidgetType.Text: c = 2
+        case WidgetType.Button: c = 3
+        case WidgetType.Absolute: c = 4
+        default: c = 0
+    }
+    return c
+}
+
+// i64 码 -> 类型名（诊断 / 探针显示用）
+pub func type_name(kind: i64) -> string {
+    if kind == 0 {
+        return "Row"
+    }
+    if kind == 1 {
+        return "Column"
+    }
+    if kind == 2 {
+        return "Text"
+    }
+    if kind == 3 {
+        return "Button"
+    }
+    return "Absolute"
+}
+
+// ---- 生命周期 ----
+
+// 重置：清空整树（重建全部 SoA 表）
+pub func reset() {
+    g_types = table_new_i64()
+    g_slots = table_new_i64()
+    g_vers = table_new_i64()
+    g_parents = table_new_i64()
+    g_first = table_new_i64()
+    g_next = table_new_i64()
+    g_dead = table_new_i64()
+    g_textlen = table_new_i64()
+    g_ox = table_new_i64()
+    g_oy = table_new_i64()
+    g_fw = table_new_i64()
+    g_fh = table_new_i64()
+    g_x = table_new_i64()
+    g_y = table_new_i64()
+    g_w = table_new_i64()
+    g_h = table_new_i64()
+    g_root = -1
+    g_next_id = 0
+}
+
+// 挂载：新建节点。parent = -1 表示根（重置后首个挂载）。返回新节点 id。
+pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
+    var id = g_next_id
+    g_next_id = g_next_id + 1
+    table_push(g_types, ty_code(ty))
+    table_push(g_slots, slot)
+    table_push(g_vers, 0)
+    table_push(g_parents, parent)
+    table_push(g_first, -1)
+    table_push(g_next, -1)
+    table_push(g_dead, 0)
+    table_push(g_textlen, 0)
+    table_push(g_ox, 0)
+    table_push(g_oy, 0)
+    table_push(g_fw, 0)
+    table_push(g_fh, 0)
+    table_push(g_x, 0)
+    table_push(g_y, 0)
+    table_push(g_w, 0)
+    table_push(g_h, 0)
+    if parent < 0 {
+        g_root = id
+    } else {
+        if g_first[parent] < 0 {
+            g_first[parent] = id
+        } else {
+            var c = g_first[parent]
+            var last = c
+            while c >= 0 {
+                last = c
+                c = g_next[c]
+            }
+            g_next[last] = id
+        }
+    }
+    return id
+}
+
+// 卸载：把 id 及其整个子树标记为 dead（迭代，无递归）。
+pub func unmount(id: i64) {
+    if id < 0 {
+        return
+    }
+    if id >= len(g_dead) {
+        return
+    }
+    if g_dead[id] == 1 {
+        return
+    }
+    var st = table_new_i64()
+    var top: i64 = 0
+    table_push(st, id)
+    while top < len(st) {
+        var cur = st[top]
+        top = top + 1
+        g_dead[cur] = 1
+        var c = g_first[cur]
+        while c >= 0 {
+            if g_dead[c] == 0 {
+                table_push(st, c)
+            }
+            c = g_next[c]
+        }
+    }
+}
+
+// ---- 查询 ----
+
+// 根节点 id（-1 = 空树）
+pub func root() -> i64 {
+    return g_root
+}
+
+// 活节点数（DFS 序遍历计数）
+pub func count() -> i64 {
+    return len(dfs_order())
+}
+
+// 总节点数（含 dead 占位）
+pub func total() -> i64 {
+    return len(g_dead)
+}
+
+// 节点是否存活
+pub func is_live(id: i64) -> bool {
+    if id < 0 {
+        return false
+    }
+    if id >= len(g_dead) {
+        return false
+    }
+    return g_dead[id] == 0
+}
+
+pub func is_dead(id: i64) -> bool {
+    return !is_live(id)
+}
+
+pub func ty_of(id: i64) -> i64 {
+    return g_types[id]
+}
+
+pub func slot_of(id: i64) -> i64 {
+    return g_slots[id]
+}
+
+pub func ver_of(id: i64) -> i64 {
+    return g_vers[id]
+}
+
+pub func parent_of(id: i64) -> i64 {
+    return g_parents[id]
+}
+
+pub func first_child(id: i64) -> i64 {
+    return g_first[id]
+}
+
+pub func next_sibling(id: i64) -> i64 {
+    return g_next[id]
+}
+
+pub func text_len(id: i64) -> i64 {
+    return g_textlen[id]
+}
+
+// ---- 属性写入 ----
+
+// 设置 props 版本号（差分唯一值键，widgets §8.1）
+pub func set_ver(id: i64, v: i64) {
+    g_vers[id] = v
+}
+
+// 批量设置 props 简化字段：版本号 / 文本长度 / 绝对偏移 / 固定尺寸
+pub func set_props(id: i64, ver: i64, textlen: i64, ox: i64, oy: i64, fw: i64, fh: i64) {
+    g_vers[id] = ver
+    g_textlen[id] = textlen
+    g_ox[id] = ox
+    g_oy[id] = oy
+    g_fw[id] = fw
+    g_fh[id] = fh
+}
+
+// ---- 布局结果（布局模块写入，命中/差分只读）----
+
+pub func set_rect(id: i64, x: i64, y: i64, w: i64, h: i64) {
+    g_x[id] = x
+    g_y[id] = y
+    g_w[id] = w
+    g_h[id] = h
+}
+
+pub func rect(id: i64) -> Rect {
+    return Rect(g_x[id], g_y[id], g_w[id], g_h[id])
+}
+
+// ---- 树遍历 ----
+
+// DFS 序（活节点；前序，父先于子，子按兄弟序）。迭代实现（显式 LIFO 栈，无递归）。
+// 注：tie 无栈 pop 原语，LIFO 用「栈数组下标写 + 栈顶指针」模拟（top 指针即"逻辑删除"）。
+pub func dfs_order() -> table<i64> {
+    var out = table_new_i64()
+    if g_root < 0 {
+        return out
+    }
+    if g_dead[g_root] == 1 {
+        return out
+    }
+    var st = table_new_i64()
+    table_push(st, -1)   // 占位：保证 len >= 1，供下标写
+    var top: i64 = 0
+    st[0] = g_root
+    top = 1
+    while top > 0 {
+        top = top - 1
+        var id = st[top]
+        table_push(out, id)
+        // 子节点逆序入栈（末子先写、长子最后写 → 弹出时长子优先）
+        var kids = table_new_i64()
+        var c = g_first[id]
+        while c >= 0 {
+            if g_dead[c] == 0 {
+                table_push(kids, c)
+            }
+            c = g_next[c]
+        }
+        var i: i64 = len(kids) - 1
+        while i >= 0 {
+            if top == len(st) {
+                table_push(st, kids[i])
+            } else {
+                st[top] = kids[i]
+            }
+            top = top + 1
+            i = i - 1
+        }
+    }
+    return out
+}
+
+// 子树节点表（含 id 自身；DFS 前序）
+pub func subtree(id: i64) -> table<i64> {
+    var out = table_new_i64()
+    if !is_live(id) {
+        return out
+    }
+    var st = table_new_i64()
+    table_push(st, -1)
+    var top: i64 = 0
+    st[0] = id
+    top = 1
+    while top > 0 {
+        top = top - 1
+        var cur = st[top]
+        table_push(out, cur)
+        var kids = table_new_i64()
+        var c = g_first[cur]
+        while c >= 0 {
+            if g_dead[c] == 0 {
+                table_push(kids, c)
+            }
+            c = g_next[c]
+        }
+        var i: i64 = len(kids) - 1
+        while i >= 0 {
+            if top == len(st) {
+                table_push(st, kids[i])
+            } else {
+                st[top] = kids[i]
+            }
+            top = top + 1
+            i = i - 1
+        }
+    }
+    return out
+}
+
+// ---- 结构 key 前缀 ----
+
+// 根到 id 的 slot 链（"s0:s1:s2"；slot 稳定 → 前缀稳定，增量段归属子树标识）
+pub func path_of(id: i64) -> string {
+    var segs = table_new_i64()
+    var cur = id
+    while cur >= 0 {
+        table_push(segs, g_slots[cur])
+        cur = g_parents[cur]
+    }
+    var sb = string_builder()
+    var i: i64 = len(segs) - 1
+    while i >= 0 {
+        if i != len(segs) - 1 {
+            sb_append(sb, ":")
+        }
+        sb_append(sb, to_string(segs[i]))
+        i = i - 1
+    }
+    return sb_build(sb)
+}
+}
+
+// ---- Rect 命名空间（与 struct 同名；obj.method() 转发或 Rect.xxx 静态调用）----
+namespace Rect {
+// 并集：覆盖 a 与 b 的最小矩形（b 为空 → 返回 a）
+// 注：struct 形参按引用传递；编译器对「形参整拷贝」路径有缺陷，统一按字段读取
+// 重新构造返回（tiec 现行实现约束）。
+pub func union(a: Rect, b: Rect) -> Rect {
+    if b.w == 0 && b.h == 0 {
+        return Rect(a.x, a.y, a.w, a.h)
+    }
+    if a.w == 0 && a.h == 0 {
+        return Rect(b.x, b.y, b.w, b.h)
+    }
+    var x0 = a.x
+    var y0 = a.y
+    var x1 = a.x + a.w
+    var y1 = a.y + a.h
+    if b.x < x0 {
+        x0 = b.x
+    }
+    if b.y < y0 {
+        y0 = b.y
+    }
+    if b.x + b.w > x1 {
+        x1 = b.x + b.w
+    }
+    if b.y + b.h > y1 {
+        y1 = b.y + b.h
+    }
+    return Rect(x0, y0, x1 - x0, y1 - y0)
+}
+
+// 点包含判定：半开区间 [x, x+w) × [y, y+h)
+pub func contains(r: Rect, px: i64, py: i64) -> bool {
+    if px < r.x {
+        return false
+    }
+    if py < r.y {
+        return false
+    }
+    if px >= r.x + r.w {
+        return false
+    }
+    if py >= r.y + r.h {
+        return false
+    }
+    return true
+}
+}
