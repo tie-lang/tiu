@@ -1,0 +1,206 @@
+type tie<logic>
+// engine/tests/probe_e1.tie —— 渲染引擎模块一验收探针
+// ============================================================
+// 覆盖：T1.1 record 字节布局解析装载（loader 消费手工构造的 IR
+// 字节，T2.1 冻结布局）· T1.2 软件图元光栅（rect/纯色/文本位图
+// 字形 → 软件帧缓冲）· T1.3 渲染语义规范初版为内核唯一执行路径
+// （混合/覆盖率/颜色空间断言）· T1.4 gold 探针（软件输出与独立
+// 手工期望逐像素 ≤1/255）。验收门：全绿 = 引擎模块一完成（最小
+// End-to-End 帧：IR 字节 → loader → 软件光栅 → 帧缓冲）。
+//
+// EN: engine module-1 gate probe — IR loader (frozen layout), SW
+// raster (rect/solid/text), semantics spec v0, gold ≤1/255.
+// ALL PASS = module complete (minimal E2E frame).
+
+import "../src/irb.tie"
+import "../src/ir_load.tie"
+import "../src/semantics.tie"
+import "../src/gold.tie"
+import "../src/glyph.tie"
+import "../src/utfmin.tie"
+import "../src/raster.tie"
+
+const BG: i64 = 0xFF202020
+const RED: i64 = 0xFFE03020
+const WHITE: i64 = 0xFFFFFFFF
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= 渲染语义规范（T1.3） =================
+    if sem.blend_ch(0x40, 0xC0, 128) == 128 { println("[PASS] semantics blend_ch src-over (128)") } else { fails = fails + 1; println("FAIL blend " + to_string(sem.blend_ch(0x40, 0xC0, 128))) }
+    if sem.blend_ch(0x20, 0xFF, 255) == 255 && sem.blend_ch(0x20, 0xFF, 0) == 32 { println("[PASS] semantics blend opaque/transparent edges") } else { fails = fails + 1; println("FAIL blend edges") }
+    if sem.pack(1, 2, 3, 255) == 0xFF010203 && sem.ch_r(0xFF010203) == 1 { println("[PASS] semantics pack/channels") } else { fails = fails + 1; println("FAIL pack") }
+
+    // ================= 手工构造 IR 帧（T2.1 冻结布局） =================
+    var b = table_new_i64()
+    eirb.put_u8(b, 84)
+    eirb.put_u8(b, 73)
+    eirb.put_u8(b, 85)
+    eirb.put_u8(b, 49)
+    eirb.put_u8(b, 1)
+    eirb.put_u8(b, 0)
+    eirb.put_u8(b, 0)
+    eirb.put_u8(b, 0)
+    eirb.put_q(b, 1.0); eirb.put_q(b, 0.0); eirb.put_q(b, 0.0)
+    eirb.put_q(b, 0.0); eirb.put_q(b, 1.0); eirb.put_q(b, 0.0)
+    eirb.put_i64(b, 16)
+    eirb.put_i64(b, 16)
+    eirb.put_q(b, 1.0)
+    eirb.put_i64(b, 3)
+    put_record(b, E_OP_RECT, 0.0, 0.0, 16.0, 16.0, 0, BG, 255, "")      // 背景
+    put_record(b, E_OP_RECT, 2.0, 2.0, 8.0, 6.0, 0, RED, 255, "")        // 红块
+    put_record(b, E_OP_TEXT, 1.0, 3.0, 12.0, 0.0, 0, WHITE, 255, "Hi")   // 文本
+
+    // ================= IR loader（T1.1） =================
+    var p = eload.parse_frame(b)
+    if len(p.ops) == 3 && len(p.fills) == 3 && len(p.txt) == 3 { println("[PASS] loader: 3 records") } else { fails = fails + 1; println("FAIL loader count") }
+    if p.ops[0] == E_OP_RECT && p.ops[2] == E_OP_TEXT { println("[PASS] loader: op sequence") } else { fails = fails + 1; println("FAIL loader ops") }
+    if p.x[0] == 0.0 && p.w[1] == 8.0 && p.h[1] == 6.0 { println("[PASS] loader: rect geometry q16") } else { fails = fails + 1; println("FAIL loader geo " + to_string(p.x[0]) + "," + to_string(p.w[1])) }
+    if p.colors[0] == BG && p.colors[1] == RED && p.colors[2] == WHITE { println("[PASS] loader: colors") } else { fails = fails + 1; println("FAIL loader colors") }
+    if p.txt[2] == "Hi" && p.fs[2] == 12.0 { println("[PASS] loader: text + font size") } else { fails = fails + 1; println("FAIL loader txt") }
+    if p.sw == 16 && p.sh == 16 && p.dpi == 1.0 { println("[PASS] loader: surface") } else { fails = fails + 1; println("FAIL surface") }
+    if p.view[0] == 1.0 && p.view[5] == 0.0 { println("[PASS] loader: view transform") } else { fails = fails + 1; println("FAIL view") }
+
+    // ================= 软件光栅 + gold ≤1/255（T1.2/T1.4） =================
+    var fb = erast.render(p)
+    var gold = gold_frame()
+    var gr = egold.cmp_pixels(fb.px, gold, 16, 16, 1)
+    if gr.diff == 0 { println("[PASS] gold frame diff=0 (≤1/255), max_delta=" + to_string(gr.max_delta)) } else { fails = fails + 1; println("FAIL gold diff=" + to_string(gr.diff) + " max=" + to_string(gr.max_delta) + " first=" + to_string(gr.first)) }
+    // 最小帧：非全零且有内容
+    var nonz: i64 = 0
+    var i2: i64 = 0
+    while i2 < 256 {
+        if fb.px[i2] != 0 {
+            nonz = nonz + 1
+        }
+        i2 = i2 + 1
+    }
+    if nonz == 256 { println("[PASS] minimal frame fully painted (256/256 px)") } else { fails = fails + 1; println("FAIL frame coverage " + to_string(nonz)) }
+
+    // ================= 半透明混合场景（语义唯一路径） =================
+    var b2 = table_new_i64()
+    eirb.put_u8(b2, 84); eirb.put_u8(b2, 73); eirb.put_u8(b2, 85); eirb.put_u8(b2, 49)
+    eirb.put_u8(b2, 1); eirb.put_u8(b2, 0); eirb.put_u8(b2, 0); eirb.put_u8(b2, 0)
+    eirb.put_q(b2, 1.0); eirb.put_q(b2, 0.0); eirb.put_q(b2, 0.0)
+    eirb.put_q(b2, 0.0); eirb.put_q(b2, 1.0); eirb.put_q(b2, 0.0)
+    eirb.put_i64(b2, 16); eirb.put_i64(b2, 16); eirb.put_q(b2, 1.0)
+    eirb.put_i64(b2, 2)
+    put_record(b2, E_OP_RECT, 0.0, 0.0, 16.0, 16.0, 0, BG, 255, "")
+    put_record(b2, E_OP_RECT, 2.0, 2.0, 4.0, 4.0, 0, WHITE, 128, "")    // 半透明白
+    var p2 = eload.parse_frame(b2)
+    var fb2 = erast.render(p2)
+    // 期望：中心像素 (4,4) = blend(0x20, 0xFF, 128) = 143,143,143；
+    // alpha 通道：src_a=128 合成到不透明背景（dst_a=255）→ 255
+    var exp = sem.blend_ch(0x20, 0xFF, 128)
+    var px44 = fb2.px[4 * 16 + 4]
+    if sem.ch_r(px44) == exp && sem.ch_g(px44) == exp && sem.ch_b(px44) == exp && sem.ch_a(px44) == 255 {
+        println("[PASS] translucent blend pixel = " + to_string(exp))
+    } else {
+        fails = fails + 1
+        println("FAIL blend px got " + to_string(sem.ch_r(px44)) + "," + to_string(sem.ch_a(px44)) + " exp " + to_string(exp))
+    }
+
+    // ================= 汇总 =================
+    if fails == 0 {
+        println("ENGINE E1: ALL PASS (minimal frame rendered)")
+    } else {
+        println("ENGINE E1: FAILURES " + to_string(fails))
+        exit(1)
+    }
+    return 0
+}
+
+// ---- 手工 record 构造（T2.1 冻结布局，引擎侧独立实现） ----
+
+func put_record(b: table<i64>, op: i64, x: f64, y: f64, w: f64, h: f64, fill: i64, color: i64, alpha: i64, txt: string) {
+    var geo = table_new_i64()
+    if op == E_OP_TEXT {
+        eirb.put_q(geo, x)
+        eirb.put_q(geo, y)
+        eirb.put_q(geo, w)          // fs
+        eirb.put_str(geo, txt)
+    } else {
+        eirb.put_q(geo, x)
+        eirb.put_q(geo, y)
+        eirb.put_q(geo, w)
+        eirb.put_q(geo, h)
+    }
+    eirb.put_q(geo, 1.0); eirb.put_q(geo, 0.0); eirb.put_q(geo, 0.0)
+    eirb.put_q(geo, 0.0); eirb.put_q(geo, 1.0); eirb.put_q(geo, 0.0)
+    var paint = table_new_i64()
+    eirb.put_i64(paint, fill)
+    eirb.put_i64(paint, color)
+    eirb.put_q(paint, 0.0); eirb.put_q(paint, 0.0); eirb.put_q(paint, 0.0); eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)     // stops_n
+    eirb.put_q(paint, 0.0)     // stroke_w
+    eirb.put_i64(paint, 0)     // cap
+    eirb.put_i64(paint, 0)     // join
+    eirb.put_i64(paint, 0)     // dash_n
+    eirb.put_i64(paint, alpha)
+    eirb.put_i64(paint, 0)     // blend
+    eirb.put_i64(paint, 0)     // cm_n
+    eirb.put_q(paint, 0.0)     // blur
+    eirb.put_i64(paint, 0)     // shadow
+    eirb.put_q(paint, 0.0); eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)     // sh_color
+    eirb.put_i64(paint, 0)     // image
+    eirb.put_i64(b, op)
+    eirb.put_i64(b, 0)         // key 占位（loader 只读不消费）
+    eirb.put_i64(b, len(geo))
+    append_all(b, geo)
+    eirb.put_i64(b, len(paint))
+    append_all(b, paint)
+    eirb.put_i64(b, -1)        // clip
+    eirb.put_str(b, "")        // meta
+}
+
+func append_all(out: table<i64>, src: table<i64>) {
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(out, src[i])
+        i = i + 1
+    }
+}
+
+// ---- gold 期望（独立手工构造，不走渲染器） ----
+
+func gold_frame() -> table<i64> {
+    var t = egold.fb_new(16, 16)
+    // 背景全帧
+    var i: i64 = 0
+    while i < 256 {
+        t[i] = BG
+        i = i + 1
+    }
+    // 红 rect [2,10)×[2,8)
+    var y: i64 = 2
+    while y < 8 {
+        var x: i64 = 2
+        while x < 10 {
+            t[y * 16 + x] = RED
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // 文本 "Hi" at (1,3)：字形行 bit0 = 最左列
+    blit_glyph(t, 72, 1, 3)    // 'H'
+    blit_glyph(t, 105, 7, 3)   // 'i'（adv 6）
+    return t
+}
+
+func blit_glyph(t: table<i64>, cp: i64, ox: i64, oy: i64) {
+    var r = eglyph.rows(cp)
+    var j: i64 = 0
+    while j < GLYPH_H {
+        var row = r[j]
+        var k: i64 = 0
+        while k < GLYPH_W {
+            if ((row >> k) & 1) != 0 {
+                t[(oy + j) * 16 + ox + k] = WHITE
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+}

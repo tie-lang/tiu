@@ -1,0 +1,249 @@
+type tie<class>
+// engine/src/ir_load.tie —— tiu 渲染引擎：绘制表 IR loader
+// ============================================================
+// 消费 API 实施计划 T2.1 冻结布局的 IR 字节 → 引擎内部图元表示
+// （Parsed，列式）。引擎只消费字节（无对象引用、无代码路径穿越），
+// 对齐渲染引擎文档 §4"绘制表是唯一跨层接口"。
+//
+// 本模块先于 API 侧冻结件联调：loader 直接消费手工构造的 IR 字节
+// 自验（T1.1），再与 API 编码器互验字节一致（引擎模块一验收门）。
+//
+// EN: draw-list IR loader (frozen layout) → engine primitive
+// representation. The engine consumes bytes only.
+
+import "./irb.tie"
+import "./utfmin.tie"
+
+// 图元 op 常量（对齐 API 冻结件 PO_* 数值）。
+const E_OP_RECT: i64 = 1
+const E_OP_RRECT: i64 = 2
+const E_OP_ELLIPSE: i64 = 3
+const E_OP_ARC: i64 = 4
+const E_OP_LINE: i64 = 5
+const E_OP_PATH: i64 = 6
+const E_OP_TEXT: i64 = 7
+const E_OP_IMAGE: i64 = 8
+const E_OP_SAVE_LAYER: i64 = 100
+const E_OP_RESTORE_LAYER: i64 = 101
+
+// 引擎内部图元表示（列式；n = len(ops)）。
+struct Parsed {
+    var ops: table<i64> = table_new_i64()
+    var x: table<f64> = table_new_f64()
+    var y: table<f64> = table_new_f64()
+    var w: table<f64> = table_new_f64()
+    var h: table<f64> = table_new_f64()
+    var rx: table<f64> = table_new_f64()
+    var ry: table<f64> = table_new_f64()
+    var a0: table<f64> = table_new_f64()
+    var a1: table<f64> = table_new_f64()
+    var fs: table<f64> = table_new_f64()
+    var txt: table<string> = table_new_string()
+    var keys: table<i64> = table_new_i64()
+    var fills: table<i64> = table_new_i64()
+    var colors: table<i64> = table_new_i64()
+    var alphas: table<i64> = table_new_i64()
+    var view: table<f64> = table_new_f64()
+    var sw: i64 = 0
+    var sh: i64 = 0
+    var dpi: f64 = 1.0
+}
+
+namespace eload {
+
+// 解析整帧 IR 字节 → Parsed。失败返回空 ops（调用方按 len(ops)==0
+// 判定；magic/version 校验见 ret）。
+pub func parse_frame(b: table<i64>) -> Parsed {
+    var p = Parsed()
+    var n = len(b)
+    if n < 88 {
+        return p
+    }
+    // header：magic TIU1 / ver 1
+    if b[0] != 84 || b[1] != 73 || b[2] != 85 || b[3] != 49 {
+        return p
+    }
+    if eirb.rd_u16(b, 4) != 1 {
+        return p
+    }
+    var v = p.view
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 8)))
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 16)))
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 24)))
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 32)))
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 40)))
+    table_push(v, eirb.q16_f(eirb.rd_i64(b, 48)))
+    p.view = v
+    p.sw = eirb.rd_i64(b, 56)
+    p.sh = eirb.rd_i64(b, 64)
+    p.dpi = eirb.q16_f(eirb.rd_i64(b, 72))
+    var cnt = eirb.rd_i64(b, 80)
+    var ofs: i64 = 88
+    var i: i64 = 0
+    while i < cnt {
+        ofs = parse_record(b, ofs, p)
+        if ofs < 0 {
+            break
+        }
+        i = i + 1
+    }
+    return p
+}
+
+// 解析单条 record（返回下一条偏移；-1 = 越界）。字段：
+// op(8) key(8) geo_len(8) geo paint_len(8) paint clip(8) meta_len(8) meta。
+func parse_record(b: table<i64>, ofs: i64, p: Parsed) -> i64 {
+    var n = len(b)
+    if ofs + 24 > n {
+        return -1
+    }
+    var op = eirb.rd_i64(b, ofs)
+    var key = eirb.rd_i64(b, ofs + 8)
+    var geo_len = eirb.rd_i64(b, ofs + 16)
+    var geo_ofs = ofs + 24
+    if geo_ofs + geo_len > n {
+        return -1
+    }
+    var paint_len = eirb.rd_i64(b, geo_ofs + geo_len)
+    var paint_ofs = geo_ofs + geo_len + 8
+    if paint_ofs + paint_len > n {
+        return -1
+    }
+    var clip = eirb.rd_i64(b, paint_ofs + paint_len)   // 校验用（本期不消费）
+    var meta_ofs = paint_ofs + paint_len + 8
+    var meta_len = eirb.rd_i64(b, meta_ofs)
+    var meta = read_str(b, meta_ofs + 8, meta_len)
+    var next = meta_ofs + 8 + meta_len
+
+    // 图元行
+    var ops = p.ops
+    table_push(ops, op)
+    p.ops = ops
+    var keys = p.keys
+    table_push(keys, key)
+    p.keys = keys
+    var x = p.x
+    var y = p.y
+    var w = p.w
+    var h = p.h
+    var rx = p.rx
+    var ry = p.ry
+    var a0 = p.a0
+    var a1 = p.a1
+    var fs = p.fs
+    var txt = p.txt
+    var g = geo_ofs
+    if op == E_OP_RECT {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_RRECT {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, eirb.q16_f(eirb.rd_i64(b, g + 32))); table_push(ry, eirb.q16_f(eirb.rd_i64(b, g + 40)))
+        table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_ELLIPSE {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_ARC {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16)))
+        table_push(h, 0.0); table_push(rx, 0.0); table_push(ry, 0.0)
+        table_push(a0, eirb.q16_f(eirb.rd_i64(b, g + 24))); table_push(a1, eirb.q16_f(eirb.rd_i64(b, g + 32)))
+        table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_LINE {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_PATH {
+        var ncmd = eirb.rd_i64(b, g)
+        var g2 = g + 8
+        var k: i64 = 0
+        while k < ncmd {
+            var cop = eirb.rd_i64(b, g2)
+            var argc = eirb.rd_i64(b, g2 + 8)
+            g2 = g2 + 16 + argc * 8
+            k = k + 1
+        }
+        table_push(x, 0.0); table_push(y, 0.0); table_push(w, 0.0); table_push(h, 0.0)
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_TEXT {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(fs, eirb.q16_f(eirb.rd_i64(b, g + 16)))
+        var tlen = eirb.rd_i64(b, g + 24)
+        table_push(txt, read_str(b, g + 32, tlen))
+        table_push(w, 0.0); table_push(h, 0.0); table_push(rx, 0.0); table_push(ry, 0.0)
+        table_push(a0, 0.0); table_push(a1, 0.0)
+    } else if op == E_OP_IMAGE {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else if op == E_OP_SAVE_LAYER {
+        table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
+        table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    } else {
+        // RESTORE_LAYER 及其它：占位行
+        table_push(x, 0.0); table_push(y, 0.0); table_push(w, 0.0); table_push(h, 0.0)
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(txt, "")
+    }
+    p.x = x
+    p.y = y
+    p.w = w
+    p.h = h
+    p.rx = rx
+    p.ry = ry
+    p.a0 = a0
+    p.a1 = a1
+    p.fs = fs
+    p.txt = txt
+
+    // paint 段：fill(8) color(8) gx0..gy1(4×8) stops_n(8) stops…
+    //        stroke_w(8) cap(8) join(8) dash_n(8) dash… alpha(8)
+    //        blend(8) cm_n(8) cm… blur(8) shadow(8) shx(8) shy(8)
+    //        sh_color(8) image(8)
+    var fill = eirb.rd_i64(b, paint_ofs)
+    var colorv = eirb.rd_i64(b, paint_ofs + 8)
+    var st_n = eirb.rd_i64(b, paint_ofs + 48)
+    var st_bytes = st_n * 40
+    var dash_n = eirb.rd_i64(b, paint_ofs + 80 + st_bytes)
+    var dash_bytes = dash_n * 8
+    var alpha_ofs = paint_ofs + 88 + st_bytes + dash_bytes
+    var alpha = 255
+    if alpha_ofs + 8 <= paint_ofs + paint_len {
+        alpha = eirb.rd_i64(b, alpha_ofs)
+    }
+    var fills = p.fills
+    table_push(fills, fill)
+    p.fills = fills
+    var colors = p.colors
+    table_push(colors, colorv)
+    p.colors = colors
+    var alphas = p.alphas
+    table_push(alphas, alpha)
+    p.alphas = alphas
+    return next
+}
+
+// 读 len 字节为字符串（UTF-8；可打印 ASCII 经 utfmin 映射）。
+func read_str(b: table<i64>, ofs: i64, len: i64) -> string {
+    var s = ""
+    var i: i64 = 0
+    while i < len {
+        s = s + utfmin.to_char(b[ofs + i] & 0xFF)
+        i = i + 1
+    }
+    return s
+}
+
+}
