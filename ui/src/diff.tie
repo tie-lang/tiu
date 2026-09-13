@@ -1,0 +1,286 @@
+type tie<class>
+// diff.tie —— tiu 差分桥（p.9.4.2 模块四）
+// EN: diff bridge — UI structural key (type+slot+ver), dirty set, dirty rect
+// roll-up, incremental segments (T2.3 frozen contract).
+// ============================================================
+// 依据：docs/designs/tiu-ui-widgets.md §8（差分契约：两层 key、脏集合位标记、
+// dirty rect 沿父链上卷、流程 §8.3）+ docs/plans/2026-09-12-tiu-api-impl.md
+// §2（T2.3 增量段协议冻结件：子树 key 前缀 + dirty rect 段——UI 层唯一差分原语）。
+// 语义：
+//   - 结构 key = (type, slot, ver)：O(1) 版本号比较，非哈希（§8.1）。
+//   - begin_frame() 保存当前帧（parent/slot/type/ver/path/rect）为 prev 快照；
+//     diff() 对照 prev 与当前树：
+//       净（type+slot+ver 全等）→ 零编码；脏（type 异 / ver 异 / 新建 / 卸载）。
+//   - 段输出 = 每「顶层脏子树」一条：key 前缀（根到子树的 slot 链）+ dirty rect
+//     （脏矩形沿父链上卷合并）+ 节点 id（卸载为 -1）。
+//   - 静态帧（快照相等）→ 零段零编码；单节点变化 → 仅该子树一段（整树隔离）。
+// 输出经平行表暴露（避免 table<struct>）：delta_count / delta_key / delta_rect /
+// delta_node。
+
+import "./tree.tie"
+
+// ---- 上帧快照（begin_frame 重建）----
+var g_pparent: table<i64> = []
+var g_pslot: table<i64> = []
+var g_ptype: table<i64> = []
+var g_pver: table<i64> = []
+var g_ppath: table<string> = []   // 上帧 slot 链 key 前缀
+var g_px: table<i64> = []         // 上帧矩形
+var g_py: table<i64> = []
+var g_pw: table<i64> = []
+var g_ph: table<i64> = []
+var g_pidx: table<i64> = []       // node id -> prev 项索引（-1 = 无）
+
+// ---- 帧内脏状态 / 段输出 ----
+var g_dirty: table<i64> = []      // 当前树脏标记（按 node id）
+var g_unmount: table<i64> = []    // 卸载 prev 项索引表
+var g_dkeys: table<string> = []
+var g_drx: table<i64> = []
+var g_dry: table<i64> = []
+var g_drw: table<i64> = []
+var g_drh: table<i64> = []
+var g_dnode: table<i64> = []
+
+namespace tiu_diff {
+// 内部：扩展表长度至 idx（下标写安全）
+func ensure_len(t: ref table<i64>, idx: i64) {
+    while len(t) <= idx {
+        table_push(t, 0)
+    }
+}
+
+// 内部：prev 线性查找 (parent, slot) → prev 项索引；未找到 -1
+func find_prev(parent: i64, slot: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_pparent) {
+        if g_pparent[i] == parent && g_pslot[i] == slot {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 内部：当前树活节点线性查找 (parent, slot) → 节点 id；未找到 -1
+func find_cur(parent: i64, slot: i64) -> i64 {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        if tiu_tree.parent_of(n) == parent && tiu_tree.slot_of(n) == slot {
+            return n
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 内部：标记当前树节点为脏
+func mark_cur_dirty(n: i64) {
+    ensure_len(g_dirty, n)
+    g_dirty[n] = 1
+}
+
+// 内部：当前树节点是否脏（越界安全）
+func cur_dirty(n: i64) -> bool {
+    if n < 0 {
+        return false
+    }
+    if n >= len(g_dirty) {
+        return false
+    }
+    return g_dirty[n] == 1
+}
+
+// 内部：prev 项索引是否在卸载列表
+func is_unmount_idx(pi: i64) -> bool {
+    var i: i64 = 0
+    while i < len(g_unmount) {
+        if g_unmount[i] == pi {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 内部：卸载 prev 项是否被父段覆盖（父卸载，或父当前树对应节点脏）
+func unmount_covered(pi: i64) -> bool {
+    var pp = g_pparent[pi]
+    if pp >= 0 {
+        if pp >= len(g_pidx) {
+            return false
+        }
+        var j = g_pidx[pp]
+        if j >= 0 {
+            if is_unmount_idx(j) {
+                return true
+            }
+            var match = find_cur(g_pparent[j], g_pslot[j])
+            if match >= 0 && cur_dirty(match) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// 内部：发射一条当前树脏段（上卷祖先矩形）
+func emit_cur_delta(n: i64) {
+    var r = tiu_tree.rect(n)
+    var p = tiu_tree.parent_of(n)
+    while p >= 0 {
+        r = Rect.union(r, tiu_tree.rect(p))
+        p = tiu_tree.parent_of(p)
+    }
+    table_push(g_dkeys, tiu_tree.path_of(n))
+    table_push(g_drx, r.x)
+    table_push(g_dry, r.y)
+    table_push(g_drw, r.w)
+    table_push(g_drh, r.h)
+    table_push(g_dnode, n)
+}
+
+// 内部：发射一条卸载段（rect 用上帧矩形上卷上帧祖先）
+func emit_prev_delta(pi: i64) {
+    var r = Rect(g_px[pi], g_py[pi], g_pw[pi], g_ph[pi])
+    var pp = g_pparent[pi]
+    while pp >= 0 {
+        if pp < len(g_pidx) {
+            var j = g_pidx[pp]
+            if j >= 0 {
+                var pr = Rect(g_px[j], g_py[j], g_pw[j], g_ph[j])
+                r = Rect.union(r, pr)
+                pp = g_pparent[j]
+            } else {
+                pp = -1
+            }
+        } else {
+            pp = -1
+        }
+    }
+    table_push(g_dkeys, g_ppath[pi])
+    table_push(g_drx, r.x)
+    table_push(g_dry, r.y)
+    table_push(g_drw, r.w)
+    table_push(g_drh, r.h)
+    table_push(g_dnode, -1)
+}
+
+// 保存当前帧为 prev 快照（差分对照基准；帧循环中每帧调一次）
+pub func begin_frame() {
+    g_pparent = table_new_i64()
+    g_pslot = table_new_i64()
+    g_ptype = table_new_i64()
+    g_pver = table_new_i64()
+    g_ppath = []
+    g_px = table_new_i64()
+    g_py = table_new_i64()
+    g_pw = table_new_i64()
+    g_ph = table_new_i64()
+    g_pidx = table_new_i64()
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        var r = tiu_tree.rect(n)
+        table_push(g_pparent, tiu_tree.parent_of(n))
+        table_push(g_pslot, tiu_tree.slot_of(n))
+        table_push(g_ptype, tiu_tree.ty_of(n))
+        table_push(g_pver, tiu_tree.ver_of(n))
+        table_push(g_ppath, tiu_tree.path_of(n))
+        table_push(g_px, r.x)
+        table_push(g_py, r.y)
+        table_push(g_pw, r.w)
+        table_push(g_ph, r.h)
+        var idx = len(g_pparent) - 1
+        ensure_len(g_pidx, n)
+        g_pidx[n] = idx
+        i = i + 1
+    }
+}
+
+// 差分：对照 prev 与当前树，产出增量段（T2.3：子树 key 前缀 + dirty rect）。
+// 返回段数；0 = 静态帧零编码。未变子树不产段（整树隔离）。
+pub func diff() -> i64 {
+    g_dirty = table_new_i64()
+    g_unmount = table_new_i64()
+    g_dkeys = []
+    g_drx = table_new_i64()
+    g_dry = table_new_i64()
+    g_drw = table_new_i64()
+    g_drh = table_new_i64()
+    g_dnode = table_new_i64()
+    // 1) 当前树活节点对账
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        var pi = find_prev(tiu_tree.parent_of(n), tiu_tree.slot_of(n))
+        if pi >= 0 {
+            if g_ptype[pi] != tiu_tree.ty_of(n) {
+                mark_cur_dirty(n)   // 同 slot 异 type：替换
+            } else if g_pver[pi] != tiu_tree.ver_of(n) {
+                mark_cur_dirty(n)   // 版本号差：更新
+            }
+        } else {
+            mark_cur_dirty(n)       // 新 slot：新建
+        }
+        i = i + 1
+    }
+    // 2) 卸载检测：prev 项在当前树无对应活节点
+    var j: i64 = 0
+    while j < len(g_pparent) {
+        if find_cur(g_pparent[j], g_pslot[j]) < 0 {
+            table_push(g_unmount, j)
+        }
+        j = j + 1
+    }
+    // 3) 顶层脏段：当前树脏节点的父不脏 → 段；被父覆盖的不单独出段
+    var k: i64 = 0
+    while k < len(order) {
+        var n = order[k]
+        if cur_dirty(n) {
+            var p = tiu_tree.parent_of(n)
+            if p < 0 {
+                emit_cur_delta(n)
+            } else {
+                if !cur_dirty(p) {
+                    emit_cur_delta(n)
+                }
+            }
+        }
+        k = k + 1
+    }
+    // 4) 卸载顶层段：未被父段覆盖的卸载项
+    var m: i64 = 0
+    while m < len(g_unmount) {
+        var pi = g_unmount[m]
+        if !unmount_covered(pi) {
+            emit_prev_delta(pi)
+        }
+        m = m + 1
+    }
+    return len(g_dkeys)
+}
+
+// 段数（= 增量绘制表段数量；0 = 零编码）
+pub func delta_count() -> i64 {
+    return len(g_dkeys)
+}
+
+// 第 i 段：key 前缀（子树归属 slot 链）
+pub func delta_key(i: i64) -> string {
+    return g_dkeys[i]
+}
+
+// 第 i 段：dirty rect（上卷合并后的重绘区）
+pub func delta_rect(i: i64) -> Rect {
+    return Rect(g_drx[i], g_dry[i], g_drw[i], g_drh[i])
+}
+
+// 第 i 段：归属节点 id（卸载段 = -1）
+pub func delta_node(i: i64) -> i64 {
+    return g_dnode[i]
+}
+}
