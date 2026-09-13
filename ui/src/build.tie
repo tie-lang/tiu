@@ -1,0 +1,144 @@
+type tie<class>
+// build.tie —— tiu 声明式构建与三类复用（p.9.4.2 模块二）
+// EN: declarative build with slot-based reuse (same type+slot reuse, type swap,
+// new-slot create).
+// ============================================================
+// 依据：docs/designs/tiu-ui-widgets.md §4（构建与复用：slot 化定位、三类复用）。
+// 语义（widgets §4.2）：
+//   - 同 type + 同 slot → 复用骨架（仅换快照；props 版本号更新）
+//   - 同 slot 异 type → 替换骨架（旧节点及子树卸载，重建）
+//   - 新 slot → 新建骨架
+//   - slot 化约束：兄弟以槽位定位，不靠闭包捕获（避免闭包导致整树 key 失效）
+// API 形态：流式 open/close（tie 无函数指针/闭包，声明式组合以指令流表达：
+//   begin() → open(...)×n → close() → ... → finish()）
+// 上帧追踪：prev 三表（parent/slot/node）由 finish() 重建；reconcile 增量 O(变化)。
+// 注意：本模块不感知布局/差分；只保证"构建后树 = 声明意图"。
+
+import "./tree.tie"
+
+// ---- 上帧记录（全局；跨函数持久）----
+var g_prev_parent: table<i64> = []
+var g_prev_slot: table<i64> = []
+var g_prev_node: table<i64> = []
+var g_touch: table<i64> = []   // 帧内复用标记（按 node id 索引）
+var g_pstack: table<i64> = []  // 父栈（open/close 用）
+var g_ptop: i64 = 0
+
+namespace tiu_build {
+// 内部：在 prev 三表中按 (parent, slot) 查找上帧节点；未找到返回 -1
+func find_prev(parent: i64, slot: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_prev_parent) {
+        if g_prev_parent[i] == parent && g_prev_slot[i] == slot {
+            return g_prev_node[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 内部：标记节点本帧被触达（复用或新建）
+func touch(node: i64) {
+    while len(g_touch) <= node {
+        table_push(g_touch, 0)
+    }
+    g_touch[node] = 1
+}
+
+// 内部：节点本帧是否被触达
+func touched(node: i64) -> bool {
+    if node < 0 {
+        return false
+    }
+    if node >= len(g_touch) {
+        return false
+    }
+    return g_touch[node] == 1
+}
+
+// 帧开始：清空父栈与触达标记（树须已 reset 或延续上帧树）
+pub func begin() {
+    g_pstack = table_new_i64()
+    g_ptop = 0
+    g_touch = table_new_i64()
+}
+
+// 打开一个节点：在父栈栈顶下挂载/复用。首次调用创建根（父 = -1）。
+// ty 为 WidgetType；slot 为兄弟槽位；ver 为 props 版本号；data 为文本长度；
+// ox/oy/fw/fh 为绝对定位偏移与固定尺寸（非 Absolute 传 0）。
+pub func open(ty: WidgetType, slot: i64, ver: i64, data: i64, ox: i64, oy: i64, fw: i64, fh: i64) {
+    var parent: i64 = -1
+    if g_ptop > 0 {
+        parent = g_pstack[g_ptop - 1]
+    }
+    var kind = tiu_tree.ty_code(ty)
+    var node = find_prev(parent, slot)
+    if node >= 0 && tiu_tree.ty_of(node) == kind {
+        // 同 type + 同 slot → 复用骨架（换快照）
+        if tiu_tree.ver_of(node) != ver {
+            tiu_tree.set_ver(node, ver)
+        }
+        tiu_tree.set_props(node, tiu_tree.ver_of(node), data, ox, oy, fw, fh)
+        touch(node)
+    } else {
+        if node >= 0 {
+            // 同 slot 异 type → 替换骨架（旧子树卸载重建）
+            tiu_tree.unmount(node)
+        }
+        node = tiu_tree.mount(parent, slot, ty)
+        tiu_tree.set_props(node, ver, data, ox, oy, fw, fh)
+        touch(node)
+    }
+    // 父栈压入当前节点
+    if g_ptop == len(g_pstack) {
+        table_push(g_pstack, node)
+    } else {
+        g_pstack[g_ptop] = node
+    }
+    g_ptop = g_ptop + 1
+}
+
+// 关闭当前节点：弹栈
+pub func close() {
+    if g_ptop > 0 {
+        g_ptop = g_ptop - 1
+    }
+}
+
+// 帧结束：清理「上帧存在但本帧未触达」的节点（卸载），重建上帧记录。
+// 完成后树 = 本次声明意图；重复帧（快照相等）不改写任何骨架。
+pub func finish() {
+    // 1) 清理未触达的上帧节点（声明删除）
+    var i: i64 = 0
+    while i < len(g_prev_parent) {
+        var n = g_prev_node[i]
+        if tiu_tree.is_live(n) {
+            if !touched(n) {
+                tiu_tree.unmount(n)
+            }
+        }
+        i = i + 1
+    }
+    // 2) 重建上帧记录 = 当前树活节点（DFS 序）
+    g_prev_parent = table_new_i64()
+    g_prev_slot = table_new_i64()
+    g_prev_node = table_new_i64()
+    var order = tiu_tree.dfs_order()
+    var j: i64 = 0
+    while j < len(order) {
+        var id = order[j]
+        table_push(g_prev_parent, tiu_tree.parent_of(id))
+        table_push(g_prev_slot, tiu_tree.slot_of(id))
+        table_push(g_prev_node, id)
+        j = j + 1
+    }
+    // 3) 清触达标记与父栈
+    g_touch = table_new_i64()
+    g_ptop = 0
+}
+
+// 上帧节点数（差分/调试用）
+pub func prev_count() -> i64 {
+    return len(g_prev_node)
+}
+}

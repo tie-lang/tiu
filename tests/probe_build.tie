@@ -1,0 +1,132 @@
+type tie<logic>
+// probe_build: 声明式构建与三类复用探针（同 slot 复用 / 替换 / 新建）
+import "../ui/src/build.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 查找根下第 n 个活子节点（按兄弟序）的 id
+func child_at(root: i64, n: i64) -> i64 {
+    var c = tiu_tree.first_child(root)
+    var k: i64 = 0
+    while k < n {
+        c = tiu_tree.next_sibling(c)
+        k = k + 1
+    }
+    return c
+}
+
+func main() {
+    // ---------- 1) 首帧：Column > [Text(slot0), Button(slot1)] ----------
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 4, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Button, 1, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 3, "build frame1: 3 nodes")
+    check(tiu_build.prev_count() == 3, "prev snapshot = 3")
+    var root = tiu_tree.root()
+    var t0 = child_at(root, 0)
+    var b1 = child_at(root, 1)
+    check(tiu_tree.ty_of(t0) == 2 && tiu_tree.text_len(t0) == 4, "frame1 text slot0 type/data")
+    check(tiu_tree.ty_of(b1) == 3 && tiu_tree.text_len(b1) == 2, "frame1 button slot1 type/data")
+    check(tiu_tree.ver_of(t0) == 1 && tiu_tree.slot_of(t0) == 0 && tiu_tree.slot_of(b1) == 1,
+        "frame1 slot/ver")
+
+    // ---------- 2) 静态帧（快照相等）：零改动、骨架复用 ----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 4, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Button, 1, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 3 && tiu_tree.total() == 3, "static frame: no new nodes (reuse)")
+    var t0b = child_at(tiu_tree.root(), 0)
+    check(t0b == t0, "static frame: text node id reused")
+
+    // ---------- 3) props 版本变化：复用骨架、只更新版本 ----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 5, 6, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Button, 1, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 3 && tiu_tree.total() == 3, "ver change: skeleton reused, no new node")
+    var t0c = child_at(tiu_tree.root(), 0)
+    check(t0c == t0 && tiu_tree.ver_of(t0c) == 5 && tiu_tree.text_len(t0c) == 6,
+        "ver change: version+data updated in place")
+
+    // ---------- 4) 同 slot 异 type：替换骨架（重建子树）----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 5, 6, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Row, 1, 2, 0, 0, 0, 0, 0)   // slot1: Button -> Row
+    tiu_build.open(WidgetType.Text, 0, 1, 3, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 4, "type swap: root(1) + text(1) + row(1) + row child(1) = 4 live")
+    check(tiu_tree.total() == 5, "type swap: old button node stays as dead placeholder")
+    var b1b = child_at(tiu_tree.root(), 1)
+    check(tiu_tree.ty_of(b1b) == 0, "type swap: slot1 now Row")
+    check(tiu_tree.is_dead(b1) && tiu_tree.is_live(b1b), "type swap: old button dead, new row live")
+
+    // ---------- 5) 删除：未触达节点被卸载 ----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 5, 6, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 2, "delete: row subtree unmounted, 2 live")
+    check(tiu_tree.is_dead(b1b), "delete: replaced row dead")
+
+    // ---------- 6) 新建：新 slot ----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 5, 6, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 3, 8, 0, 0, 0, 0)   // 新 slot1
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    check(tiu_tree.count() == 3, "new slot: 3 live")
+    var n1 = child_at(tiu_tree.root(), 1)
+    check(tiu_tree.slot_of(n1) == 1 && tiu_tree.text_len(n1) == 8 && tiu_tree.ver_of(n1) == 3,
+        "new slot: type/data/ver correct")
+
+    // ---------- 7) 绝对定位 props 传递 ----------
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Absolute, 0, 1, 0, 30, 40, 100, 50)
+    tiu_build.close()
+    tiu_build.finish()
+    var absn = tiu_tree.root()
+    var ar = tiu_tree.rect(absn)
+    check(tiu_tree.ty_of(absn) == 4 && ar.w == 0, "absolute node mounted (ty=4)")
+    check(tiu_tree.text_len(absn) == 0, "absolute node props baseline")
+
+    if fails > 0 {
+        println("PROBE_BUILD FAIL " + to_string(fails))
+        exit(1)
+    } else {
+        println("PROBE_BUILD PASS")
+    }
+}
