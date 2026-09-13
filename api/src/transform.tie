@@ -1,0 +1,111 @@
+type tie<class>
+// api/src/transform.tie —— tiu 绘制 API 对象模型：2D 仿射变换
+// ============================================================
+// Transform 数据记录：2D 仿射（行主序 3x2）：
+//   x' = a*x + b*y + c
+//   y' = d*x + e*y + f
+// 默认 = 单位矩阵。值语义、不可变；任何"修改"返回新记录（结构共享）。
+//
+// EN: Transform record — 2D affine (row-major 3x2), identity by
+// default. Value semantics, immutable.
+
+struct Transform {
+    var a: f64 = 1.0
+    var b: f64 = 0.0
+    var c: f64 = 0.0
+    var d: f64 = 0.0
+    var e: f64 = 1.0
+    var f: f64 = 0.0
+}
+
+namespace tform {
+
+// 单位矩阵。
+pub func identity() -> Transform {
+    return Transform()
+}
+
+// 平移。
+pub func translate(tx: f64, ty: f64) -> Transform {
+    var t = Transform()
+    t.c = tx
+    t.f = ty
+    return t
+}
+
+// 缩放（原点）。
+pub func scale(sx: f64, sy: f64) -> Transform {
+    var t = Transform()
+    t.a = sx
+    t.e = sy
+    return t
+}
+
+// 旋转（弧度，原点）。
+pub func rotate(rad: f64) -> Transform {
+    var t = Transform()
+    t.a = cos_f(rad)
+    t.b = -sin_f(rad)
+    t.d = sin_f(rad)
+    t.e = cos_f(rad)
+    return t
+}
+
+// 两个变换复合：t_first 先应用，再应用 t_second（t_second ∘ t_first）。
+// 返回新 Transform，两输入不变（值语义）。
+pub func concat(t_first: Transform, t_second: Transform) -> Transform {
+    var r = Transform()
+    r.a = t_second.a * t_first.a + t_second.b * t_first.d
+    r.b = t_second.a * t_first.b + t_second.b * t_first.e
+    r.c = t_second.a * t_first.c + t_second.b * t_first.f + t_second.c
+    r.d = t_second.d * t_first.a + t_second.e * t_first.d
+    r.e = t_second.d * t_first.b + t_second.e * t_first.e
+    r.f = t_second.d * t_first.c + t_second.e * t_first.f + t_second.f
+    return r
+}
+
+// 变换点 (x, y) → (x', y')。
+pub func map_pt(t: Transform, x: f64, y: f64) -> (f64, f64) {
+    var nx = t.a * x + t.b * y + t.c
+    var ny = t.d * x + t.e * y + t.f
+    return (nx, ny)
+}
+
+// 六元组导出（IR 编码 / gold 用）：[a, b, c, d, e, f]。
+pub func to_six(t: Transform) -> table<f64> {
+    var out = table_new_f64()
+    table_push(out, t.a)
+    table_push(out, t.b)
+    table_push(out, t.c)
+    table_push(out, t.d)
+    table_push(out, t.e)
+    table_push(out, t.f)
+    return out
+}
+
+// 相等比较（值语义）。
+pub func eq(t1: Transform, t2: Transform) -> bool {
+    return t1.a == t2.a && t1.b == t2.b && t1.c == t2.c &&
+           t1.d == t2.d && t1.e == t2.e && t1.f == t2.f
+}
+
+// 余弦（泰勒 4 项，模块内；无需引入外部数学依赖）。
+func cos_f(r: f64) -> f64 {
+    var r2 = r * r
+    var r4 = r2 * r2
+    var r6 = r4 * r2
+    var r8 = r4 * r4
+    return 1.0 - r2 / 2.0 + r4 / 24.0 - r6 / 720.0 + r8 / 40320.0
+}
+
+// 正弦（泰勒 4 项）。
+func sin_f(r: f64) -> f64 {
+    var r2 = r * r
+    var r3 = r2 * r
+    var r5 = r3 * r2
+    var r7 = r5 * r2
+    var r9 = r7 * r2
+    return r - r3 / 6.0 + r5 / 120.0 - r7 / 5040.0 + r9 / 362880.0
+}
+
+}

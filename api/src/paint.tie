@@ -1,0 +1,263 @@
+type tie<class>
+// api/src/paint.tie —— tiu 绘制 API 对象模型：Paint 效果栈（不可变）
+import "./tabutil.tie"
+import "./color.tie"
+// ============================================================
+// Paint 数据记录 = 效果栈（填充 + 描边 + 透明度 + 混合 + 滤镜），对齐
+// docs/designs/tiu-drawing-api.md §3.4。值语义、不可变：
+// 任何"修改"返回**新 Paint**（with_* 系列），旧引用恒有效（别名安全）；
+// 表字段（stops/dash/cmatrix）在复制时共享引用（tie 表引用共享 =
+// 结构共享），原地更新只发生在模块内部 clone 出的副本上。
+//
+// 效果栈默认范围（T1.2 闭合，超集组合不登记 —— 由引擎 §7 降级拆分承载）：
+//   填充 fill: 0=solid 实色 · 1=linear 线性渐变 · 2=radial 径向渐变
+//              3=sweep 扫描渐变 · 4=image 图像平铺
+//   描边 stroke: stroke_w 线宽（0=不描边）· cap 0=butt/1=round/2=square
+//              join 0=miter/1=round/2=bevel · dash 虚线 [pattern..., phase]
+//   颜色变换: alpha 透明度 0-255（乘到 color.a）· cmatrix 4x5 颜色矩阵（空=恒等）
+//   图像滤镜: blur 模糊半径（0=无）· shadow 阴影（offset + blur + color）
+//   混合模式 blend: 0=src-over（默认）· 1=dst-over · 2=multiply ·
+//                   3=screen · 4=xor
+// 渐变停靠点编码：stops 扁平 table<i64>，每停靠点 5 项 [r, g, b, a,
+// offset_q16]（offset_q16 = offset * 65536 定点，offset ∈ [0,1]）。
+//
+// EN: Paint record = effect stack (fill + stroke + alpha + blend +
+// filter), immutable — with_* returns a new Paint, old refs stay valid;
+// table fields share references (tie table assignment shares = structural
+// sharing); in-place mutation only on module-internal clones.
+
+const P_FILL_SOLID: i64 = 0
+const P_FILL_LINEAR: i64 = 1
+const P_FILL_RADIAL: i64 = 2
+const P_FILL_SWEEP: i64 = 3
+const P_FILL_IMAGE: i64 = 4
+
+const P_CAP_BUTT: i64 = 0
+const P_CAP_ROUND: i64 = 1
+const P_CAP_SQUARE: i64 = 2
+
+const P_JOIN_MITER: i64 = 0
+const P_JOIN_ROUND: i64 = 1
+const P_JOIN_BEVEL: i64 = 2
+
+const P_BLEND_SRC_OVER: i64 = 0
+const P_BLEND_DST_OVER: i64 = 1
+const P_BLEND_MULTIPLY: i64 = 2
+const P_BLEND_SCREEN: i64 = 3
+const P_BLEND_XOR: i64 = 4
+
+const P_NO_IMAGE: i64 = 0    // 图像句柄占位（资源句柄模块五落地）
+
+// 定点标度：offset * Q16 = offset_q16。
+const P_Q16: i64 = 65536
+
+struct Paint {
+    var fill: i64 = P_FILL_SOLID
+    var color: Color = Color()
+    var gx0: f64 = 0.0
+    var gy0: f64 = 0.0
+    var gx1: f64 = 0.0
+    var gy1: f64 = 0.0
+    var stops: table<i64> = table_new_i64()
+    var stroke_w: f64 = 0.0
+    var cap: i64 = P_CAP_BUTT
+    var join: i64 = P_JOIN_MITER
+    var dash: table<f64> = table_new_f64()
+    var alpha: i64 = 255
+    var blend: i64 = P_BLEND_SRC_OVER
+    var cmatrix: table<i64> = table_new_i64()
+    var blur: f64 = 0.0
+    var shadow: i64 = 0
+    var shx: f64 = 0.0
+    var shy: f64 = 0.0
+    var sh_color: Color = Color()
+    var image: i64 = P_NO_IMAGE
+}
+
+namespace paint {
+
+// ---- 填充：实色 ----
+
+pub func solid(c: Color) -> Paint {
+    var p = Paint()
+    p.fill = P_FILL_SOLID
+    p.color = c
+    return p
+}
+
+// ---- 填充：线性渐变（端点 + 停靠点表） ----
+
+pub func linear(x0: f64, y0: f64, x1: f64, y1: f64, stops: table<i64>) -> Paint {
+    var p = Paint()
+    p.fill = P_FILL_LINEAR
+    p.gx0 = x0
+    p.gy0 = y0
+    p.gx1 = x1
+    p.gy1 = y1
+    p.stops = stops
+    return p
+}
+
+// ---- 填充：径向渐变（圆心 + 半径 + 停靠点表） ----
+
+pub func radial(cx: f64, cy: f64, r: f64, stops: table<i64>) -> Paint {
+    var p = Paint()
+    p.fill = P_FILL_RADIAL
+    p.gx0 = cx
+    p.gy0 = cy
+    p.gx1 = r
+    p.gy1 = 0
+    p.stops = stops
+    return p
+}
+
+// ---- 填充：扫描渐变（中心 + 停靠点表） ----
+
+pub func sweep(cx: f64, cy: f64, stops: table<i64>) -> Paint {
+    var p = Paint()
+    p.fill = P_FILL_SWEEP
+    p.gx0 = cx
+    p.gy0 = cy
+    p.stops = stops
+    return p
+}
+
+// ---- 填充：图像平铺（资源句柄，模块五落地；本期占位） ----
+
+pub func image_tile(handle: i64) -> Paint {
+    var p = Paint()
+    p.fill = P_FILL_IMAGE
+    p.image = handle
+    return p
+}
+
+// ---- 描边（返回新 Paint，结构共享） ----
+
+pub func with_stroke(p: Paint, w: f64, cap: i64, join: i64) -> Paint {
+    var np = p
+    np.stroke_w = w
+    np.cap = cap
+    np.join = join
+    return np
+}
+
+// 虚线 pattern + phase（pattern 表共享引用；phase 并入尾部）。
+pub func with_dash(p: Paint, pattern: table<f64>, phase: f64) -> Paint {
+    var np = p
+    var d = tabu.clone_f64(pattern)
+    table_push(d, phase)
+    np.dash = d
+    return np
+}
+
+// ---- 透明度（0-255，乘到 color.a） ----
+
+pub func with_alpha(p: Paint, a: i64) -> Paint {
+    var np = p
+    np.alpha = clamp_a(a)
+    return np
+}
+
+// ---- 混合模式 ----
+
+pub func with_blend(p: Paint, m: i64) -> Paint {
+    var np = p
+    np.blend = m
+    return np
+}
+
+// ---- 颜色矩阵（4x5 = 20 项扁平，空 = 恒等） ----
+
+pub func with_matrix(p: Paint, m: table<i64>) -> Paint {
+    var np = p
+    np.cmatrix = m
+    return np
+}
+
+// ---- 图像滤镜：模糊 / 阴影 ----
+
+pub func with_blur(p: Paint, radius: f64) -> Paint {
+    var np = p
+    np.blur = radius
+    return np
+}
+
+pub func with_shadow(p: Paint, offx: f64, offy: f64, c: Color) -> Paint {
+    var np = p
+    np.shadow = 1
+    np.shx = offx
+    np.shy = offy
+    np.sh_color = c
+    return np
+}
+
+// ---- 停靠点表构建（渐变用） ----
+
+// 单停靠点 5 项 [r, g, b, a, offset_q16]。
+pub func stop(r: i64, g: i64, b: i64, a: i64, offset: f64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, clamp_a(r))
+    table_push(t, clamp_a(g))
+    table_push(t, clamp_a(b))
+    table_push(t, clamp_a(a))
+    table_push(t, as_i64(offset * as_f64(P_Q16)))
+    return t
+}
+
+// 追加停靠点 → 新表（不可变：clone + push，原表不变）。
+pub func stop_add(t: table<i64>, r: i64, g: i64, b: i64, a: i64, offset: f64) -> table<i64> {
+    var nt = tabu.clone_i64(t)
+    table_push(nt, clamp_a(r))
+    table_push(nt, clamp_a(g))
+    table_push(nt, clamp_a(b))
+    table_push(nt, clamp_a(a))
+    table_push(nt, as_i64(offset * as_f64(P_Q16)))
+    return nt
+}
+
+// ---- 深度相等（含表逐项） ----
+
+pub func eq(p1: Paint, p2: Paint) -> bool {
+    if p1.fill != p2.fill || !color.eq(p1.color, p2.color) {
+        return false
+    }
+    if p1.gx0 != p2.gx0 || p1.gy0 != p2.gy0 || p1.gx1 != p2.gx1 || p1.gy1 != p2.gy1 {
+        return false
+    }
+    if p1.stroke_w != p2.stroke_w || p1.cap != p2.cap || p1.join != p2.join {
+        return false
+    }
+    if p1.alpha != p2.alpha || p1.blend != p2.blend {
+        return false
+    }
+    if p1.blur != p2.blur || p1.shadow != p2.shadow || p1.shx != p2.shx || p1.shy != p2.shy {
+        return false
+    }
+    if !color.eq(p1.sh_color, p2.sh_color) {
+        return false
+    }
+    if p1.image != p2.image {
+        return false
+    }
+    if !tabu.eq_i64(p1.stops, p2.stops) || !tabu.eq_f64(p1.dash, p2.dash) || !tabu.eq_i64(p1.cmatrix, p2.cmatrix) {
+        return false
+    }
+    return true
+}
+
+// 停靠点个数（每停靠点 5 项）。
+pub func stop_count(t: table<i64>) -> i64 {
+    return len(t) / 5
+}
+
+func clamp_a(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    return v
+}
+
+}

@@ -1,0 +1,220 @@
+type tie<class>
+// api/src/prim.tie —— tiu 绘制 API 对象模型：图元 / 图层记录
+// ============================================================
+// Prim 数据记录 = 图元 / 图层操作，字段对齐 docs/designs/
+// tiu-render-engine.md §4 record：op / geo / paint / clip / meta
+// （key 由 IR 编码器自动派生，不在此记录）。值语义、不可变：
+// 构建函数一次创建，此后只读共享（经 DrawList 引用；修改 = 新记录）。
+//
+//   op: 图元种类（OP_*）+ 图层操作（OP_SAVE_LAYER / OP_RESTORE_LAYER）
+//   geo: x/y/w/h/rx/ry/a0/a1 + path 引用 + text（按 op 解释）
+//   paint: p 引用（值语义 Paint）
+//   clip: clip 记录 ID（clip 池，-1 = 无；本期占位）
+//   meta: 命名字段（调参用，不参与渲染语义）
+//
+// Layer 记录 = saveLayer(区域, paint) 参数描述（引擎 Frame Graph
+// 离屏层；离屏内存别名复用归引擎 §5，API 层无感知）。
+//
+// EN: Prim record = primitive / layer op, fields aligned with engine
+// §4 record (op/geo/paint/clip/meta; key derived by IR encoder).
+// Value semantics, immutable. Layer record describes saveLayer bounds
+// + paint; offscreen aliasing belongs to the engine.
+
+const PO_RECT: i64 = 1
+const PO_RRECT: i64 = 2
+const PO_ELLIPSE: i64 = 3
+const PO_ARC: i64 = 4
+const PO_LINE: i64 = 5
+const PO_PATH: i64 = 6
+const PO_TEXT: i64 = 7
+const PO_IMAGE: i64 = 8
+const PO_SAVE_LAYER: i64 = 100
+const PO_RESTORE_LAYER: i64 = 101
+
+const PO_NO_CLIP: i64 = -1   // clip 引用占位（clip 池模块二落地）
+
+struct Prim {
+    var op: i64 = 0
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    var rx: f64 = 0.0
+    var ry: f64 = 0.0
+    var a0: f64 = 0.0
+    var a1: f64 = 0.0
+    var pth: Path = Path()
+    var txt: string = ""
+    var font: i64 = 0
+    var fs: f64 = 12.0
+    var p: Paint = Paint()
+    var tx: Transform = Transform()
+    var clip: i64 = PO_NO_CLIP
+    var meta: string = ""
+}
+
+// Layer 记录（saveLayer 参数）。
+struct Layer {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    var p: Paint = Paint()
+}
+
+namespace prim {
+
+// ---- 图元构建（全部返回不可变记录） ----
+
+// 矩形（逻辑坐标 + paint）。
+pub func rect(x: f64, y: f64, w: f64, h: f64, p: Paint) -> Prim {
+    var r = Prim()
+    r.op = PO_RECT
+    r.x = x
+    r.y = y
+    r.w = w
+    r.h = h
+    r.p = p
+    return r
+}
+
+// 圆角矩形（rx/ry 各角半径）。
+pub func rrect(x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64, p: Paint) -> Prim {
+    var r = rect(x, y, w, h, p)
+    r.op = PO_RRECT
+    r.rx = rx
+    r.ry = ry
+    return r
+}
+
+// 椭圆（外接矩形）。
+pub func ellipse(x: f64, y: f64, w: f64, h: f64, p: Paint) -> Prim {
+    var r = rect(x, y, w, h, p)
+    r.op = PO_ELLIPSE
+    return r
+}
+
+// 弧线 / pie（a0 起角、a1 扫角，弧度）。
+pub func arc(x: f64, y: f64, r: f64, a0: f64, a1: f64, p: Paint) -> Prim {
+    var q = Prim()
+    q.op = PO_ARC
+    q.x = x
+    q.y = y
+    q.w = r
+    q.a0 = a0
+    q.a1 = a1
+    q.p = p
+    return q
+}
+
+// 线段（x,y → w,h 为端点）。
+pub func line(x0: f64, y0: f64, x1: f64, y1: f64, p: Paint) -> Prim {
+    var q = Prim()
+    q.op = PO_LINE
+    q.x = x0
+    q.y = y0
+    q.w = x1
+    q.h = y1
+    q.p = p
+    return q
+}
+
+// 路径（path 记录 + paint；fill/stroke 语义由 paint 描边字段决定）。
+pub func path_p(pth: Path, p: Paint) -> Prim {
+    var q = Prim()
+    q.op = PO_PATH
+    q.pth = pth
+    q.p = p
+    return q
+}
+
+// 文本块（内容 + 位置 + 字号 + paint；排版结果模块四进 IR）。
+pub func text_p(s: string, x: f64, y: f64, size: f64, p: Paint) -> Prim {
+    var q = Prim()
+    q.op = PO_TEXT
+    q.txt = s
+    q.x = x
+    q.y = y
+    q.fs = size
+    q.p = p
+    return q
+}
+
+// 图像（资源句柄 + 目标矩形 + paint；模块五句柄落地）。
+pub func image(h: i64, x: f64, y: f64, w: f64, hh: f64, p: Paint) -> Prim {
+    var q = Prim()
+    q.op = PO_IMAGE
+    q.x = x
+    q.y = y
+    q.w = w
+    q.h = hh
+    q.font = h
+    q.p = p
+    return q
+}
+
+// ---- 图层操作 ----
+
+// saveLayer(区域, paint)：显式标记图层边界 → 引擎离屏层。
+pub func save_layer(ly: Layer) -> Prim {
+    var q = Prim()
+    q.op = PO_SAVE_LAYER
+    q.x = ly.x
+    q.y = ly.y
+    q.w = ly.w
+    q.h = ly.h
+    q.p = ly.p
+    return q
+}
+
+// restoreLayer()。
+pub func restore_layer() -> Prim {
+    var q = Prim()
+    q.op = PO_RESTORE_LAYER
+    return q
+}
+
+// ---- 记录组装辅助 ----
+
+// 逐项变换（当前为无变换；Transform 复合由调用方先行构造）。
+pub func with_tx(r: Prim, t: Transform) -> Prim {
+    var nr = r
+    nr.tx = t
+    return nr
+}
+
+// clip 引用（clip 池 ID；模块二落地）。
+pub func with_clip(r: Prim, clip_id: i64) -> Prim {
+    var nr = r
+    nr.clip = clip_id
+    return nr
+}
+// 命名字段（调参用，不参与渲染语义）。
+pub func with_meta(r: Prim, m: string) -> Prim {
+    var nr = r
+    nr.meta = m
+    return nr
+}
+
+// ---- 深度相等（图元记录，gold 比较用） ----
+
+pub func eq(a: Prim, b: Prim) -> bool {
+    if a.op != b.op || a.x != b.x || a.y != b.y || a.w != b.w || a.h != b.h {
+        return false
+    }
+    if a.rx != b.rx || a.ry != b.ry || a.a0 != b.a0 || a.a1 != b.a1 {
+        return false
+    }
+    if a.txt != b.txt || a.font != b.font || a.fs != b.fs {
+        return false
+    }
+    if a.clip != b.clip || a.meta != b.meta {
+        return false
+    }
+    if !tform.eq(a.tx, b.tx) || !paint.eq(a.p, b.p) || !path.eq(a.pth, b.pth) {
+        return false
+    }
+    return true
+}
+
+}
