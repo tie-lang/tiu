@@ -1,0 +1,103 @@
+type tie<logic>
+// api/tests/probe_m3.tie —— API 模块三验收探针：Canvas 会话 + 双模式
+// ============================================================
+// 覆盖：T3.1 Canvas 会话（窗口/离屏/图像目标；分辨率/DPI/色彩空间
+// 固定引擎工作空间）· T3.2 record/submit/replay + immediate 合成
+// （所有权转移约定）· T3.3 双模式等价探针：immediate IR == retained
+// IR（gold IR 字节相等）且 immediate 渲染图 == retained 渲染图
+// （引擎软件光栅，像素级一致）。另含 TP2 联调：API 编码 → 引擎
+// loader/光栅全链路像素抽查。验收门：全绿 = 模块三完成。
+//
+// EN: API module-3 gate probe — Canvas session, record/submit/replay,
+// dual-mode equivalence (byte-identical IR + identical rendered
+// frame via the engine SW raster). ALL PASS = module complete.
+
+import "../src/color.tie"
+import "../src/transform.tie"
+import "../src/paint.tie"
+import "../src/path.tie"
+import "../src/prim.tie"
+import "../src/tabutil.tie"
+import "../src/drawlist.tie"
+import "../src/ir_bytes.tie"
+import "../src/ir_hash.tie"
+import "../src/ir_enc.tie"
+import "../src/ir_cmp.tie"
+import "../src/canvas.tie"
+import "../../engine/src/irb.tie"
+import "../../engine/src/ir_load.tie"
+import "../../engine/src/semantics.tie"
+import "../../engine/src/gold.tie"
+import "../../engine/src/raster.tie"
+
+const BG: i64 = 0xFF202020
+const RED: i64 = 0xFFE03020
+const WHITE: i64 = 0xFFFFFFFF
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= Canvas 会话（T3.1） =================
+    var cv_win = cvs.new_window(320, 240, 1.0)
+    if cv_win.target == TGT_WINDOW && cv_win.w == 320 && cv_win.h == 240 && cv_win.dpi == 1.0 && cv_win.cs == CS_SRGB { println("[PASS] canvas window session (320x240, sRGB)") } else { fails = fails + 1; println("FAIL canvas window") }
+    var cv_off = cvs.new_offscreen(64, 64, 2.0)
+    if cv_off.target == TGT_OFFSCREEN && cv_off.dpi == 2.0 { println("[PASS] canvas offscreen session dpi=2") } else { fails = fails + 1; println("FAIL canvas offscreen") }
+    var cv_img = cvs.new_image(16, 16, 1.0)
+    if cv_img.target == TGT_IMAGE { println("[PASS] canvas image session") } else { fails = fails + 1; println("FAIL canvas image") }
+    var cv_v = cvs.set_view(cv_win, tform.translate(1.0, 2.0))
+    if cv_v.view.c == 1.0 && cv_v.view.f == 2.0 && cv_win.view.c == 0.0 { println("[PASS] canvas set_view returns new session (alias-safe)") } else { fails = fails + 1; println("FAIL set_view") }
+
+    // ================= record（T3.2） =================
+    var cv = cvs.new_offscreen(16, 16, 1.0)
+    var dl_im = cvs.record(cv)
+    if dl.count(dl_im) == 0 && dl_im.sw == 16 && dl_im.sh == 16 { println("[PASS] canvas.record opens empty draw-list (surface bound)") } else { fails = fails + 1; println("FAIL record") }
+
+    // ================= 双模式等价（T3.3） =================
+    var red_p = paint.solid(color.rgba(0xE0, 0x30, 0x20))
+    var white_p = paint.solid(color.rgba(255, 255, 255))
+    var bg_p = paint.solid(color.rgba(0x20, 0x20, 0x20))
+
+    // immediate 路径：record → 构建 → submit
+    var dl_a = cvs.record(cv)
+    dl.rect(dl_a, 0.0, 0.0, 16.0, 16.0, bg_p)
+    dl.rect(dl_a, 2.0, 2.0, 8.0, 6.0, red_p)
+    dl.text_p(dl_a, "Tiu", 1.0, 3.0, 12.0, white_p)
+    var ir_a = cvs.submit(cv, dl_a)
+
+    // retained 路径：同一绘制表 → replay
+    var ir_b = cvs.replay(cv, dl_a)
+
+    if ircmp.eq(ir_a, ir_b) { println("[PASS] dual-mode: immediate IR == retained IR (byte-identical)") } else { fails = fails + 1; println("FAIL IR eq at " + to_string(ircmp.diff_at(ir_a, ir_b))) }
+
+    // 引擎渲染：immediate vs retained 像素一致
+    var pa = eload.parse_frame(ir_a)
+    var pb = eload.parse_frame(ir_b)
+    var fa = erast.render(pa)
+    var fb2 = erast.render(pb)
+    var gr = egold.cmp_pixels(fa.px, fb2.px, 16, 16, 0)
+    if gr.diff == 0 { println("[PASS] dual-mode: immediate frame == retained frame (pixel-identical)") } else { fails = fails + 1; println("FAIL frame eq diff=" + to_string(gr.diff)) }
+
+    // ================= TP2 联调：API 编码 → 引擎光栅全链路像素抽查 =================
+    if pa.sw == 16 && pa.sh == 16 && len(pa.ops) == 3 { println("[PASS] TP2: engine loads API-encoded frame (3 records)") } else { fails = fails + 1; println("FAIL TP2 load") }
+    // 背景区（0,0）
+    if sem.ch_r(fa.px[0]) == 0x20 && sem.ch_g(fa.px[0]) == 0x20 && sem.ch_b(fa.px[0]) == 0x20 { println("[PASS] TP2: background pixel (0,0)") } else { fails = fails + 1; println("FAIL bg px " + to_string(fa.px[0])) }
+    // 红块内部（4,4）
+    if sem.ch_r(fa.px[4 * 16 + 4]) == 0xE0 && sem.ch_g(fa.px[4 * 16 + 4]) == 0x30 { println("[PASS] TP2: red rect pixel (4,4)") } else { fails = fails + 1; println("FAIL red px " + to_string(fa.px[4 * 16 + 4])) }
+    // 红块外（1,1）非红
+    if sem.ch_r(fa.px[1 * 16 + 1]) != 0xE0 { println("[PASS] TP2: outside rect not red (1,1)") } else { fails = fails + 1; println("FAIL outside px") }
+    // 文本区有白色像素（T 字形首列 (1,3)）
+    if sem.ch_r(fa.px[3 * 16 + 1]) == 0xFF && sem.ch_g(fa.px[3 * 16 + 1]) == 0xFF { println("[PASS] TP2: text glyph pixel present (white)") } else { fails = fails + 1; println("FAIL text px " + to_string(fa.px[3 * 16 + 1])) }
+
+    // 纹理：submit 后同一绘制表 replay 幂等（所有权转移约定：冻结后只读重放）
+    var ir_c = cvs.replay(cv, dl_a)
+    if ircmp.eq(ir_c, ir_a) { println("[PASS] replay idempotent (frozen draw-list reuse)") } else { fails = fails + 1; println("FAIL replay idem") }
+
+    // ================= 汇总 =================
+    if fails == 0 {
+        println("API M3: ALL PASS (dual-mode equivalent)")
+    } else {
+        println("API M3: FAILURES " + to_string(fails))
+        exit(1)
+    }
+    return 0
+}
