@@ -1,0 +1,101 @@
+type tie<logic>
+// probe_hit: 事件轴对接探针（命中测试 / 冒泡路径 / 卸载后不命中 / 滚动平移）
+// 树（实际布局）：
+//   Column(0,0,16,32) > [Text(0,0,16,16), Row(0,16,16,16) > [Text(0,16,8,16), Text(8,16,8,16)]]
+import "../ui/src/build.tie"
+import "../ui/src/layout.tie"
+import "../ui/src/hit.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func child_at(root: i64, n: i64) -> i64 {
+    var c = tiu_tree.first_child(root)
+    var k: i64 = 0
+    while k < n {
+        c = tiu_tree.next_sibling(c)
+        k = k + 1
+    }
+    return c
+}
+
+func tbl_eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    tiu_tree.reset()
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 2, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Row, 1, 1, 0, 0, 0, 0, 0)
+    tiu_build.open(WidgetType.Text, 0, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open(WidgetType.Text, 1, 1, 1, 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    var root = tiu_tree.root()
+    var c = Constraints.loose()
+    tiu_layout.layout(root, c)
+
+    var t0 = child_at(root, 0)          // Text "AB" @ (0,0,16,16)
+    var row = child_at(root, 1)         // Row @ (0,16,16,16)
+    var tx = child_at(row, 0)           // Text "x" @ (0,16,8,16)
+    var ty = child_at(row, 1)           // Text "y" @ (8,16,8,16)
+
+    // ---------- 1) 命中测试 ----------
+    check(tiu_hit.hit_test(4, 8) == t0, "hit text0 at (4,8)")
+    check(tiu_hit.hit_test(4, 20) == tx, "hit row text0 at (4,20)")
+    check(tiu_hit.hit_test(12, 20) == ty, "hit row text1 at (12,20)")
+    check(tiu_hit.hit_test(8, 30) == ty, "hit ty at (8,30)")
+    check(tiu_hit.hit_test(-1, 8) == -1, "miss left outside")
+    check(tiu_hit.hit_test(50, 50) == -1, "miss outside")
+
+    // ---------- 2) 冒泡路径（leaf -> root）----------
+    var path = tiu_hit.bubble(tx)
+    var want: table<i64> = [tx, row, root]
+    check(tbl_eq(path, want), "bubble tx -> row -> root")
+    var path2 = tiu_hit.bubble(t0)
+    var want2: table<i64> = [t0, root]
+    check(tbl_eq(path2, want2), "bubble t0 -> root")
+
+    // ---------- 3) 卸载后不命中 / 空树 ----------
+    tiu_tree.unmount(tx)
+    check(tiu_hit.hit_test(4, 20) == row, "after unmount tx: hit row instead")
+    var path3 = tiu_hit.bubble(tx)
+    check(len(path3) == 0, "bubble of dead node = empty")
+
+    // ---------- 4) 滚动命中平移（O(1)，内容偏移 dx 后逻辑点映射内容坐标；
+    // tx 已卸载，命中回落到 row）----------
+    check(tiu_hit.hit_test_scrolled(20, 20, -10, 0) == ty, "scrolled hit: (20,20) dx=-10 -> ty")
+    check(tiu_hit.hit_test_scrolled(-5, 20, 10, 0) == row, "scrolled hit: (-5,20) dx=10 -> row")
+    check(tiu_hit.hit_test_scrolled(1, 20, 0, 0) == row, "scrolled zero offset -> row")
+
+    if fails > 0 {
+        println("PROBE_HIT FAIL " + to_string(fails))
+        exit(1)
+    } else {
+        println("PROBE_HIT PASS")
+    }
+}
