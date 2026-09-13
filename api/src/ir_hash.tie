@@ -1,0 +1,46 @@
+type tie<class>
+// api/src/ir_hash.tie —— tiu 绘制 API：轻量指纹（稳定 key 派生底座）
+// ============================================================
+// FNV-1a 64：确定性、无依赖、低碰撞（轻量组合指纹，对齐引擎 §4
+// "key 采用轻量组合"；不引入跨仓 std 依赖，TSHA 族留作后续密钥级
+// 场景。能力缺口如实记录，不阻塞）。溢出回绕 = u64 mod 2^64
+// （LLVM 普通 mul 回绕，二进制补码确定性）。
+//
+// EN: FNV-1a 64 deterministic fingerprint for stable key derivation.
+
+const FNV_OFFSET: i64 = -3750763034362895579   // 0xcbf29ce484222325
+const FNV_PRIME: i64 = 1099511628211           // 0x100000001b3
+
+namespace irh {
+
+// 增量更新（seed 哈希 + 一个字节）。
+pub func step(h: i64, b: i64) -> i64 {
+    var h2 = h ^ (b & 0xFF)
+    return h2 * FNV_PRIME
+}
+
+// 字节流 → FNV-1a 64。
+pub func bytes(t: table<i64>) -> i64 {
+    var h = FNV_OFFSET
+    var i: i64 = 0
+    while i < len(t) {
+        h = step(h, t[i])
+        i = i + 1
+    }
+    return h
+}
+
+// 两个哈希合并（顺序敏感：a 先 b 后）。
+pub func join(a: i64, b: i64) -> i64 {
+    var h = step(a, (b >> 56) & 0xFF)
+    h = step(h, (b >> 48) & 0xFF)
+    h = step(h, (b >> 40) & 0xFF)
+    h = step(h, (b >> 32) & 0xFF)
+    h = step(h, (b >> 24) & 0xFF)
+    h = step(h, (b >> 16) & 0xFF)
+    h = step(h, (b >> 8) & 0xFF)
+    h = step(h, b & 0xFF)
+    return h
+}
+
+}

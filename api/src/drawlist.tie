@@ -1,0 +1,365 @@
+type tie<class>
+// api/src/drawlist.tie —— tiu 绘制 API：DrawList（绘制表段，列式）
+import "./tabutil.tie"
+import "./color.tie"
+import "./transform.tie"
+import "./path.tie"
+import "./prim.tie"
+// ============================================================
+// DrawList = 中间 IR 绘制表（引擎文档 §4 L2）：图元记录序列 +
+// 视图变换 + surface 参数。**构建期可变、冻结后只读**（tie 表赋值
+// 引用共享，追加即原地扩展——构建器语义；冻结 = 约定不再修改，
+// 编码/提交只读。语义上记录不可变：冻结后任何访问不改变数据）。
+//
+// 存储：列式（对齐 tiec 列式 arena 惯例）——每图元一行，Paint/
+// Path 经池（列式对象池）引用；stops/dash/颜色矩阵入全局池。
+// 本对象模型下 tiu 无 struct 数组（tie 表仅内建元素类型），列式是
+// tie 既有能力的落地形态（实施计划 §3：不引入新语言特性）。
+//
+// EN: DrawList = draw-list segment (engine §4 L2): primitive record
+// sequence + view transform + surface. Columnar storage (tie tables
+// only hold builtin element types — columnar pools are the tie-idiom
+// substitute; no struct arrays, per plan §3). Mutable while building,
+// read-only once frozen.
+
+struct DrawList {
+    // ---- 图元行（每行一个 record） ----
+    var op: table<i64> = table_new_i64()
+    var x: table<f64> = table_new_f64()
+    var y: table<f64> = table_new_f64()
+    var w: table<f64> = table_new_f64()
+    var h: table<f64> = table_new_f64()
+    var rx: table<f64> = table_new_f64()
+    var ry: table<f64> = table_new_f64()
+    var a0: table<f64> = table_new_f64()
+    var a1: table<f64> = table_new_f64()
+    var fs: table<f64> = table_new_f64()
+    var txt: table<string> = table_new_string()
+    var meta: table<string> = table_new_string()
+    var font: table<i64> = table_new_i64()
+    var clip: table<i64> = table_new_i64()
+    var p_id: table<i64> = table_new_i64()
+    var pth_id: table<i64> = table_new_i64()
+    var tx0: table<f64> = table_new_f64()
+    var tx1: table<f64> = table_new_f64()
+    var tx2: table<f64> = table_new_f64()
+    var tx3: table<f64> = table_new_f64()
+    var tx4: table<f64> = table_new_f64()
+    var tx5: table<f64> = table_new_f64()
+
+    // ---- Paint 池（行 id = 追加序；-1 = 默认 Paint()） ----
+    var pp_fill: table<i64> = table_new_i64()
+    var pp_color: table<i64> = table_new_i64()
+    var pp_gx0: table<f64> = table_new_f64()
+    var pp_gy0: table<f64> = table_new_f64()
+    var pp_gx1: table<f64> = table_new_f64()
+    var pp_gy1: table<f64> = table_new_f64()
+    var pp_st_ofs: table<i64> = table_new_i64()
+    var pp_st_len: table<i64> = table_new_i64()
+    var pp_dash_ofs: table<i64> = table_new_i64()
+    var pp_dash_len: table<i64> = table_new_i64()
+    var pp_stroke_w: table<f64> = table_new_f64()
+    var pp_cap: table<i64> = table_new_i64()
+    var pp_join: table<i64> = table_new_i64()
+    var pp_alpha: table<i64> = table_new_i64()
+    var pp_blend: table<i64> = table_new_i64()
+    var pp_blur: table<f64> = table_new_f64()
+    var pp_shadow: table<i64> = table_new_i64()
+    var pp_shx: table<f64> = table_new_f64()
+    var pp_shy: table<f64> = table_new_f64()
+    var pp_shcolor: table<i64> = table_new_i64()
+    var pp_image: table<i64> = table_new_i64()
+    var pp_cm_ofs: table<i64> = table_new_i64()
+    var pp_cm_len: table<i64> = table_new_i64()
+
+    // ---- 全局池 ----
+    var stops_pool: table<i64> = table_new_i64()
+    var dash_pool: table<f64> = table_new_f64()
+    var cm_pool: table<i64> = table_new_i64()
+    var pth_ops: table<i64> = table_new_i64()
+    var pth_args: table<f64> = table_new_f64()
+    var pth_cmd_ofs: table<i64> = table_new_i64()
+    var pth_cmd_len: table<i64> = table_new_i64()
+
+    // ---- 视图 + surface ----
+    var view: Transform = Transform()
+    var sw: i64 = 0
+    var sh: i64 = 0
+    var dpi: f64 = 1.0
+}
+
+const DL_DEF_PAINT: i64 = -1
+const DL_NO_PATH: i64 = -1
+
+namespace dl {
+
+// 新建空 DrawList（surface 逻辑尺寸 + DPI）。
+pub func new(w: i64, h: i64, dpi: f64) -> DrawList {
+    var d = DrawList()
+    d.sw = w
+    d.sh = h
+    d.dpi = dpi
+    return d
+}
+
+// 设视图变换（会话级，整帧共用）。返回新 DrawList（值语义：
+// struct 标量字段的原地修改对调用方不可见，故返回新记录）。
+pub func set_view(d: DrawList, t: Transform) -> DrawList {
+    var nd = d
+    nd.view = t
+    return nd
+}
+
+// ---- 图元追加（构建期） ----
+
+pub func rect(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
+    push_row(d, PO_RECT, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func rrect(d: DrawList, x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64, p: Paint) {
+    push_row(d, PO_RRECT, x, y, w, h, rx, ry, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func ellipse(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
+    push_row(d, PO_ELLIPSE, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func arc(d: DrawList, x: f64, y: f64, r: f64, a0: f64, a1: f64, p: Paint) {
+    push_row(d, PO_ARC, x, y, r, 0.0, 0.0, 0.0, a0, a1, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func line(d: DrawList, x0: f64, y0: f64, x1: f64, y1: f64, p: Paint) {
+    push_row(d, PO_LINE, x0, y0, x1, y1, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func path(d: DrawList, pth: Path, p: Paint) {
+    push_row(d, PO_PATH, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, pool_path(d, pth), tform.identity())
+}
+
+pub func text_p(d: DrawList, s: string, x: f64, y: f64, size: f64, p: Paint) {
+    push_row(d, PO_TEXT, x, y, size, 0.0, 0.0, 0.0, 0.0, 0.0, size, s, "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func save_layer(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
+    push_row(d, PO_SAVE_LAYER, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+}
+
+pub func restore_layer(d: DrawList) {
+    push_row(d, PO_RESTORE_LAYER, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, Paint(), DL_NO_PATH, tform.identity())
+}
+
+// 命名字段（不参与 key/渲染语义）。表内容下标写（共享引用生效）。
+pub func set_meta(d: DrawList, m: string) {
+    var meta = d.meta
+    var last = len(meta) - 1
+    if last >= 0 {
+        meta[last] = m
+    }
+}
+
+// 图元数（表长度 = 共享引用，读有效）。
+pub func count(d: DrawList) -> i64 {
+    return len(d.op)
+}
+
+// ---- 内部：行 push（构建期） ----
+
+func push_row(d: DrawList, op: i64, x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64,
+              a0: f64, a1: f64, fs: f64, txt: string, meta: string, font: i64,
+              p: Paint, pth_id: i64, tx: Transform) {
+    var c_op = d.op
+    table_push(c_op, op)
+    d.op = c_op
+    var c_x = d.x
+    table_push(c_x, x)
+    d.x = c_x
+    var c_y = d.y
+    table_push(c_y, y)
+    d.y = c_y
+    var c_w = d.w
+    table_push(c_w, w)
+    d.w = c_w
+    var c_h = d.h
+    table_push(c_h, h)
+    d.h = c_h
+    var c_rx = d.rx
+    table_push(c_rx, rx)
+    d.rx = c_rx
+    var c_ry = d.ry
+    table_push(c_ry, ry)
+    d.ry = c_ry
+    var c_a0 = d.a0
+    table_push(c_a0, a0)
+    d.a0 = c_a0
+    var c_a1 = d.a1
+    table_push(c_a1, a1)
+    d.a1 = c_a1
+    var c_fs = d.fs
+    table_push(c_fs, fs)
+    d.fs = c_fs
+    var c_txt = d.txt
+    table_push(c_txt, txt)
+    d.txt = c_txt
+    var c_meta = d.meta
+    table_push(c_meta, meta)
+    d.meta = c_meta
+    var c_font = d.font
+    table_push(c_font, font)
+    d.font = c_font
+    var c_clip = d.clip
+    table_push(c_clip, PO_NO_CLIP)
+    d.clip = c_clip
+    var c_pid = d.p_id
+    table_push(c_pid, pool_paint(d, p))
+    d.p_id = c_pid
+    var c_pth = d.pth_id
+    table_push(c_pth, pth_id)
+    d.pth_id = c_pth
+    var c_t0 = d.tx0
+    table_push(c_t0, tx.a)
+    d.tx0 = c_t0
+    var c_t1 = d.tx1
+    table_push(c_t1, tx.b)
+    d.tx1 = c_t1
+    var c_t2 = d.tx2
+    table_push(c_t2, tx.c)
+    d.tx2 = c_t2
+    var c_t3 = d.tx3
+    table_push(c_t3, tx.d)
+    d.tx3 = c_t3
+    var c_t4 = d.tx4
+    table_push(c_t4, tx.e)
+    d.tx4 = c_t4
+    var c_t5 = d.tx5
+    table_push(c_t5, tx.f)
+    d.tx5 = c_t5
+}
+
+// Paint 入池（复制展开为列；stops/dash/cmatrix 快照到全局池）。
+func pool_paint(d: DrawList, p: Paint) -> i64 {
+    var id = len(d.pp_fill)
+    var f = d.pp_fill
+    table_push(f, p.fill)
+    d.pp_fill = f
+    var c = d.pp_color
+    table_push(c, color.pack(p.color))
+    d.pp_color = c
+    var x0 = d.pp_gx0
+    table_push(x0, p.gx0)
+    d.pp_gx0 = x0
+    var y0 = d.pp_gy0
+    table_push(y0, p.gy0)
+    d.pp_gy0 = y0
+    var x1 = d.pp_gx1
+    table_push(x1, p.gx1)
+    d.pp_gx1 = x1
+    var y1 = d.pp_gy1
+    table_push(y1, p.gy1)
+    d.pp_gy1 = y1
+    var so = len(d.stops_pool)
+    var sp = d.stops_pool
+    var i: i64 = 0
+    while i < len(p.stops) {
+        table_push(sp, p.stops[i])
+        i = i + 1
+    }
+    d.stops_pool = sp
+    var so_t = d.pp_st_ofs
+    table_push(so_t, so)
+    d.pp_st_ofs = so_t
+    var sl = d.pp_st_len
+    table_push(sl, len(p.stops))
+    d.pp_st_len = sl
+    var d_o = len(d.dash_pool)
+    var dp = d.dash_pool
+    var j: i64 = 0
+    while j < len(p.dash) {
+        table_push(dp, p.dash[j])
+        j = j + 1
+    }
+    d.dash_pool = dp
+    var do_t = d.pp_dash_ofs
+    table_push(do_t, d_o)
+    d.pp_dash_ofs = do_t
+    var dl2 = d.pp_dash_len
+    table_push(dl2, len(p.dash))
+    d.pp_dash_len = dl2
+    var sw = d.pp_stroke_w
+    table_push(sw, p.stroke_w)
+    d.pp_stroke_w = sw
+    var cp = d.pp_cap
+    table_push(cp, p.cap)
+    d.pp_cap = cp
+    var jn = d.pp_join
+    table_push(jn, p.join)
+    d.pp_join = jn
+    var al = d.pp_alpha
+    table_push(al, p.alpha)
+    d.pp_alpha = al
+    var bl = d.pp_blend
+    table_push(bl, p.blend)
+    d.pp_blend = bl
+    var br = d.pp_blur
+    table_push(br, p.blur)
+    d.pp_blur = br
+    var sh = d.pp_shadow
+    table_push(sh, p.shadow)
+    d.pp_shadow = sh
+    var shx = d.pp_shx
+    table_push(shx, p.shx)
+    d.pp_shx = shx
+    var shy = d.pp_shy
+    table_push(shy, p.shy)
+    d.pp_shy = shy
+    var sc = d.pp_shcolor
+    table_push(sc, color.pack(p.sh_color))
+    d.pp_shcolor = sc
+    var im = d.pp_image
+    table_push(im, p.image)
+    d.pp_image = im
+    var cm_o = len(d.cm_pool)
+    var cm = d.cm_pool
+    var k: i64 = 0
+    while k < len(p.cmatrix) {
+        table_push(cm, p.cmatrix[k])
+        k = k + 1
+    }
+    d.cm_pool = cm
+    var cmo = d.pp_cm_ofs
+    table_push(cmo, cm_o)
+    d.pp_cm_ofs = cmo
+    var cml = d.pp_cm_len
+    table_push(cml, len(p.cmatrix))
+    d.pp_cm_len = cml
+    return id
+}
+
+// Path 入池（命令序列快照；返回池 id）。
+func pool_path(d: DrawList, pth: Path) -> i64 {
+    var ofs = len(d.pth_cmd_ofs)
+    var o = d.pth_ops
+    var a = d.pth_args
+    var i: i64 = 0
+    while i < pth.n {
+        table_push(o, pth.ops[i])
+        var argc = path.cmd_argc(pth.ops[i])
+        var seg = path.cmd_args(pth, i)
+        var j: i64 = 0
+        while j < argc {
+            table_push(a, seg[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    d.pth_ops = o
+    d.pth_args = a
+    var of = d.pth_cmd_ofs
+    table_push(of, ofs)
+    d.pth_cmd_ofs = of
+    var ln = d.pth_cmd_len
+    table_push(ln, pth.n)
+    d.pth_cmd_len = ln
+    return ofs
+}
+
+}
