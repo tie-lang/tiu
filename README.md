@@ -41,8 +41,27 @@ tiu 全部以 **tie 语言**实现，用自举 tiec 编译（要求本机克隆
 - `engine/` 渲染引擎（绘制表 IR loader、软件统一内核与渲染语义、帧缓冲导出）
 - `ui/` 控件框架（骨架 / 声明式构建复用 / 约束布局 / 主题 token / 差分桥 / 命中对接 / 绘制桥）
 - `host/` 平台壳（窗口 / 消息泵 / 上屏 / 事件；tie 绑定的最小平台层，见下）
+- `examples/` 示例应用（可运行的窗口程序，见下）
 - `docs/` 设计与实施文档（从 tie-main 收拢；tie-main 侧保留原件）
 - `tests/` 探针（gold IR / gold 图 / 双模式等价 / 端到端可见闭环 / 交互闭环）
+
+## 示例 / Examples
+
+- [`examples/counter.tie`](examples/counter.tie) —— **计数器应用**：声明式界面 + 绝对定位 +
+  主题切换 + 按钮三态（悬停 / 按下）+ 状态驱动重绘。启动后先自演示一遍（合成点击），
+  之后可手动交互，按 `ESC` 或关闭窗口退出。
+
+一键构建并运行（tiu 仓根；需先按上节准备好工具链）：
+
+```powershell
+..\tiec\compiler\tiec.exe examples\build.tie -o build\example_build.exe
+build\example_build.exe
+```
+
+EN: `examples/counter.tie` is a runnable counter app wiring all layers together
+(declarative build, absolute layout, theme switching, three-state buttons,
+state-driven redraw). It self-demos with synthetic clicks on start, then takes
+real input; ESC or the close button quits.
 
 ## 平台壳 / Host layer
 

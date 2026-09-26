@@ -1,0 +1,70 @@
+type tie<logic>
+// examples/build.tie —— tiu 示例应用构建驱动（tie 写；在 tiu 仓根运行）
+// EN: tiu sample-app build driver (tie-written; run from the tiu repo root).
+// ============================================================
+// 链路与 host/build.tie 相同（clang-cl 编平台壳 → tiec --emit-ir → clang 链接），
+// 区别是这里构建的是**示例应用**而非验收探针。
+//
+// 用法（tiu 仓根）：
+//   ..\tiec\compiler\tiec.exe examples\build.tie -o build\example_build.exe
+//   build\example_build.exe
+
+unsafe extern fn system(p0: string) -> i32
+
+var g_out: string = "build\\host"
+var g_tiec: string = "..\\tiec\\compiler\\tiec.exe"
+var g_host_cpp: string = "host\\win32\\tiu_host.cpp"
+var g_host_obj: string = "build\\host\\tiu_host.obj"
+
+func sh(cmd: string) -> i64 {
+    println("  $ " + cmd)
+    unsafe {
+        return as_i64(system(cmd))
+    }
+}
+
+func die(m: string) -> i64 {
+    println("[example] ERROR: " + m)
+    exit(1)
+    return 1
+}
+
+func main() -> i64 {
+    if sh("if not exist " + g_out + " mkdir " + g_out) != 0 {
+        return die("mkdir " + g_out + " failed")
+    }
+
+    // 1) 平台壳（C）—— 已存在则跳过
+    if sh("if not exist " + g_host_obj + " clang-cl /MT /O2 /c " + g_host_cpp + " /Fo:" + g_host_obj) != 0 {
+        return die("tiu_host.cpp compile failed")
+    }
+    println("[example] tiu_host.obj ok")
+
+    // 2) 示例源码 → IR → obj → exe
+    var ll = g_out + "\\counter.ll"
+    var obj = g_out + "\\counter.obj"
+    var exe = g_out + "\\counter.exe"
+
+    if sh(g_tiec + " examples\\counter.tie --emit-ir -o " + ll) != 0 {
+        return die("counter IR failed (tiec)")
+    }
+    if sh("clang -O2 -c " + ll + " -o " + obj) != 0 {
+        return die("counter obj failed (clang)")
+    }
+    var lcmd = "clang -fuse-ld=link " + obj + " " + g_host_obj + " ..\\trm-lite\\trm_lite.a" +
+        " -o " + exe +
+        " -luser32 -lgdi32 -lshell32 -lole32 -ladvapi32 -rtlib=compiler-rt"
+    if sh(lcmd) != 0 {
+        return die("counter link failed")
+    }
+    println("[example] counter.exe linked")
+
+    // 3) 运行（真窗口；示例自带自演示，之后可手动交互）
+    println("[example] running counter.exe — a window will appear; ESC or close it to quit ...")
+    var rc = sh(exe)
+    if rc != 0 {
+        return die("counter run failed rc=" + to_string(rc))
+    }
+    println("[example] run ok (rc=0)")
+    return 0
+}

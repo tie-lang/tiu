@@ -1,0 +1,332 @@
+type tie<logic>
+// examples/counter.tie —— tiu 示例应用：计数器
+// EN: tiu sample application — a counter.
+// ============================================================
+// 这是 tiu 的第一个**示例应用**（非探针）：把三层（UI / API / engine）与平台壳
+// 串成一个可运行的窗口程序，用来直观展示框架能力与用法。
+//
+// 演示的能力：
+//   * 声明式构建 + 槽位复用（tiu_build）：每帧声明界面，框架按 slot 复用骨架
+//   * 绝对定位布局（WidgetType.Absolute + ox/oy/fw/fh）
+//   * 绘制桥（upaint.draw）：控件树 → API 绘制表
+//   * 主题 token（uth）：暗/亮两套，运行时切换
+//   * 命中测试 + 事件路由（tiu_hit）：悬停 / 按下 / 点击三态
+//   * 状态驱动重绘：应用状态变更 → 重建 + 布局 + 绘制 + 编码 + 光栅 + 上屏
+//   * 平台壳（host）：窗口 / 消息泵 / 上屏 / 事件队列
+//
+// 运行（tiu 仓根下）：
+//   ..\tiec\compiler\tiec.exe examples\counter.tie --emit-ir -o build\host\counter.ll
+//   ...（完整链路见 host/build.tie；或直接跑 host/build.tie 一次构建全部）
+//
+// EN: First tiu sample app — declarative build + slot reuse, absolute layout,
+// paint bridge, theme tokens, hit-test routed pointer events, state-driven
+// redraw, and the platform host — all wired into one runnable window program.
+
+import "../ui/src/tree.tie"
+import "../ui/src/build.tie"
+import "../ui/src/layout.tie"
+import "../ui/src/hit.tie"
+import "../ui/src/theme.tie"
+import "../ui/src/paint_bridge.tie"
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+
+const W: i64 = 360
+const H: i64 = 260
+
+// 控件槽位（Absolute 定位，槽位即稳定身份，复用以 slot 为准）
+const S_TITLE: i64 = 0
+const S_COUNT: i64 = 1
+const S_MINUS: i64 = 2
+const S_PLUS: i64 = 3
+const S_RESET: i64 = 4
+const S_THEME: i64 = 5
+const S_STATUS: i64 = 6
+const S_HINT: i64 = 7
+
+// ---- 应用状态（应用层持有；框架不托管状态，widgets §3.3）----
+var g_count: i64 = 0
+var g_theme: i64 = 0
+var g_hot: i64 = -1          // 悬停节点
+var g_active: i64 = -1       // 按下节点
+var g_status: string = "click -1 / +1"
+var g_frames: i64 = 0        // 实际重绘次数
+var g_quit: i64 = 0          // 0 = 继续 / 1 = 退出（用 i64 承载，避免全局 bool 初值歧义）
+var g_rounds: i64 = 0        // 主循环实际轮数（诊断）
+
+func main() -> i64 {
+    println("=== tiu counter demo (UI -> API -> engine -> window) ===")
+
+    // 首帧：构建 → 布局 → 绘制 → 编码 → 光栅
+    var root = build_scene()
+    tiu_layout.layout(root, Constraints.tight(W, H))
+    dump_layout(root)
+
+    var cv = cvs.new_window(W, H, 1.0)
+    var fb = render_frame(cv)
+    if len(fb.px) != W * H {
+        println("FAIL: frame render")
+        return 1
+    }
+
+    // 开窗 + 主循环
+    var hwnd = host.open("tiu · counter demo", W, H)
+    if hwnd == 0 {
+        println("FAIL: cannot open window")
+        return 1
+    }
+    host.show(hwnd)
+    println("[INFO] window is open — a short self-demo runs first, then it is all yours.")
+    println("[INFO] auto-closes in ~45s (or close it / press ESC)")
+
+    unsafe {
+        var buf: ptr<u8> = epres.to_bgra(fb.px, W, H)
+        host.present_bytes(hwnd, buf, W, H)
+
+        var rounds: i64 = 0
+        var dirty = false
+        while rounds < 2800 && g_quit == 0 {
+            host.pump(hwnd)
+
+            // 自演示：前 ~14s 由脚本合成点击（之后交给真人操作）
+            self_demo(hwnd, rounds)
+
+            // 事件批次 → 状态变更（事件到达才命中，无事件零开销）
+            var evs = host.take_events(hwnd)
+            var ne = host.ev_count(evs)
+            if ne > 0 {
+                var k: i64 = 0
+                while k < ne {
+                    if on_event(evs, k) {
+                        dirty = true
+                    }
+                    k = k + 1
+                }
+            }
+
+            // 脏则重绘上屏（真实主循环形态）
+            if dirty {
+                var nf = render_frame(cv)
+                var nb: ptr<u8> = epres.to_bgra(nf.px, W, H)
+                host.present_bytes(hwnd, nb, W, H)
+                free(nb)
+                g_frames = g_frames + 1
+                dirty = false
+            }
+
+            if host.closed(hwnd) {
+                println("[INFO] window closed by its close button")
+                break
+            }
+            host.sleep(16)
+            rounds = rounds + 1
+        }
+        g_rounds = rounds
+        free(buf)
+    }
+
+    host.destroy(hwnd)
+    println("=== final: count=" + to_string(g_count)
+        + "  theme=" + uth.name(g_theme)
+        + "  rounds=" + to_string(g_rounds)
+        + "  redraws=" + to_string(g_frames) + " ===")
+    return 0
+}
+
+// ---- 声明式界面（每帧重声明；框架按 slot 复用骨架）----
+
+func build_scene() -> i64 {
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Absolute, 0, 1, 0, 0, 0, 0, 0)
+
+    tiu_build.open_t(WidgetType.Text, S_TITLE, 1, "tiu demo", 20, 18, 0, 0)
+    tiu_build.close()
+
+    // 计数：文本随状态变，ver 跟随数值（版本号驱动的差分语义）
+    tiu_build.open_t(WidgetType.Text, S_COUNT, g_count + 1, "Count: " + to_string(g_count), 32, 66, 0, 0)
+    tiu_build.close()
+
+    tiu_build.open_t(WidgetType.Button, S_MINUS, 1, "-1", 20, 108, 88, 36)
+    tiu_build.close()
+    tiu_build.open_t(WidgetType.Button, S_PLUS, 1, "+1", 124, 108, 88, 36)
+    tiu_build.close()
+    tiu_build.open_t(WidgetType.Button, S_RESET, 1, "Reset", 228, 108, 112, 36)
+    tiu_build.close()
+
+    tiu_build.open_t(WidgetType.Button, S_THEME, 1, "Toggle Theme", 20, 156, 320, 36)
+    tiu_build.close()
+
+    tiu_build.open_t(WidgetType.Text, S_STATUS, g_frames + 1, g_status, 20, 212, 0, 0)
+    tiu_build.close()
+    tiu_build.open_t(WidgetType.Text, S_HINT, 1, "press ESC to quit", 20, 234, 0, 0)
+    tiu_build.close()
+
+    tiu_build.close()   // 根
+    tiu_build.finish()
+    return tiu_tree.root()
+}
+
+// ---- 一帧：装饰绘制 → 绘制桥 → API 编码 → loader → 软件光栅 ----
+// 装饰用直接 API 绘制（展示「绘制桥产出控件 + 应用手工补绘」可以共存在同一
+// 绘制表里；两者最终都走同一条 IR 通道）。
+
+func render_frame(cv: Canvas) -> FrameBuf {
+    var d = cvs.record(cv)
+
+    // 1) 整帧背景
+    upaint.background(d, W, H, g_theme)
+
+    // 2) 装饰：标题分隔线、计数面板、状态栏
+    dl.rect(d, 20.0, 42.0, 320.0, 1.0, tint(uth.border(g_theme)))
+    dl.rect(d, 20.0, 52.0, 320.0, 44.0, tint(uth.surface(g_theme)))
+    dl.rect(d, 0.0, 200.0, 360.0, 60.0, tint(uth.surface(g_theme)))
+
+    // 3) 控件（绘制桥：UI 树 → 绘制记录）
+    upaint.draw(d, g_theme, g_hot, g_active)
+
+    var ir = cvs.submit(cv, d)
+    var p = eload.parse_frame(ir)
+    return erast.render(p)
+}
+
+// 0xAARRGGBB → 纯色 Paint。
+func tint(argb: i64) -> Paint {
+    return paint.solid(color.from_argb(argb))
+}
+
+// ---- 自演示：按轮次合成点击，让界面自己动一遍（之后交给真人）----
+// 坐标 = 各按钮中心（见 dump_layout 的几何输出）。
+
+func self_demo(hwnd: i64, r: i64) {
+    if r == 40 {
+        click(hwnd, 168, 126)          // +1
+    } else if r == 90 {
+        click(hwnd, 168, 126)          // +1
+    } else if r == 140 {
+        click(hwnd, 168, 126)          // +1
+    } else if r == 190 {
+        click(hwnd, 64, 126)           // -1
+    } else if r == 250 {
+        click(hwnd, 284, 126)          // Reset
+    } else if r == 310 {
+        click(hwnd, 168, 126)          // +1
+    } else if r == 360 {
+        click(hwnd, 168, 126)          // +1
+    } else if r == 430 {
+        click(hwnd, 180, 174)          // Toggle Theme
+    } else if r == 520 {
+        println("[INFO] self-demo finished — window is yours; click around, ESC quits")
+    }
+}
+
+// 合成一次点击（move → down → up），由消息泵回投给窗口、经 WndProc 入队。
+func click(hwnd: i64, x: i64, y: i64) {
+    host.post_mouse(hwnd, x, y)
+    host.post_lbutton_down(hwnd, x, y)
+    host.post_lbutton_up(hwnd, x, y)
+}
+
+// ---- 事件 → 状态（返回是否脏）----
+
+func on_event(evs: table<i64>, k: i64) -> bool {
+    var et = host.ev_type(evs, k)
+    var ex = host.ev_x(evs, k)
+    var ey = host.ev_y(evs, k)
+
+    if et == host.ev_mouse_move() {
+        var h = hover_target(ex, ey)
+        if h != g_hot {
+            g_hot = h
+            return true
+        }
+        return false
+    }
+    if et == host.ev_lbutton_down() {
+        var h = hover_target(ex, ey)
+        if h != g_active {
+            g_active = h
+            return true
+        }
+        return false
+    }
+    if et == host.ev_lbutton_up() {
+        var changed = false
+        var h = hover_target(ex, ey)
+        if g_active >= 0 && h == g_active {
+            act(tiu_tree.slot_of(h))
+            changed = true
+        }
+        if g_active != -1 {
+            g_active = -1
+            changed = true
+        }
+        return changed
+    }
+    if et == host.ev_key_down() {
+        var vk = host.ev_key(evs, k)
+        if vk == 27 {                      // VK_ESCAPE
+            g_quit = 1
+            return false
+        }
+    }
+    return false
+}
+
+// 命中 → 仅按钮可交互（容器/文本不参与），返回节点 id 或 -1。
+func hover_target(px: i64, py: i64) -> i64 {
+    var h = tiu_hit.hit_test(px, py)
+    if h < 0 {
+        return -1
+    }
+    if tiu_tree.ty_of(h) == tiu_tree.ty_code(WidgetType.Button) {
+        return h
+    }
+    return -1
+}
+
+// 按钮动作（按槽位路由）。
+func act(slot: i64) {
+    if slot == S_MINUS {
+        g_count = g_count - 1
+        g_status = "count decremented"
+    } else if slot == S_PLUS {
+        g_count = g_count + 1
+        g_status = "count incremented"
+    } else if slot == S_RESET {
+        g_count = 0
+        g_status = "count reset"
+    } else if slot == S_THEME {
+        g_theme = uth.toggle(g_theme)
+        g_status = "theme -> " + uth.name(g_theme)
+    }
+    println("[action] slot=" + to_string(slot) + "  count=" + to_string(g_count)
+        + "  theme=" + uth.name(g_theme))
+}
+
+// 打印布局结果（便于核验界面几何）。
+func dump_layout(root: i64) {
+    println("[layout] window " + to_string(W) + "x" + to_string(H))
+    var k = tiu_tree.first_child(root)
+    while k >= 0 {
+        var r = tiu_tree.rect(k)
+        var label = tiu_tree.text_of(k)
+        println("  slot " + to_string(tiu_tree.slot_of(k))
+            + "  " + pad(tiu_tree.type_name(tiu_tree.ty_of(k)))
+            + " (" + to_string(r.x) + "," + to_string(r.y) + ","
+            + to_string(r.w) + "," + to_string(r.h) + ")  \"" + label + "\"")
+        k = tiu_tree.next_sibling(k)
+    }
+}
+
+func pad(s: string) -> string {
+    var out = s
+    while str_len(out) < 9 {
+        out = out + " "
+    }
+    return out
+}
