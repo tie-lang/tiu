@@ -1,0 +1,59 @@
+type tie<class>
+// engine/src/present.tie —— tiu 渲染引擎：帧缓冲导出为呈现格式
+// EN: tiu engine — frame-buffer export for presentation.
+// ============================================================
+// 职责（依据 tiu-render-impl.md §1 T4.1「平台最小抽象接线」、引擎文档 §10
+// 「引擎无平台壳语义、输入只有绘制表」）：把软件内核产出的 FrameBuf
+// 折叠为**连续 BGRA 32bpp 字节缓冲**——即 host 层 win_present 的上屏格式。
+//
+// 分层纪律：本模块只做「帧缓冲 → 呈现字节」的纯转换，不感知窗口 / 平台句柄 /
+// 消息泵（上屏调用由 host 层与上层编排，引擎不依赖平台壳）。
+//
+// 通道取用一律走 semantics（sem.ch_*）——保持「渲染语义唯一执行路径」纪律，
+// 不在此处手工移位，避免与内核语义分叉。
+
+import "./raster.tie"
+import "./semantics.tie"
+
+namespace epres {
+
+// 折叠为连续 BGRA 字节缓冲（w*h*4 字节）。调用方负责 free。
+// 依据：win_present 收 BGRA 32bpp top-down；x86 小端下 0xAARRGGBB 的内存序
+// 即为 B,G,R,A，故逐通道拆字节写入即可，无需重排。
+// 越界保护：px 短于 w*h 时，缺位按黑（0,0,0,255）填充，不越界读。
+// 注：返回 ptr 故本函数为 unsafe（tie 门禁：ptr 只允许出现在 unsafe 路径）。
+pub unsafe func to_bgra(px: table<i64>, w: i64, h: i64) -> ptr<u8> {
+    unsafe {
+        var n = w * h
+        if n < 0 {
+            n = 0
+        }
+        var have = len(px)
+        var buf: ptr<u8> = alloc(n * 4)
+        var i: i64 = 0
+        while i < n {
+            var o = i * 4
+            if i < have {
+                var c = px[i]
+                deref_write(ptr_add(buf, o), as_u8(sem.ch_b(c)))
+                deref_write(ptr_add(buf, o + 1), as_u8(sem.ch_g(c)))
+                deref_write(ptr_add(buf, o + 2), as_u8(sem.ch_r(c)))
+                deref_write(ptr_add(buf, o + 3), as_u8(sem.ch_a(c)))
+            } else {
+                deref_write(ptr_add(buf, o), as_u8(0))
+                deref_write(ptr_add(buf, o + 1), as_u8(0))
+                deref_write(ptr_add(buf, o + 2), as_u8(0))
+                deref_write(ptr_add(buf, o + 3), as_u8(255))
+            }
+            i = i + 1
+        }
+        return buf
+    }
+}
+
+// 单像素通道读取（呈现路径自检用；同样走语义层）。
+pub func bgra_of(c: i64) -> i64 {
+    return sem.pack(sem.ch_b(c), sem.ch_g(c), sem.ch_r(c), sem.ch_a(c))
+}
+
+}

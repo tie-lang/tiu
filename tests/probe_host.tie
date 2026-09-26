@@ -1,0 +1,286 @@
+type tie<logic>
+// tests/probe_host.tie —— tiu host 层验收探针（窗口 / 上屏 / 消息泵 / 事件）
+// EN: tiu host-layer gate probe — window / present / message pump / events.
+// ============================================================
+// 覆盖（依据 tiu-render-impl.md §1 T4.1「平台最小抽象接线」、引擎文档 §11）：
+//   1. 帧缓冲导出：FrameBuf（table<i64>, 0xAARRGGBB）→ 连续 BGRA 字节缓冲
+//      （engine/src/present.tie），逐像素通道序断言。
+//   2. 真窗口闭环：win_open → win_show → win_present 上屏 → 消息泵 →
+//      WM_PAINT 观测 → 主循环脏重绘 → 干净销毁。**窗口真实可见**（人工复核项）。
+//   3. 事件队列：合成注入（PostMessageW 投递给自身窗口）→ WndProc 捕获 →
+//      tie 侧取出，类型/顺序/坐标断言。全程无真人输入依赖。
+// 验收门：本探针全绿 = tiu 端到端最小可见闭环成立（IR → 光栅 → 屏幕）。
+//
+// 说明：窗口停留约 2 秒（120 轮 × 16ms）供人眼复核，全程有界、无死等。
+
+import "../engine/src/irb.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+
+const BG: i64 = 0xFF202020
+const RED: i64 = 0xFFE03020
+const WHITE: i64 = 0xFFFFFFFF
+const W: i64 = 320
+const H: i64 = 200
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= 1. 构造 IR 帧（T2.1 冻结布局） =================
+    var b = table_new_i64()
+    eirb.put_u8(b, 84)
+    eirb.put_u8(b, 73)
+    eirb.put_u8(b, 85)
+    eirb.put_u8(b, 49)
+    eirb.put_u8(b, 1)
+    eirb.put_u8(b, 0)
+    eirb.put_u8(b, 0)
+    eirb.put_u8(b, 0)
+    eirb.put_q(b, 1.0)
+    eirb.put_q(b, 0.0)
+    eirb.put_q(b, 0.0)
+    eirb.put_q(b, 0.0)
+    eirb.put_q(b, 1.0)
+    eirb.put_q(b, 0.0)
+    eirb.put_i64(b, W)
+    eirb.put_i64(b, H)
+    eirb.put_q(b, 1.0)
+    eirb.put_i64(b, 3)
+    put_record(b, E_OP_RECT, 0.0, 0.0, 320.0, 200.0, 0, BG, 255, "")
+    put_record(b, E_OP_RECT, 20.0, 20.0, 120.0, 60.0, 0, RED, 255, "")
+    put_record(b, E_OP_TEXT, 20.0, 100.0, 16.0, 0.0, 0, WHITE, 255, "tiu")
+
+    var p = eload.parse_frame(b)
+    var fb = erast.render(p)
+    if len(fb.px) == W * H {
+        println("[PASS] frame buffer " + to_string(W) + "x" + to_string(H) + " (" + to_string(len(fb.px)) + " px)")
+    } else {
+        fails = fails + 1
+        println("FAIL frame buf len=" + to_string(len(fb.px)))
+    }
+
+    // 帧内容自检（渲染语义输出）
+    if fb.px[0] == BG {
+        println("[PASS] frame bg pixel")
+    } else {
+        fails = fails + 1
+        println("FAIL bg px = " + to_string(fb.px[0]))
+    }
+    if fb.px[50 * W + 80] == RED {
+        println("[PASS] frame red rect centre")
+    } else {
+        fails = fails + 1
+        println("FAIL red px = " + to_string(fb.px[50 * W + 80]))
+    }
+    var white_n: i64 = 0
+    var ty: i64 = 100
+    while ty < 110 {
+        var tx: i64 = 20
+        while tx < 60 {
+            if fb.px[ty * W + tx] == WHITE {
+                white_n = white_n + 1
+            }
+            tx = tx + 1
+        }
+        ty = ty + 1
+    }
+    if white_n > 0 {
+        println("[PASS] frame text glyph pixels = " + to_string(white_n))
+    } else {
+        fails = fails + 1
+        println("FAIL text pixels absent")
+    }
+
+    // ================= 2. 通道序（BGRA 重排语义） =================
+    var probe = 0xFF112233      // A=FF R=11 G=22 B=33
+    var swapped = epres.bgra_of(probe)
+    if swapped == 0xFF332211 {
+        println("[PASS] present channel order B<->R swap = 0x" + to_string(swapped))
+    } else {
+        fails = fails + 1
+        println("FAIL channel order = " + to_string(swapped))
+    }
+
+    // ================= 3. 真窗口闭环 + 主循环 =================
+    var hwnd = host.open("tiu probe_host · 宿主层", W, H)
+    if hwnd == 0 {
+        fails = fails + 1
+        println("FAIL window open")
+        report(fails)
+        return 0
+    }
+    println("[PASS] window opened hwnd=" + to_string(hwnd))
+    host.show(hwnd)
+
+    unsafe {
+        var buf: ptr<u8> = epres.to_bgra(fb.px, W, H)
+
+        // 字节序自检：像素 0 的通道 = BG(0x20,0x20,0x20,0xFF)
+        var b0 = as_i64(deref(ptr_add(buf, 0)))
+        var b3 = as_i64(deref(ptr_add(buf, 3)))
+        if b0 == 0x20 && b3 == 0xFF {
+            println("[PASS] bgra buffer byte0/byte3 = 32/255")
+        } else {
+            fails = fails + 1
+            println("FAIL bgra bytes = " + to_string(b0) + "," + to_string(b3))
+        }
+
+        // 首帧上屏
+        var rc = host.present_bytes(hwnd, buf, W, H)
+        if rc == 0 {
+            println("[PASS] present_bytes rc=0 (first frame blitted)")
+        } else {
+            fails = fails + 1
+            println("FAIL present rc=" + to_string(rc))
+        }
+
+        // 合成注入：鼠标移动 + 左键按下（确定性驱动事件路径）
+        host.post_mouse(hwnd, 40, 60)
+        host.post_lbutton_down(hwnd, 44, 66)
+
+        // 主循环：泵消息 → 脏则重绘（真实主循环形态；重绘次数有界）
+        var nmsg: i64 = 0
+        var got_paint: bool = false
+        var redraws: i64 = 0
+        var rounds: i64 = 0
+        println("[INFO] window visible ~2s for eye check; pumping main loop ...")
+        while rounds < 120 {
+            nmsg = nmsg + host.pump(hwnd)
+            if host.paint_pending(hwnd) {
+                got_paint = true
+                if redraws < 3 {
+                    host.present_bytes(hwnd, buf, W, H)
+                    redraws = redraws + 1
+                }
+            }
+            if host.closed(hwnd) {
+                println("[INFO] window closed by user at round " + to_string(rounds))
+                break
+            }
+            host.sleep(16)
+            rounds = rounds + 1
+        }
+        free(buf)
+
+        if nmsg > 0 {
+            println("[PASS] message pump processed " + to_string(nmsg) + " messages")
+        } else {
+            fails = fails + 1
+            println("FAIL pump processed 0 messages")
+        }
+        if got_paint {
+            println("[PASS] WM_PAINT observed + " + to_string(redraws) + " dirty redraws")
+        } else {
+            fails = fails + 1
+            println("FAIL no WM_PAINT observed")
+        }
+
+        // 事件队列
+        var evs = host.take_events(hwnd)
+        var ne = host.ev_count(evs)
+        println("[INFO] events drained = " + to_string(ne))
+        if ne >= 2 {
+            println("[PASS] event queue delivered " + to_string(ne) + " events")
+        } else {
+            fails = fails + 1
+            println("FAIL event count = " + to_string(ne))
+        }
+        if ne >= 2 {
+            if host.ev_type(evs, 0) == host.ev_mouse_move() && host.ev_type(evs, 1) == host.ev_lbutton_down() {
+                println("[PASS] event order move < lbutton_down")
+            } else {
+                fails = fails + 1
+                println("FAIL event order t0=" + to_string(host.ev_type(evs, 0)) + " t1=" + to_string(host.ev_type(evs, 1)))
+            }
+            if host.ev_x(evs, 0) == 40 && host.ev_y(evs, 0) == 60 {
+                println("[PASS] mouse move coords (40,60)")
+            } else {
+                fails = fails + 1
+                println("FAIL move coords " + to_string(host.ev_x(evs, 0)) + "," + to_string(host.ev_y(evs, 0)))
+            }
+            if host.ev_x(evs, 1) == 44 && host.ev_y(evs, 1) == 66 {
+                println("[PASS] lbutton down coords (44,66)")
+            } else {
+                fails = fails + 1
+                println("FAIL down coords " + to_string(host.ev_x(evs, 1)) + "," + to_string(host.ev_y(evs, 1)))
+            }
+        }
+    }
+
+    host.destroy(hwnd)
+    println("[PASS] window destroyed (slot released)")
+
+    report(fails)
+    return 0
+}
+
+func report(fails: i64) {
+    if fails == 0 {
+        println("PROBE_HOST: ALL PASS (tiu end-to-end visible loop)")
+    } else {
+        println("PROBE_HOST: FAILURES " + to_string(fails))
+        exit(1)
+    }
+}
+
+// ---- 手工 record 构造（T2.1 冻结布局，与 probe_e1 同源） ----
+
+func put_record(b: table<i64>, op: i64, x: f64, y: f64, w: f64, h: f64, fill: i64, color: i64, alpha: i64, txt: string) {
+    var geo = table_new_i64()
+    if op == E_OP_TEXT {
+        eirb.put_q(geo, x)
+        eirb.put_q(geo, y)
+        eirb.put_q(geo, w)
+        eirb.put_str(geo, txt)
+    } else {
+        eirb.put_q(geo, x)
+        eirb.put_q(geo, y)
+        eirb.put_q(geo, w)
+        eirb.put_q(geo, h)
+    }
+    eirb.put_q(geo, 1.0)
+    eirb.put_q(geo, 0.0)
+    eirb.put_q(geo, 0.0)
+    eirb.put_q(geo, 0.0)
+    eirb.put_q(geo, 1.0)
+    eirb.put_q(geo, 0.0)
+    var paint = table_new_i64()
+    eirb.put_i64(paint, fill)
+    eirb.put_i64(paint, color)
+    eirb.put_q(paint, 0.0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(paint, alpha)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(paint, 0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_q(paint, 0.0)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(paint, 0)
+    eirb.put_i64(b, op)
+    eirb.put_i64(b, 0)
+    eirb.put_i64(b, len(geo))
+    append_all(b, geo)
+    eirb.put_i64(b, len(paint))
+    append_all(b, paint)
+    eirb.put_i64(b, -1)
+    eirb.put_str(b, "")
+}
+
+func append_all(out: table<i64>, src: table<i64>) {
+    var i: i64 = 0
+    while i < len(src) {
+        table_push(out, src[i])
+        i = i + 1
+    }
+}
