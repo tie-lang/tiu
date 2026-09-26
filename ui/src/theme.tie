@@ -1,0 +1,104 @@
+type tie<class>
+// ui/src/theme.tie —— tiu UI 层：主题 token（最小集）
+// EN: tiu UI theme tokens (minimal).
+// ============================================================
+// 依据 docs/designs/tiu-ui-widgets.md §6（token 单例 / 三层覆写 / 默认主题内置）。
+//
+// v0 落地形态：token 以「主题 id + 取值函数」表达（无状态、无全局单例），
+// 满足 §6「默认主题内置：无主题配置可直接运行」的最低门槛；换肤 = 应用层
+// 切换主题 id（§6「换肤 = 替换主题单例 + 全局版本号 +1」，版本号由应用层
+// 驱动，本模块只提供 token 取值）。
+//
+// 颜色一律 0xAARRGGBB（与引擎 sem.pack 打包一致，无需再做通道重排）。
+// 组合空间约束（§6）：token 全部为固定枚举取值，不对应用暴露自由调色入口。
+
+const TH_DARK: i64 = 0
+const TH_LIGHT: i64 = 1
+
+namespace uth {
+
+// ---- 主题标识 ----
+pub func dark() -> i64 { return TH_DARK }
+pub func light() -> i64 { return TH_LIGHT }
+
+// 主题切换（返回另一主题 id；应用层持有当前 id）。
+pub func toggle(t: i64) -> i64 {
+    if t == TH_DARK {
+        return TH_LIGHT
+    }
+    return TH_DARK
+}
+
+pub func name(t: i64) -> string {
+    if t == TH_DARK {
+        return "dark"
+    }
+    return "light"
+}
+
+// ---- 背景 / 面板 ----
+pub func bg(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF1E1E1E
+    }
+    return 0xFFF5F5F5
+}
+
+pub func surface(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF2D2D30
+    }
+    return 0xFFFFFFFF
+}
+
+pub func border(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF3F3F46
+    }
+    return 0xFFD0D0D0
+}
+
+// ---- 强调色三态（常态 / 悬停 / 按下）----
+pub func accent(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF4A9EFF
+    }
+    return 0xFF0A66C2
+}
+
+pub func accent_hot(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF6FB6FF
+    }
+    return 0xFF2F86D8
+}
+
+pub func accent_down(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF2E7BD6
+    }
+    return 0xFF084E96
+}
+
+// ---- 前景（文本色）----
+// 注：token 名不用 `text`（tie 保留类型名，实测 error[E00485]），故取 `fg`。
+pub func fg(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFFE8E8E8
+    }
+    return 0xFF1A1A1A
+}
+
+pub func fg_dim(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF9A9A9A
+    }
+    return 0xFF6A6A6A
+}
+
+// 强调底色之上的文本色（按钮标签）。
+pub func on_accent() -> i64 {
+    return 0xFFFFFFFF
+}
+
+}

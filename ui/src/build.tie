@@ -23,6 +23,7 @@ var g_prev_node: table<i64> = []
 var g_touch: table<i64> = []   // 帧内复用标记（按 node id 索引）
 var g_pstack: table<i64> = []  // 父栈（open/close 用）
 var g_ptop: i64 = 0
+var g_last_node: i64 = -1      // 最近一次 open 挂载/复用的节点 id（open_t 用）
 
 namespace tiu_build {
 // 内部：在 prev 三表中按 (parent, slot) 查找上帧节点；未找到返回 -1
@@ -97,12 +98,26 @@ pub func open(ty: WidgetType, slot: i64, ver: i64, data: i64, ox: i64, oy: i64, 
         touch(node)
     }
     // 父栈压入当前节点
+    g_last_node = node
     if g_ptop == len(g_pstack) {
         table_push(g_pstack, node)
     } else {
         g_pstack[g_ptop] = node
     }
     g_ptop = g_ptop + 1
+}
+
+// 最近一次 open 落到的节点 id（-1 = 本帧尚未 open）。
+pub func cur_id() -> i64 {
+    return g_last_node
+}
+
+// 带文本的 open：等价 open(...) + 设置该节点文本（Text / Button 用）。
+// 既有 open 签名保持不变（既有探针零改动）。
+// 注：形参名不可用 `text`（tie 保留类型名），故用 `s`。
+pub func open_t(ty: WidgetType, slot: i64, ver: i64, s: string, ox: i64, oy: i64, fw: i64, fh: i64) {
+    open(ty, slot, ver, str_len(s), ox, oy, fw, fh)
+    tiu_tree.set_text(g_last_node, s)
 }
 
 // 关闭当前节点：弹栈

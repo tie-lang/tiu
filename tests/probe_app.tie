@@ -1,0 +1,327 @@
+type tie<logic>
+// tests/probe_app.tie —— tiu 应用闭环验收探针（UI → API → engine → 窗口 + 交互）
+// EN: tiu application-loop gate probe — UI → API → engine → window, with interaction.
+// ============================================================
+// 覆盖（依据 tiu-ui-widgets.md §13 终点验收、tiu-render-impl.md §1 T4.1）：
+//   1. 声明式构建 → 约束布局（控件树 + 文本承载）
+//   2. 绘制桥：UI 树 → API DrawList（DFS 序，父先于子）
+//   3. API 编码 → engine loader → 软件光栅 → 帧缓冲（TP2 联调路径）
+//   4. 真窗口上屏 + 消息泵 + 主循环脏重绘
+//   5. 交互：合成鼠标事件 → 命中测试 → 控件状态变更（点击计数 / 主题切换）
+//      → 重绘 → 上屏（帧内容随状态变化）
+// 验收门：全绿 = tiu 端到端「可交互」闭环成立。
+//
+// 说明：交互由合成注入驱动（PostMessageW 投递给自身窗口），无真人输入依赖；
+// 窗口停留约 2 秒供人眼复核；全程有界，无死等。
+
+import "../ui/src/tree.tie"
+import "../ui/src/build.tie"
+import "../ui/src/layout.tie"
+import "../ui/src/hit.tie"
+import "../ui/src/theme.tie"
+import "../ui/src/paint_bridge.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+
+const W: i64 = 320
+const H: i64 = 200
+
+// ---- 应用状态（应用层持有，框架不托管；widgets §3.3 状态单源）----
+var g_theme: i64 = 0        // 当前主题 id
+var g_clicks: i64 = 0       // OK 按钮点击次数
+var g_hot: i64 = -1         // 悬停节点
+var g_active: i64 = -1      // 按下节点
+var g_renders: i64 = 0      // 重绘次数
+
+func main() -> i64 {
+    var fails: i64 = 0
+
+    // ================= 1. 声明式构建 + 布局 =================
+    var root = build_scene()
+    if root >= 0 {
+        println("[PASS] widget tree built (root=" + to_string(root) + ", nodes=" + to_string(tiu_tree.total()) + ")")
+    } else {
+        fails = fails + 1
+        println("FAIL tree build")
+    }
+
+    var c = Constraints.loose()
+    tiu_layout.layout(root, c)
+    println("[INFO] layout done")
+
+    // 定位两个按钮（按 slot 取兄弟）
+    var b_ok = child_by_slot(root, 1)
+    var b_theme = child_by_slot(root, 2)
+    var r_ok = tiu_tree.rect(b_ok)
+    var r_th = tiu_tree.rect(b_theme)
+    println("[INFO] button OK rect = (" + to_string(r_ok.x) + "," + to_string(r_ok.y) + "," + to_string(r_ok.w) + "," + to_string(r_ok.h) + ")")
+    println("[INFO] button Theme rect = (" + to_string(r_th.x) + "," + to_string(r_th.y) + "," + to_string(r_th.w) + "," + to_string(r_th.h) + ")")
+    if r_ok.w == 96 && r_ok.h == 32 && r_th.w == 96 && r_th.h == 32 {
+        println("[PASS] fixed-size buttons laid out (96x32)")
+    } else {
+        fails = fails + 1
+        println("FAIL button layout")
+    }
+
+    // 文本承载（绘制桥取用的真实文本）
+    var t_title = tiu_tree.first_child(root)
+    if tiu_tree.text_of(t_title) == "tiu" && tiu_tree.text_of(b_ok) == "OK" {
+        println("[PASS] widget text carried (title/button labels)")
+    } else {
+        fails = fails + 1
+        println("FAIL widget text")
+    }
+
+    // ================= 2. 命中测试 =================
+    var cx_ok = r_ok.x + r_ok.w / 2
+    var cy_ok = r_ok.y + r_ok.h / 2
+    var hit = tiu_hit.hit_test(cx_ok, cy_ok)
+    if hit == b_ok {
+        println("[PASS] hit-test: button centre hits OK button (id=" + to_string(hit) + ")")
+    } else {
+        fails = fails + 1
+        println("FAIL hit-test got " + to_string(hit) + " want " + to_string(b_ok))
+    }
+    var hit_out = tiu_hit.hit_test(W - 2, H - 2)
+    if hit_out != b_ok && hit_out != b_theme {
+        println("[PASS] hit-test: empty corner hits no button (id=" + to_string(hit_out) + ")")
+    } else {
+        fails = fails + 1
+        println("FAIL hit-test corner")
+    }
+
+    // ================= 3. UI → API → engine（帧渲染） =================
+    var cv = cvs.new_window(W, H, 1.0)
+    var fb0 = render_frame(cv, 0)
+    if len(fb0.px) == W * H {
+        println("[PASS] frame rendered " + to_string(W) + "x" + to_string(H) + " from widget tree")
+    } else {
+        fails = fails + 1
+        println("FAIL frame render len=" + to_string(len(fb0.px)))
+    }
+    // 背景色 = 主题 bg（暗色 0xFF1E1E1E）
+    if pixel_is(fb0, 5, 5, 0x1E, 0x1E, 0x1E) {
+        println("[PASS] frame background = dark theme bg")
+    } else {
+        fails = fails + 1
+        println("FAIL frame bg")
+    }
+    // 按钮底色 = 强调色（暗色 0xFF4A9EFF）
+    if pixel_is(fb0, cx_ok, cy_ok - 12, 0x4A, 0x9E, 0xFF) {
+        println("[PASS] button fill = dark theme accent")
+    } else {
+        fails = fails + 1
+        println("FAIL button fill")
+    }
+
+    // ================= 4. 真窗口 + 主循环 + 交互 =================
+    var hwnd = host.open("tiu probe_app · 交互闭环", W, H)
+    if hwnd == 0 {
+        fails = fails + 1
+        println("FAIL window open")
+        report(fails)
+        return 0
+    }
+    println("[PASS] window opened hwnd=" + to_string(hwnd))
+    host.show(hwnd)
+
+    unsafe {
+        var buf: ptr<u8> = epres.to_bgra(fb0.px, W, H)
+        var rc = host.present_bytes(hwnd, buf, W, H)
+        if rc == 0 {
+            println("[PASS] first frame presented")
+        } else {
+            fails = fails + 1
+            println("FAIL present rc=" + to_string(rc))
+        }
+
+        // 合成交互：点击 OK 按钮（down → up），再点击 Theme 按钮
+        host.post_lbutton_down(hwnd, cx_ok, cy_ok)
+        host.post_lbutton_up(hwnd, cx_ok, cy_ok)
+        var cx_th = r_th.x + r_th.w / 2
+        var cy_th = r_th.y + r_th.h / 2
+        host.post_lbutton_down(hwnd, cx_th, cy_th)
+        host.post_lbutton_up(hwnd, cx_th, cy_th)
+
+        // 主循环：泵消息 → 事件驱动 → 脏则重绘上屏（真实主循环形态）
+        var nmsg: i64 = 0
+        var nev: i64 = 0
+        var rounds: i64 = 0
+        println("[INFO] window visible ~2s; main loop with synthetic interaction ...")
+        while rounds < 120 {
+            nmsg = nmsg + host.pump(hwnd)
+
+            // 事件批次处理：命中 → 状态变更 → 标记脏
+            var evs = host.take_events(hwnd)
+            var ne = host.ev_count(evs)
+            if ne > 0 {
+                nev = nev + ne
+                var k: i64 = 0
+                var dirty = false
+                while k < ne {
+                    if handle_event(evs, k, root) {
+                        dirty = true
+                    }
+                    k = k + 1
+                }
+                if dirty {
+                    // 重绘：重建 + 布局 + 绘制 + 编码 + 光栅 + 上屏
+                    var fbN = render_frame(cv, 1)
+                    var bn: ptr<u8> = epres.to_bgra(fbN.px, W, H)
+                    host.present_bytes(hwnd, bn, W, H)
+                    free(bn)
+                    g_renders = g_renders + 1
+                }
+            }
+
+            if host.closed(hwnd) {
+                println("[INFO] window closed by user at round " + to_string(rounds))
+                break
+            }
+            host.sleep(16)
+            rounds = rounds + 1
+        }
+        free(buf)
+
+        println("[INFO] pump messages=" + to_string(nmsg) + " events=" + to_string(nev) + " redraws=" + to_string(g_renders))
+        if nmsg > 0 {
+            println("[PASS] message pump ran")
+        } else {
+            fails = fails + 1
+            println("FAIL pump")
+        }
+        if nev >= 4 {
+            println("[PASS] interaction events delivered (" + to_string(nev) + ")")
+        } else {
+            fails = fails + 1
+            println("FAIL event count " + to_string(nev))
+        }
+    }
+
+    // ================= 5. 交互结果断言 =================
+    if g_clicks == 1 {
+        println("[PASS] OK button clicked once -> app state updated (clicks=1)")
+    } else {
+        fails = fails + 1
+        println("FAIL click count = " + to_string(g_clicks))
+    }
+    if g_theme == uth.light() {
+        println("[PASS] Theme button toggled theme -> light")
+    } else {
+        fails = fails + 1
+        println("FAIL theme = " + to_string(g_theme))
+    }
+
+    // 主题切换后帧内容确实变化（重绘生效）
+    var fbL = render_frame(cv, 2)
+    if pixel_is(fbL, 5, 5, 0xF5, 0xF5, 0xF5) {
+        println("[PASS] frame after toggle = light theme bg (redraw reflects state)")
+    } else {
+        fails = fails + 1
+        println("FAIL light frame bg")
+    }
+
+    host.destroy(hwnd)
+    println("[PASS] window destroyed")
+
+    report(fails)
+    return 0
+}
+
+// 构建控件树（声明式；复用由 build 层按 slot 负责）。
+func build_scene() -> i64 {
+    tiu_build.begin()
+    tiu_build.open(WidgetType.Column, 0, 1, 0, 0, 0, 0, 0)
+    tiu_build.open_t(WidgetType.Text, 0, 1, "tiu", 0, 0, 0, 0)
+    tiu_build.close()
+    tiu_build.open_t(WidgetType.Button, 1, 1, "OK", 0, 0, 96, 32)
+    tiu_build.close()
+    tiu_build.open_t(WidgetType.Button, 2, 1, "Theme", 0, 0, 96, 32)
+    tiu_build.close()
+    tiu_build.close()
+    tiu_build.finish()
+    return tiu_tree.root()
+}
+
+// 一帧完整渲染：记录 → 绘制桥 → 提交编码 → loader → 软件光栅 → FrameBuf。
+func render_frame(cv: Canvas, ver: i64) -> FrameBuf {
+    var d = cvs.record(cv)
+    upaint.background(d, W, H, g_theme)
+    upaint.draw(d, g_theme, g_hot, g_active)
+    var ir = cvs.submit(cv, d)
+    var p = eload.parse_frame(ir)
+    return erast.render(p)
+}
+
+// 事件分发：命中 → 控件状态变更。返回是否产生脏（需要重绘）。
+func handle_event(evs: table<i64>, k: i64, root: i64) -> bool {
+    var et = host.ev_type(evs, k)
+    var ex = host.ev_x(evs, k)
+    var ey = host.ev_y(evs, k)
+    var dirty = false
+
+    if et == host.ev_mouse_move() {
+        var h = tiu_hit.hit_test(ex, ey)
+        if (h == -1 || tiu_tree.ty_of(h) == tiu_tree.ty_code(WidgetType.Button)) && h != g_hot {
+            g_hot = h
+            dirty = true
+        }
+    } else if et == host.ev_lbutton_down() {
+        var h = tiu_hit.hit_test(ex, ey)
+        if h >= 0 && tiu_tree.ty_of(h) == tiu_tree.ty_code(WidgetType.Button) {
+            g_active = h
+            dirty = true
+        }
+    } else if et == host.ev_lbutton_up() {
+        var h = tiu_hit.hit_test(ex, ey)
+        if g_active >= 0 && h == g_active {
+            // 命中释放 → 触发控件动作
+            var slot = tiu_tree.slot_of(h)
+            if slot == 1 {
+                g_clicks = g_clicks + 1
+            } else if slot == 2 {
+                g_theme = uth.toggle(g_theme)
+            }
+            dirty = true
+        }
+        if g_active >= 0 {
+            g_active = -1
+            dirty = true
+        }
+    }
+    return dirty
+}
+
+// 根下按 slot 找子节点。
+func child_by_slot(root: i64, slot: i64) -> i64 {
+    var k = tiu_tree.first_child(root)
+    while k >= 0 {
+        if tiu_tree.slot_of(k) == slot {
+            return k
+        }
+        k = tiu_tree.next_sibling(k)
+    }
+    return -1
+}
+
+// 帧缓冲像素通道断言（走引擎语义层取通道）。
+func pixel_is(fb: FrameBuf, x: i64, y: i64, r: i64, g: i64, b: i64) -> bool {
+    var c = fb.px[y * W + x]
+    return sem_r(c) == r && sem_g(c) == g && sem_b(c) == b
+}
+
+func sem_r(c: i64) -> i64 { return (c >> 16) & 0xFF }
+func sem_g(c: i64) -> i64 { return (c >> 8) & 0xFF }
+func sem_b(c: i64) -> i64 { return c & 0xFF }
+
+func report(fails: i64) {
+    if fails == 0 {
+        println("PROBE_APP: ALL PASS (tiu interactive end-to-end loop)")
+    } else {
+        println("PROBE_APP: FAILURES " + to_string(fails))
+        exit(1)
+    }
+}

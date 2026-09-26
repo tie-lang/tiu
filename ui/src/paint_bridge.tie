@@ -1,0 +1,118 @@
+type tie<class>
+// ui/src/paint_bridge.tie —— tiu UI 层：绘制桥（UI 树 → API 绘制表）
+// EN: tiu UI layer, paint bridge — widget tree → API draw-list.
+// ============================================================
+// 依据 docs/designs/tiu-ui-widgets.md §1（依赖方向：UI → API 增量段编码）、
+// §3（骨架只读）、§13（模块清单）；docs/designs/tiu-drawing-api.md §6（跨层契约）。
+//
+// 职责：按 DFS 序把当前 UI 树的**布局结果矩形 + 控件类型 + 文本**翻译为 API 的
+// DrawList 绘制记录。**只读**树与布局结果，不修改任何控件状态（§3「布局结果
+// 不回写 props」同款纪律）。
+//
+// 绘制顺序 = DFS 前序（父先于子，子覆盖父）——与命中测试的「倒序查找、顶层优先」
+// （hit.tie）互为镜像，保证「看到的」与「点到的」一致。
+//
+// v0 控件绘制集：
+//   Text   —— 文本（引擎位图字形路径）
+//   Button —— 底色矩形 + 居中标签 + 悬停/按下三态
+//   Row / Column / Absolute —— 透明容器（不产记录；容器背景留待主题模块扩展）
+// 注：v0 用 dl.rect 而非 dl.rrect —— 引擎软件内核 v0 只渲染 rx=0 的圆角矩形，
+// 非零圆角会整条跳过（raster.tie 的 op 过滤），此处不产生不可见记录。
+
+import "./tree.tie"
+import "./theme.tie"
+import "../../api/src/color.tie"
+import "../../api/src/paint.tie"
+import "../../api/src/drawlist.tie"
+
+const CHAR_ADV: i64 = 8       // 位图字形步进（与引擎 glyph 一致）
+const LINE_H: i64 = 16        // 行高（布局层同值）
+const TEXT_SIZE: f64 = 16.0
+
+// 控件类型码缓存（避免逐节点走 switch）
+var g_ty_text: i64 = -1
+var g_ty_button: i64 = -1
+
+func ensure_types() {
+    if g_ty_text < 0 {
+        g_ty_text = tiu_tree.ty_code(WidgetType.Text)
+        g_ty_button = tiu_tree.ty_code(WidgetType.Button)
+    }
+}
+
+namespace upaint {
+
+// 绘制整棵树；返回产生的绘制记录数。
+// hot / active = 当前悬停 / 按下节点 id（-1 = 无）。
+pub func draw(d: DrawList, th: i64, hot: i64, active: i64) -> i64 {
+    ensure_types()
+    var n: i64 = 0
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        n = n + node(d, order[i], th, hot, active)
+        i = i + 1
+    }
+    return n
+}
+
+// 画布背景（整帧底色，先于树绘制）。
+pub func background(d: DrawList, w: i64, h: i64, th: i64) -> i64 {
+    dl.rect(d, 0.0, 0.0, as_f64(w), as_f64(h), solid(uth.bg(th)))
+    return 1
+}
+
+func node(d: DrawList, id: i64, th: i64, hot: i64, active: i64) -> i64 {
+    var ty = tiu_tree.ty_of(id)
+    var r = tiu_tree.rect(id)
+    if r.w <= 0 || r.h <= 0 {
+        return 0
+    }
+    if ty == g_ty_text {
+        return text_node(d, id, r, th)
+    }
+    if ty == g_ty_button {
+        return button_node(d, id, r, th, hot, active)
+    }
+    return 0
+}
+
+// Text：在布局矩形处绘制文本（左对齐、上对齐）。
+func text_node(d: DrawList, id: i64, r: Rect, th: i64) -> i64 {
+    var s = tiu_tree.text_of(id)
+    if str_len(s) == 0 {
+        return 0
+    }
+    dl.text_p(d, s, as_f64(r.x), as_f64(r.y), TEXT_SIZE, solid(uth.fg(th)))
+    return 1
+}
+
+// Button：底色矩形 + 居中标签；三态底色（常态 / 悬停 / 按下）。
+func button_node(d: DrawList, id: i64, r: Rect, th: i64, hot: i64, active: i64) -> i64 {
+    var base = uth.accent(th)
+    if id == hot {
+        base = uth.accent_hot(th)
+    }
+    if id == active {
+        base = uth.accent_down(th)
+    }
+    dl.rect(d, as_f64(r.x), as_f64(r.y), as_f64(r.w), as_f64(r.h), solid(base))
+    var n: i64 = 1
+    var s = tiu_tree.text_of(id)
+    var sl = str_len(s)
+    if sl > 0 {
+        var tw = sl * CHAR_ADV
+        var tx = r.x + (r.w - tw) / 2
+        var ty = r.y + (r.h - LINE_H) / 2
+        dl.text_p(d, s, as_f64(tx), as_f64(ty), TEXT_SIZE, solid(uth.on_accent()))
+        n = n + 1
+    }
+    return n
+}
+
+// 打包色（0xAARRGGBB）→ 纯色 Paint。
+func solid(argb: i64) -> Paint {
+    return paint.solid(color.from_argb(argb))
+}
+
+}

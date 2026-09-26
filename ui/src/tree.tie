@@ -40,7 +40,8 @@ var g_parents: table<i64> = []  // 父 id（根 = -1）
 var g_first: table<i64> = []    // 长子 id（-1 = 无）
 var g_next: table<i64> = []     // 下一兄弟 id（-1 = 无）
 var g_dead: table<i64> = []     // 0 = 活 / 1 = dead（卸载标记）
-var g_textlen: table<i64> = []  // Text/Button 内容长度（布局用；简化 props）
+var g_textlen: table<i64> = []  // Text/Button 内容长度（布局用）
+var g_text: table<string> = []  // Text/Button 内容（真实文本；绘制桥消费）
 var g_ox: table<i64> = []       // 绝对定位：相对父内容区 x 偏移
 var g_oy: table<i64> = []       // 绝对定位：相对父内容区 y 偏移
 var g_fw: table<i64> = []       // 固定宽（0 = 内容自适应）
@@ -98,6 +99,7 @@ pub func reset() {
     g_next = table_new_i64()
     g_dead = table_new_i64()
     g_textlen = table_new_i64()
+    g_text = table_new_string()
     g_ox = table_new_i64()
     g_oy = table_new_i64()
     g_fw = table_new_i64()
@@ -108,6 +110,29 @@ pub func reset() {
     g_h = table_new_i64()
     g_root = -1
     g_next_id = 0
+}
+
+// ---- 文本承载（Text/Button 内容） ----
+// 说明：骨架 SoA 只存 textlen（布局用）；真实文本走独立表 g_text（节点 id 索引），
+// 供绘制桥取用。表长不足自动补齐，越界读返回空串。
+
+// 设置节点文本内容。
+pub func set_text(id: i64, s: string) {
+    if id < 0 {
+        return
+    }
+    while len(g_text) <= id {
+        table_push(g_text, "")
+    }
+    g_text[id] = s
+}
+
+// 读节点文本内容（未设置 / 越界 → 空串）。
+pub func text_of(id: i64) -> string {
+    if id < 0 || id >= len(g_text) {
+        return ""
+    }
+    return g_text[id]
 }
 
 // 挂载：新建节点。parent = -1 表示根（重置后首个挂载）。返回新节点 id。
@@ -122,6 +147,7 @@ pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     table_push(g_next, -1)
     table_push(g_dead, 0)
     table_push(g_textlen, 0)
+    table_push(g_text, "")
     table_push(g_ox, 0)
     table_push(g_oy, 0)
     table_push(g_fw, 0)

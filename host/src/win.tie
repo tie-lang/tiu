@@ -36,6 +36,7 @@ unsafe extern fn PostMessageW(p0: i64, p1: u32, p2: i64, p3: i64) -> i64
 // ---- 合成注入用消息码（探针确定性驱动事件路径，不依赖真人输入）----
 const WM_MOUSEMOVE: i64 = 0x0200
 const WM_LBUTTONDOWN: i64 = 0x0201
+const WM_LBUTTONUP: i64 = 0x0202
 
 // ---- 事件类型码（对齐 tiu_host.cpp 的 EVENT_* 定义）----
 // 事件记录 = 5 个 i64 槽 [type, x, y, key, t_ms]（C 端 out 参数布局）。
@@ -227,6 +228,10 @@ pub func post_mouse(hwnd: i64, x: i64, y: i64) -> bool {
 
 pub func post_lbutton_down(hwnd: i64, x: i64, y: i64) -> bool {
     return post(hwnd, WM_LBUTTONDOWN, 1, xy_lparam(x, y))
+}
+
+pub func post_lbutton_up(hwnd: i64, x: i64, y: i64) -> bool {
+    return post(hwnd, WM_LBUTTONUP, 0, xy_lparam(x, y))
 }
 
 }
