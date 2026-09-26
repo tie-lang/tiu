@@ -19,6 +19,9 @@ type tie<logic>
 unsafe extern fn system(p0: string) -> i32
 
 var g_out: string = "build\\host"
+var g_tiec: string = "..\\tiec\\compiler\\tiec.exe"
+var g_host_cpp: string = "host\\win32\\tiu_host.cpp"
+var g_host_obj: string = "build\\host\\tiu_host.obj"
 
 func sh(cmd: string) -> i64 {
     println("  $ " + cmd)
@@ -34,51 +37,58 @@ func die(m: string) -> i64 {
 }
 
 func main() -> i64 {
-    var tiec = "..\\tiec\\compiler\\tiec.exe"
-    var host_cpp = "host\\win32\\tiu_host.cpp"
-    var host_obj = g_out + "\\tiu_host.obj"
-    var probe_src = "tests\\probe_host.tie"
-    var probe_ll = g_out + "\\probe_host.ll"
-    var probe_obj = g_out + "\\probe_host.obj"
-    var probe_exe = g_out + "\\probe_host.exe"
-    var trmlite = "..\\trm-lite\\trm_lite.a"
-
     if sh("if not exist " + g_out + " mkdir " + g_out) != 0 {
         return die("mkdir " + g_out + " failed")
     }
 
-    // 1) 平台壳（C）
-    if sh("clang-cl /MT /O2 /c " + host_cpp + " /Fo:" + host_obj) != 0 {
+    // 1) 平台壳（C）—— 两个探针共用
+    if sh("clang-cl /MT /O2 /c " + g_host_cpp + " /Fo:" + g_host_obj) != 0 {
         return die("tiu_host.cpp compile failed")
     }
     println("[build] tiu_host.obj ok")
 
-    // 2) 探针 → LLVM IR
-    if sh(tiec + " " + probe_src + " --emit-ir -o " + probe_ll) != 0 {
-        return die("probe IR failed (tiec)")
+    // 2) 探针逐个：IR → obj → 链接 → 运行
+    var names: table<string> = []
+    table_push(names, "probe_host")
+    table_push(names, "probe_app")
+    var i: i64 = 0
+    while i < len(names) {
+        if build_run(names[i]) != 0 {
+            return 1
+        }
+        i = i + 1
     }
 
-    // 3) IR → obj
-    if sh("clang -O2 -c " + probe_ll + " -o " + probe_obj) != 0 {
-        return die("probe obj failed (clang)")
-    }
-    println("[build] probe_host.obj ok")
+    println("[build] ALL PROBES run ok")
+    return 0
+}
 
-    // 4) 链接
-    var lcmd = "clang -fuse-ld=link " + probe_obj + " " + host_obj + " " + trmlite +
-        " -o " + probe_exe +
+// 单探针链路：tiec --emit-ir → clang -c → clang 链接 → 运行
+func build_run(name: string) -> i64 {
+    var src = "tests\\" + name + ".tie"
+    var ll = g_out + "\\" + name + ".ll"
+    var obj = g_out + "\\" + name + ".obj"
+    var exe = g_out + "\\" + name + ".exe"
+
+    if sh(g_tiec + " " + src + " --emit-ir -o " + ll) != 0 {
+        return die(name + ": IR failed (tiec)")
+    }
+    if sh("clang -O2 -c " + ll + " -o " + obj) != 0 {
+        return die(name + ": obj failed (clang)")
+    }
+    var lcmd = "clang -fuse-ld=link " + obj + " " + g_host_obj + " ..\\trm-lite\\trm_lite.a" +
+        " -o " + exe +
         " -luser32 -lgdi32 -lshell32 -lole32 -ladvapi32 -rtlib=compiler-rt"
     if sh(lcmd) != 0 {
-        return die("link failed")
+        return die(name + ": link failed")
     }
-    println("[build] probe_host.exe linked")
+    println("[build] " + name + ".exe linked")
 
-    // 5) 运行
-    println("[build] running probe_host.exe (a window will appear ~2s) ...")
-    var rc = sh(probe_exe)
+    println("[build] running " + name + ".exe (a window appears ~2s) ...")
+    var rc = sh(exe)
     if rc != 0 {
-        return die("probe run failed rc=" + to_string(rc))
+        return die(name + " run failed rc=" + to_string(rc))
     }
-    println("[build] PROBE_HOST run ok (rc=0)")
+    println("[build] " + name + " run ok (rc=0)")
     return 0
 }
