@@ -38,9 +38,39 @@ tiu 全部以 **tie 语言**实现，用自举 tiec 编译（要求本机克隆
 ## 内容 / Contents
 
 - `api/` 绘制 API 库（图元 / Path / Paint / Layer 对象模型、IR 编码器、Canvas 会话与双模式）
-- `engine/` 渲染引擎（绘制表 IR loader、软件统一内核与渲染语义、Frame Graph）
+- `engine/` 渲染引擎（绘制表 IR loader、软件统一内核与渲染语义、帧缓冲导出）
+- `ui/` 控件框架（骨架 / 声明式构建复用 / 约束布局 / 差分桥 / 命中对接）
+- `host/` 平台壳（窗口 / 消息泵 / 上屏 / 事件；tie 绑定的最小平台层，见下）
 - `docs/` 设计与实施文档（从 tie-main 收拢；tie-main 侧保留原件）
-- `tests/` 探针（gold IR / gold 图 / 双模式等价）
+- `tests/` 探针（gold IR / gold 图 / 双模式等价 / 端到端可见闭环）
+
+## 平台壳 / Host layer
+
+三层（UI / API / engine）之外是最小平台壳 `host/`：**窗口 / 消息泵 / 上屏 / 事件队列**。
+C 壳（`host/win32/tiu_host.cpp`）收编自 ext/gfx 的 Win32 嵌入层（p.6.8.9–6.8.10），
+收编时逐字节核验一致。
+
+**为什么窗口壳必须有 C 端**：tie 无法把函数值作为 extern 形参传递
+（实测 `error[E00041]`：extern 形参仅接受标量 / string / ptr / slice），故 C 回调
+不可用、WndProc 无法用 tie 写。窗口状态机因此收敛在 C 端；tie 侧只做绑定与编排。
+**演进方向**：编译器支持 C 回调后，本 C 壳整体退役、平台层转纯 tie。
+
+EN: Beyond the three layers sits the minimal platform host (window / message pump /
+present / event queue). The C shell is absorbed from ext/gfx's Win32 embedding layer;
+it exists because tie cannot pass a function value as an extern parameter, so a
+WndProc callback is impossible in pure tie. The shell retires once the compiler gains
+C-callback support.
+
+### 构建 host 层 / Build the host layer
+
+```powershell
+..\tiec\compiler\tiec.exe host\build.tie -o build\host_build.exe
+build\host_build.exe
+```
+
+构建驱动（tie 写）链路：`clang-cl` 编 C 壳 → `tiec --emit-ir` 编探针 →
+`clang -c` → `clang -fuse-ld=link` 链接（`+ ..\trm-lite\trm_lite.a` 表运行时、
+系统库 user32/gdi32/shell32）。产物落在 `build/`（不入库）。
 
 ## License
 

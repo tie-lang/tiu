@@ -1,0 +1,84 @@
+type tie<logic>
+// host/build.tie —— tiu host 层构建驱动（tie 写；在 tiu 仓根运行）
+// EN: tiu host-layer build driver (tie-written; run from the tiu repo root).
+// ============================================================
+// 链路（沿用 ext/gfx p.6.8.9-6.8.12 已验证的构建范式）：
+//   1) clang-cl /MT 编 host/win32/tiu_host.cpp → tiu_host.obj（Win32 平台壳）
+//   2) tiec 编 tests/probe_host.tie --emit-ir → probe_host.ll
+//   3) clang -c 编 .ll → probe_host.obj
+//   4) clang -fuse-ld=link 链接 probe_host.obj + tiu_host.obj + trm_lite.a
+//      + 系统库（user32 / gdi32 / shell32）+ compiler-rt → probe_host.exe
+//   5) 运行探针（开窗约 2 秒供人工复核）
+//
+// 依赖：tiec（兄弟目录 ../tiec/compiler/tiec.exe）
+//       · clang / clang-cl（PATH，本机 D:\LLVM\bin）
+//       · ../trm-lite/trm_lite.a（tie 表运行时：table<T> 容器符号）
+//
+// 用法：tiec host\build.tie -o build\host_build.exe && build\host_build.exe
+
+unsafe extern fn system(p0: string) -> i32
+
+var g_out: string = "build\\host"
+
+func sh(cmd: string) -> i64 {
+    println("  $ " + cmd)
+    unsafe {
+        return as_i64(system(cmd))
+    }
+}
+
+func die(m: string) -> i64 {
+    println("[build] ERROR: " + m)
+    exit(1)
+    return 1
+}
+
+func main() -> i64 {
+    var tiec = "..\\tiec\\compiler\\tiec.exe"
+    var host_cpp = "host\\win32\\tiu_host.cpp"
+    var host_obj = g_out + "\\tiu_host.obj"
+    var probe_src = "tests\\probe_host.tie"
+    var probe_ll = g_out + "\\probe_host.ll"
+    var probe_obj = g_out + "\\probe_host.obj"
+    var probe_exe = g_out + "\\probe_host.exe"
+    var trmlite = "..\\trm-lite\\trm_lite.a"
+
+    if sh("if not exist " + g_out + " mkdir " + g_out) != 0 {
+        return die("mkdir " + g_out + " failed")
+    }
+
+    // 1) 平台壳（C）
+    if sh("clang-cl /MT /O2 /c " + host_cpp + " /Fo:" + host_obj) != 0 {
+        return die("tiu_host.cpp compile failed")
+    }
+    println("[build] tiu_host.obj ok")
+
+    // 2) 探针 → LLVM IR
+    if sh(tiec + " " + probe_src + " --emit-ir -o " + probe_ll) != 0 {
+        return die("probe IR failed (tiec)")
+    }
+
+    // 3) IR → obj
+    if sh("clang -O2 -c " + probe_ll + " -o " + probe_obj) != 0 {
+        return die("probe obj failed (clang)")
+    }
+    println("[build] probe_host.obj ok")
+
+    // 4) 链接
+    var lcmd = "clang -fuse-ld=link " + probe_obj + " " + host_obj + " " + trmlite +
+        " -o " + probe_exe +
+        " -luser32 -lgdi32 -lshell32 -lole32 -ladvapi32 -rtlib=compiler-rt"
+    if sh(lcmd) != 0 {
+        return die("link failed")
+    }
+    println("[build] probe_host.exe linked")
+
+    // 5) 运行
+    println("[build] running probe_host.exe (a window will appear ~2s) ...")
+    var rc = sh(probe_exe)
+    if rc != 0 {
+        return die("probe run failed rc=" + to_string(rc))
+    }
+    println("[build] PROBE_HOST run ok (rc=0)")
+    return 0
+}
