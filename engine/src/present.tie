@@ -35,15 +35,15 @@ pub unsafe func to_bgra(px: table<i64>, w: i64, h: i64) -> ptr<u8> {
             var o = i * 4
             if i < have {
                 var c = px[i]
-                deref_write(ptr_add(buf, o), as_u8(sem.ch_b(c)))
-                deref_write(ptr_add(buf, o + 1), as_u8(sem.ch_g(c)))
-                deref_write(ptr_add(buf, o + 2), as_u8(sem.ch_r(c)))
-                deref_write(ptr_add(buf, o + 3), as_u8(sem.ch_a(c)))
+                deref_write(ptr_add(buf, o), to_u8(sem.ch_b(c)))
+                deref_write(ptr_add(buf, o + 1), to_u8(sem.ch_g(c)))
+                deref_write(ptr_add(buf, o + 2), to_u8(sem.ch_r(c)))
+                deref_write(ptr_add(buf, o + 3), to_u8(sem.ch_a(c)))
             } else {
-                deref_write(ptr_add(buf, o), as_u8(0))
-                deref_write(ptr_add(buf, o + 1), as_u8(0))
-                deref_write(ptr_add(buf, o + 2), as_u8(0))
-                deref_write(ptr_add(buf, o + 3), as_u8(255))
+                deref_write(ptr_add(buf, o), to_u8(0))
+                deref_write(ptr_add(buf, o + 1), to_u8(0))
+                deref_write(ptr_add(buf, o + 2), to_u8(0))
+                deref_write(ptr_add(buf, o + 3), to_u8(255))
             }
             i = i + 1
         }

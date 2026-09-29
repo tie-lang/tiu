@@ -39,7 +39,7 @@ pub func render(p: Parsed) -> FrameBuf {
         var fill = p.fills[i]
         var color = p.colors[i]
         var alpha = p.alphas[i]
-        var eff_a = as_i64((as_f64(alpha) * as_f64(sem.ch_a(color)) / 255.0) + 0.5)
+        var eff_a = to_i64((to_f64(alpha) * to_f64(sem.ch_a(color)) / 255.0) + 0.5)
         if op == E_OP_RECT || (op == E_OP_RRECT && p.rx[i] == 0.0) {
             if fill == 0 {
                 rect_px(fb, p, i, color, eff_a)
@@ -145,9 +145,9 @@ func dev(p: Parsed, lx: f64, ly: f64) -> (f64, f64) {
 
 func i64_round(v: f64) -> i64 {
     if v >= 0.0 {
-        return as_i64(v + 0.5)
+        return to_i64(v + 0.5)
     }
-    return as_i64(v - 0.5)
+    return to_i64(v - 0.5)
 }
 
 }

@@ -20,7 +20,7 @@ namespace eirb {
 
 // Q16 → f64。
 pub func q16_f(v: i64) -> f64 {
-    return as_f64(v) / as_f64(E_Q16)
+    return to_f64(v) / to_f64(E_Q16)
 }
 
 // 读 i64 小端（offset 起 8 字节）。
@@ -62,9 +62,9 @@ pub func put_u8(out: table<i64>, v: i64) {
 // f64 → Q16（与 API 同 round 语义）。
 pub func q16(v: f64) -> i64 {
     if v >= 0.0 {
-        return as_i64(v * as_f64(E_Q16) + 0.5)
+        return to_i64(v * to_f64(E_Q16) + 0.5)
     }
-    return as_i64(v * as_f64(E_Q16) - 0.5)
+    return to_i64(v * to_f64(E_Q16) - 0.5)
 }
 
 // 追加 Q16 定点。

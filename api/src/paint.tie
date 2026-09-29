@@ -200,7 +200,7 @@ pub func stop(r: i64, g: i64, b: i64, a: i64, offset: f64) -> table<i64> {
     table_push(t, clamp_a(g))
     table_push(t, clamp_a(b))
     table_push(t, clamp_a(a))
-    table_push(t, as_i64(offset * as_f64(P_Q16)))
+    table_push(t, to_i64(offset * to_f64(P_Q16)))
     return t
 }
 
@@ -211,7 +211,7 @@ pub func stop_add(t: table<i64>, r: i64, g: i64, b: i64, a: i64, offset: f64) ->
     table_push(nt, clamp_a(g))
     table_push(nt, clamp_a(b))
     table_push(nt, clamp_a(a))
-    table_push(nt, as_i64(offset * as_f64(P_Q16)))
+    table_push(nt, to_i64(offset * to_f64(P_Q16)))
     return nt
 }
 

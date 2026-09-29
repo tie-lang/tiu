@@ -42,6 +42,7 @@ var g_next: table<i64> = []     // 下一兄弟 id（-1 = 无）
 var g_dead: table<i64> = []     // 0 = 活 / 1 = dead（卸载标记）
 var g_textlen: table<i64> = []  // Text/Button 内容长度（布局用）
 var g_text: table<string> = []  // Text/Button 内容（真实文本；绘制桥消费）
+var g_act: table<i64> = []      // Button 动作码（事件回传应用层的短标识）
 var g_ox: table<i64> = []       // 绝对定位：相对父内容区 x 偏移
 var g_oy: table<i64> = []       // 绝对定位：相对父内容区 y 偏移
 var g_fw: table<i64> = []       // 固定宽（0 = 内容自适应）
@@ -100,6 +101,7 @@ pub func reset() {
     g_dead = table_new_i64()
     g_textlen = table_new_i64()
     g_text = table_new_string()
+    g_act = table_new_i64()
     g_ox = table_new_i64()
     g_oy = table_new_i64()
     g_fw = table_new_i64()
@@ -135,6 +137,27 @@ pub func text_of(id: i64) -> string {
     return g_text[id]
 }
 
+// ---- 动作码承载（Button 等可交互控件用）----
+
+// 设置节点动作码（应用层定义的短标识）。
+pub func set_act(id: i64, a: i64) {
+    if id < 0 {
+        return
+    }
+    while len(g_act) <= id {
+        table_push(g_act, 0)
+    }
+    g_act[id] = a
+}
+
+// 读节点动作码（未设置 / 越界 → 0）。
+pub func act_of(id: i64) -> i64 {
+    if id < 0 || id >= len(g_act) {
+        return 0
+    }
+    return g_act[id]
+}
+
 // 挂载：新建节点。parent = -1 表示根（重置后首个挂载）。返回新节点 id。
 pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     var id = g_next_id
@@ -148,6 +171,7 @@ pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     table_push(g_dead, 0)
     table_push(g_textlen, 0)
     table_push(g_text, "")
+    table_push(g_act, 0)
     table_push(g_ox, 0)
     table_push(g_oy, 0)
     table_push(g_fw, 0)

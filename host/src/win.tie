@@ -97,21 +97,21 @@ pub func open(title: string, w: i64, h: i64) -> i64 {
                 var v = cp - 0x10000
                 var hi = 0xD800 + (v >> 10)
                 var lo = 0xDC00 + (v & 0x3FF)
-                deref_write(ptr_add(buf, o), as_u8(hi & 0xFF))
-                deref_write(ptr_add(buf, o + 1), as_u8((hi >> 8) & 0xFF))
-                deref_write(ptr_add(buf, o + 2), as_u8(lo & 0xFF))
-                deref_write(ptr_add(buf, o + 3), as_u8((lo >> 8) & 0xFF))
+                deref_write(ptr_add(buf, o), to_u8(hi & 0xFF))
+                deref_write(ptr_add(buf, o + 1), to_u8((hi >> 8) & 0xFF))
+                deref_write(ptr_add(buf, o + 2), to_u8(lo & 0xFF))
+                deref_write(ptr_add(buf, o + 3), to_u8((lo >> 8) & 0xFF))
                 o = o + 4
             } else {
-                deref_write(ptr_add(buf, o), as_u8(cp & 0xFF))
-                deref_write(ptr_add(buf, o + 1), as_u8((cp >> 8) & 0xFF))
+                deref_write(ptr_add(buf, o), to_u8(cp & 0xFF))
+                deref_write(ptr_add(buf, o + 1), to_u8((cp >> 8) & 0xFF))
                 o = o + 2
             }
             i = i + 1
         }
-        deref_write(ptr_add(buf, o), as_u8(0))
-        deref_write(ptr_add(buf, o + 1), as_u8(0))
-        var hw = win_open(buf, as_i32(total), as_i32(w), as_i32(h))
+        deref_write(ptr_add(buf, o), to_u8(0))
+        deref_write(ptr_add(buf, o + 1), to_u8(0))
+        var hw = win_open(buf, to_i32(total), to_i32(w), to_i32(h))
         free(buf)
         return hw
     }
@@ -127,7 +127,7 @@ pub func update(hwnd: i64) {
 
 // 消息泵单步（非阻塞排空线程消息队列）；返回本轮处理消息数。
 pub func pump(hwnd: i64) -> i64 {
-    unsafe { return as_i64(win_pump(hwnd)) }
+    unsafe { return to_i64(win_pump(hwnd)) }
 }
 
 // 1 = 窗口已收到 WM_CLOSE / WM_DESTROY。
@@ -146,7 +146,7 @@ pub func destroy(hwnd: i64) {
 
 // 兜底延时（消息泵之间，禁忙等）。单位毫秒。
 pub func sleep(ms: i64) {
-    unsafe { Sleep(as_u32(ms)) }
+    unsafe { Sleep(to_u32(ms)) }
 }
 
 // ---- 呈现 ----
@@ -156,7 +156,7 @@ pub func sleep(ms: i64) {
 // 注：形参含 ptr 故为 unsafe（tie 门禁：ptr 只允许出现在 unsafe 路径）。
 pub unsafe func present_bytes(hwnd: i64, buf: ptr<u8>, w: i64, h: i64) -> i64 {
     unsafe {
-        return as_i64(win_present(hwnd, buf, as_i32(w * 4), as_i32(w), as_i32(h)))
+        return to_i64(win_present(hwnd, buf, to_i32(w * 4), to_i32(w), to_i32(h)))
     }
 }
 
@@ -164,7 +164,7 @@ pub unsafe func present_bytes(hwnd: i64, buf: ptr<u8>, w: i64, h: i64) -> i64 {
 
 // 队列剩余事件条数。
 pub func events_avail(hwnd: i64) -> i64 {
-    unsafe { return as_i64(win_events_avail(hwnd)) }
+    unsafe { return to_i64(win_events_avail(hwnd)) }
 }
 
 // 队列是否发生过溢出（容量 256 满后丢最旧）。
@@ -203,7 +203,7 @@ unsafe func rd_i64(p: ptr<u8>, off: i64) -> i64 {
     var v: i64 = 0
     var k: i64 = 0
     while k < 8 {
-        v = v | (as_i64(deref(ptr_add(p, off + k))) << (8 * k))
+        v = v | (to_i64(deref(ptr_add(p, off + k))) << (8 * k))
         k = k + 1
     }
     return v
@@ -219,7 +219,7 @@ func xy_lparam(x: i64, y: i64) -> i64 {
 }
 
 pub func post(hwnd: i64, msg: i64, wparam: i64, lparam: i64) -> bool {
-    unsafe { return PostMessageW(hwnd, as_u32(msg), wparam, lparam) != 0 }
+    unsafe { return PostMessageW(hwnd, to_u32(msg), wparam, lparam) != 0 }
 }
 
 pub func post_mouse(hwnd: i64, x: i64, y: i64) -> bool {
