@@ -22,3 +22,6 @@ Thumbs.db
 # ---- 记忆 / 本地配置 ----
 .localmemory/
 .opencode.json
+
+# ---- 一次性语法试验碎片 ----
+tests/_scratch/
