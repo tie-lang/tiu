@@ -22,6 +22,12 @@ enum WidgetType {
     Text
     Button
     Absolute
+    // ---- p.9.4.2 模块二首批控件补齐（2026-10-03）----
+    // ⚠ 只在**末尾追加**：ty_code 是枚举序数（g_types 存的就是它），
+    //   追加不改动已有码 ⇒ 已入库探针的码值断言零漂移。
+    Scroll      // 滚动容器：内容整体偏移 + clip 裁剪区
+    TextInput   // 文本输入：文本 + 占位符 + 焦点态
+    Image       // 图像：资源句柄 + 绘制矩形
 }
 
 // 布局矩形（值语义；方法放 Rect 命名空间，obj.method() 转发）
@@ -54,10 +60,20 @@ var g_h: table<i64> = []
 var g_root: i64 = -1
 var g_next_id: i64 = 0
 
+// ---- p.9.4.2 首批控件补齐所需属性槽（2026-10-03）----
+// 三个新控件各需一个既有槽无法承载的属性；单独建槽而不塞进 set_props 的
+// 理由：set_props 是**每帧必写**的热路径，控件专属属性按需读写（多数帧不变），
+// 混进去会给 Text/Button 也加上无用写入。
+var g_scroll: table<i64> = []    // Scroll：内容区垂直偏移（滚动量）
+var g_focus: table<i64> = []     // TextInput：焦点态（0 无 / 1 聚焦）
+var g_res: table<i64> = []       // Image：资源句柄（0 = 无图，占位绘制）
+
 namespace tiu_tree {
 // ---- 类型码转换 ----
 
-// WidgetType -> i64 码（0..4）
+// WidgetType -> i64 码（0..7）
+// ⚠ 码值是**对外契约**（g_types 存的就是它，探针按码断言）——只在末尾追加，
+//   已有码永不改。2026-10-03 补Scroll(5) / TextInput(6) / Image(7)。
 pub func ty_code(ty: WidgetType) -> i64 {
     var c: i64 = 0
     switch ty {
@@ -66,6 +82,9 @@ pub func ty_code(ty: WidgetType) -> i64 {
         case WidgetType.Text: c = 2
         case WidgetType.Button: c = 3
         case WidgetType.Absolute: c = 4
+        case WidgetType.Scroll: c = 5
+        case WidgetType.TextInput: c = 6
+        case WidgetType.Image: c = 7
         default: c = 0
     }
     return c
@@ -84,6 +103,15 @@ pub func type_name(kind: i64) -> string {
     }
     if kind == 3 {
         return "Button"
+    }
+    if kind == 5 {
+        return "Scroll"
+    }
+    if kind == 6 {
+        return "TextInput"
+    }
+    if kind == 7 {
+        return "Image"
     }
     return "Absolute"
 }
@@ -110,6 +138,9 @@ pub func reset() {
     g_y = table_new_i64()
     g_w = table_new_i64()
     g_h = table_new_i64()
+    g_scroll = table_new_i64()
+    g_focus = table_new_i64()
+    g_res = table_new_i64()
     g_root = -1
     g_next_id = 0
 }
@@ -158,6 +189,69 @@ pub func act_of(id: i64) -> i64 {
     return g_act[id]
 }
 
+// ---- 滚动偏移（Scroll 专用）----
+
+// 设置滚动偏移（内容区垂直位移；渲染时内容整体平移 -off）。
+pub func set_scroll(id: i64, off: i64) {
+    if id < 0 {
+        return
+    }
+    while len(g_scroll) <= id {
+        table_push(g_scroll, 0)
+    }
+    g_scroll[id] = off
+}
+
+// 读滚动偏移（未设置 / 越界 → 0）。
+pub func scroll_of(id: i64) -> i64 {
+    if id < 0 || id >= len(g_scroll) {
+        return 0
+    }
+    return g_scroll[id]
+}
+
+// ---- 焦点态（TextInput 等可编辑控件用）----
+
+// 设置焦点态（0 = 无焦点 / 1 = 聚焦）。
+pub func set_focus(id: i64, f: i64) {
+    if id < 0 {
+        return
+    }
+    while len(g_focus) <= id {
+        table_push(g_focus, 0)
+    }
+    g_focus[id] = f
+}
+
+// 读焦点态（未设置 / 越界 → 0）。
+pub func focus_of(id: i64) -> i64 {
+    if id < 0 || id >= len(g_focus) {
+        return 0
+    }
+    return g_focus[id]
+}
+
+// ---- 资源句柄（Image 专用）----
+
+// 设置资源句柄（0 = 无图，绘制占位块）。
+pub func set_res(id: i64, h: i64) {
+    if id < 0 {
+        return
+    }
+    while len(g_res) <= id {
+        table_push(g_res, 0)
+    }
+    g_res[id] = h
+}
+
+// 读资源句柄（未设置 / 越界 → 0）。
+pub func res_of(id: i64) -> i64 {
+    if id < 0 || id >= len(g_res) {
+        return 0
+    }
+    return g_res[id]
+}
+
 // 挂载：新建节点。parent = -1 表示根（重置后首个挂载）。返回新节点 id。
 pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     var id = g_next_id
@@ -180,6 +274,10 @@ pub func mount(parent: i64, slot: i64, ty: WidgetType) -> i64 {
     table_push(g_y, 0)
     table_push(g_w, 0)
     table_push(g_h, 0)
+    // SoA 各表长度必须与 g_types 同步（按下标并行访问），漏 push 即错位。
+    table_push(g_scroll, 0)
+    table_push(g_focus, 0)
+    table_push(g_res, 0)
     if parent < 0 {
         g_root = id
     } else {

@@ -52,6 +52,7 @@ import "./build.tie"
 //   Empty                       空节点（条件渲染的假分支，不产记录）
 
 // 顶层声明默认公有（§7.1），故 enum 不加 `pub`（`pub` 仅用于 func / macro）。
+// ⚠ **变体只能在末尾追加**：emit() 按变体序号分派，插在中间会错位。
 enum Elem {
     Text(string)
     Button(string, i64)
@@ -60,6 +61,12 @@ enum Elem {
     Column(table<Elem>)
     Spacer(i64)
     Empty
+    // ---- p.9.4.2 首批控件补齐（2026-10-03）----
+    // 首批控件清单（widgets §模块二）：Button / Text / Row / Column /
+    // Scroll / TextInput / Image —— 至此七个齐备。
+    Scroll(table<Elem>, i64)     // 内容 + 视口高（滚动偏移由外部 set_scroll 驱动）
+    TextInput(string, i64)        // 占位符 + 动作码（文本经 set_text 写入）
+    Image(i64, i64, i64)          // 资源句柄 + 宽 + 高（句柄 0 = 占位块）
 }
 
 namespace vw {
@@ -84,6 +91,24 @@ pub func Spacer(h: i64) -> Elem {
 
 pub func Empty() -> Elem {
     return Elem.Empty
+}
+
+// ---- 首批控件补齐的构造器（2026-10-03）----
+
+// 滚动容器：kids 为内容，vh 为视口高（超出部分被裁剪）。
+pub func Scroll(kids: table<Elem>, vh: i64) -> Elem {
+    return Elem.Scroll(kids, vh)
+}
+
+// 文本输入：placeholder 为空文本时的提示，act 为提交/聚焦动作码。
+// ⚠ 实参写进变体的是**占位符**；真实文本在重渲染时由 set_text 写入节点。
+pub func TextInput(placeholder: string, act: i64) -> Elem {
+    return Elem.TextInput(placeholder, act)
+}
+
+// 图像：res 为资源句柄（0 = 占位块），w/h 为绘制尺寸。
+pub func Image(res: i64, w: i64, h: i64) -> Elem {
+    return Elem.Image(res, w, h)
 }
 
 // ---- 条件渲染（补足「if 不能作表达式」）----
@@ -235,6 +260,31 @@ func emit(e: Elem, slot: i64, depth: i64) -> i64 {
             return 1
         case Elem.Empty:
             return 0
+        case Elem.Scroll(kids, vh):
+            // 滚动容器：视口尺寸写 fw（固定宽由布局给），vh 作为 props 版本的一部分
+            // —— 视口变了才需重排，滚动偏移走set_scroll 不进版本（变换级变化）。
+            tiu_build.open(WidgetType.Scroll, slot, fp(5, "", depth, vh, len(kids)), 0, 0, 0, vh, 0)
+            var n: i64 = 1
+            var i: i64 = 0
+            while i < len(kids) {
+                n = n + emit(kids[i], i, depth + 1)
+                i = i + 1
+            }
+            tiu_build.close()
+            return n
+        case Elem.TextInput(placeholder, act):
+            // 文本输入：open_t 写占位符；真实文本由应用层 set_text 覆盖。
+            // 焦点态进版本号 —— 聚焦/失焦是视觉变化，须触发重绘。
+            tiu_build.open_t(WidgetType.TextInput, slot, fp(6, placeholder, act, depth, 0), placeholder, 0, 0, 0, 0)
+            tiu_tree.set_act(tiu_build.cur_id(), act)
+            tiu_build.close()
+            return 1
+        case Elem.Image(res, w, h):
+            // 图像：句柄 0 走占位块（绘制桥据g_res 决定实图/占位）。
+            tiu_build.open(WidgetType.Image, slot, fp(7, "", res, depth, w * 31 + h), 0, 0, 0, w, h)
+            tiu_tree.set_res(tiu_build.cur_id(), res)
+            tiu_build.close()
+            return 1
         default:
             return 0
     }
