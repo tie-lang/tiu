@@ -1,0 +1,249 @@
+type tie<class>
+// ui/src/view.tie —— tiu 声明式视图层（前端式写法，纯 tie 现有语法）
+// EN: tiu declarative view layer — frontend-style authoring in pure tie.
+// ============================================================
+// 目标：把写 tiu 界面变成写前端组件那样的体验——纯函数、声明式嵌套、
+// 组件可复用、条件/列表渲染内联、状态变化自动重渲染。
+//
+// ---- 设计依据（2026-09-26 全部实测，非推测）----
+//   ✓ 表字面量 `[a, b]` 可嵌套表达子树
+//   ✓ enum payload：string / i64 / `table<Elem>` 递归 / 多字段——**均可用**
+//   ✓ 泛型函数 + `fn` 参数（`each<T>(items, f)`）——**可用**（组件与列表渲染的基石）
+//   ✓ `for it in table` 遍历——可用
+//   ✗ `if` / `for` 作表达式——**不可用**（"无法以 If/For 开始表达式"）
+//        → 条件渲染由 `show_if` / `hide_if` / `choose` 补足
+//        → 列表渲染由 `each_str` / `each_i64` 补足
+//   ✗ 表字面量尾随逗号——**不支持**（"无法以 RBracket 开始表达式"）
+//        → 末元素后不加逗号（这是当前书写体验的主要妥协，见设计文档）
+//   ✗ `{ }` 在表达式位置是 map 字面量——不能用作 UI 块
+//   ✗ `table<Elem>`（struct 行池）**不能作函数形参**（p.9.12.6 边界）
+//        → 故容器构造走 **enum 构造**（`Elem.Row([...])`），不走包装函数；
+//          叶构造器（Text/Button）形参仅标量/string，可用函数
+//   ✗ enum payload 不支持 struct / fn（E00365）
+//        → 控件属性以**扁平标量**表达，而非 props struct（待 p.8.1.8）
+//
+// ---- 用法（写起来与前端组件一致）----
+//
+//   func app(s: State) -> Elem {
+//       return Elem.Column([
+//           Text("tiu demo"),
+//           Text("count " + to_string(s.count)),
+//           Elem.Row([
+//               Button("-1", ACT_DEC),
+//               Button("+1", ACT_INC)
+//           ]),
+//           show_if(s.count > 3, Text("big!"))
+//       ])
+//   }
+//
+// 组件 = 普通函数（可带参、可泛型、可组合）；状态由应用层持有；状态变化后
+// 重新调用 app(s) 得到新树，框架按 slot 复用骨架（差分 O(变化)，静态帧零重绘）。
+
+import "./tree.tie"
+import "./build.tie"
+
+// ---- 声明式节点（enum 递归 payload 承载树）----
+// 变体语义：
+//   Text(s)                     文本
+//   Button(label, act)          自适应尺寸按钮
+//   ButtonSized(label, act, w, h) 固定尺寸按钮
+//   Row(kids) / Column(kids)    容器
+//   Spacer(h)                   纵向留白（不产绘制记录）
+//   Empty                       空节点（条件渲染的假分支，不产记录）
+
+// 顶层声明默认公有（§7.1），故 enum 不加 `pub`（`pub` 仅用于 func / macro）。
+enum Elem {
+    Text(string)
+    Button(string, i64)
+    ButtonSized(string, i64, i64, i64)
+    Row(table<Elem>)
+    Column(table<Elem>)
+    Spacer(i64)
+    Empty
+}
+
+namespace vw {
+
+// ---- 叶构造器（形参仅标量/string，故可用函数）----
+
+pub func Text(s: string) -> Elem {
+    return Elem.Text(s)
+}
+
+pub func Button(label: string, act: i64) -> Elem {
+    return Elem.Button(label, act)
+}
+
+pub func ButtonSized(label: string, act: i64, w: i64, h: i64) -> Elem {
+    return Elem.ButtonSized(label, act, w, h)
+}
+
+pub func Spacer(h: i64) -> Elem {
+    return Elem.Spacer(h)
+}
+
+pub func Empty() -> Elem {
+    return Elem.Empty
+}
+
+// ---- 条件渲染（补足「if 不能作表达式」）----
+// 注：函数名不可用 `when`（tie 关键词：switch 守卫条件），故取 `show_if`。
+// 严格求值下 e 恒被构造（构造是纯函数、无副作用），cond 为假时返回 Empty
+// 不进入树——语义等价前端的条件渲染。
+
+pub func show_if(cond: bool, e: Elem) -> Elem {
+    if cond {
+        return e
+    }
+    return Elem.Empty
+}
+
+pub func hide_if(cond: bool, e: Elem) -> Elem {
+    if cond {
+        return Elem.Empty
+    }
+    return e
+}
+
+// 二选一（等价前端的三元 / if-else 表达式）。
+pub func choose(cond: bool, a: Elem, b: Elem) -> Elem {
+    if cond {
+        return a
+    }
+    return b
+}
+
+// ---- 列表渲染（补足「for 不能作表达式」）----
+// 返回 `table<Elem>`，直接作为容器实参内联：`Elem.Row(each_str(xs, f))`
+
+pub func each_str(items: table<string>, f: fn(string) -> Elem) -> table<Elem> {
+    var out: table<Elem> = []
+    for it in items {
+        table_push(out, f(it))
+    }
+    return out
+}
+
+pub func each_i64(items: table<i64>, f: fn(i64) -> Elem) -> table<Elem> {
+    var out: table<Elem> = []
+    for it in items {
+        table_push(out, f(it))
+    }
+    return out
+}
+
+// 带索引版本（组件按 item + index 构造）。
+pub func each_index_str(items: table<string>, f: fn(string, i64) -> Elem) -> table<Elem> {
+    var out: table<Elem> = []
+    var i: i64 = 0
+    for it in items {
+        table_push(out, f(it, i))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 常用组合子 ----
+
+// 过滤（等价前端 filter）。
+pub func filter_str(items: table<string>, keep: fn(string) -> bool) -> table<string> {
+    var out: table<string> = []
+    for it in items {
+        if keep(it) {
+            table_push(out, it)
+        }
+    }
+    return out
+}
+
+// 子表拼接（把多段子树接成一个序列，便于条件/列表混排）。
+pub func join(a: table<Elem>, b: table<Elem>) -> table<Elem> {
+    var out: table<Elem> = []
+    for x in a {
+        table_push(out, x)
+    }
+    for y in b {
+        table_push(out, y)
+    }
+    return out
+}
+
+// ---- 树 → 骨架（挂到 tiu 骨架；按 slot 复用与差分）----
+// 返回挂载的节点数。
+
+pub func mount(root: Elem) -> i64 {
+    tiu_build.begin()
+    var n = emit(root, 0, 0)
+    tiu_build.finish()
+    return n
+}
+
+// 内容指纹（差分键：内容不变 → 版本号不变 → 静态帧零重绘）。
+func fp(kind: i64, label: string, a: i64, b: i64, c: i64) -> i64 {
+    var f: i64 = kind * 1000003 + a * 101 + b * 7919 + c * 104729
+    var i: i64 = 0
+    var n = str_len(label)
+    while i < n {
+        f = (f * 31 + char_code(str_char(label, i))) % 1000000007
+        i = i + 1
+    }
+    if f < 0 {
+        f = -f
+    }
+    return f + 1
+}
+
+// 递归发射：depth 仅用于指纹去重（同层同内容不撞版本）。
+func emit(e: Elem, slot: i64, depth: i64) -> i64 {
+    switch e {
+        case Elem.Text(s):
+            tiu_build.open_t(WidgetType.Text, slot, fp(2, s, depth, 0, 0), s, 0, 0, 0, 0)
+            tiu_build.close()
+            return 1
+        case Elem.Button(label, act):
+            emit_button(label, act, slot, depth, 0, 0)
+            return 1
+        case Elem.ButtonSized(label, act, w, h):
+            emit_button(label, act, slot, depth, w, h)
+            return 1
+        case Elem.Row(kids):
+            tiu_build.open(WidgetType.Row, slot, fp(0, "", depth, len(kids), 0), 0, 0, 0, 0, 0)
+            var n: i64 = 1
+            var i: i64 = 0
+            while i < len(kids) {
+                n = n + emit(kids[i], i, depth + 1)
+                i = i + 1
+            }
+            tiu_build.close()
+            return n
+        case Elem.Column(kids):
+            tiu_build.open(WidgetType.Column, slot, fp(1, "", depth, len(kids), 0), 0, 0, 0, 0, 0)
+            var n: i64 = 1
+            var i: i64 = 0
+            while i < len(kids) {
+                n = n + emit(kids[i], i, depth + 1)
+                i = i + 1
+            }
+            tiu_build.close()
+            return n
+        case Elem.Spacer(h):
+            if h <= 0 {
+                return 0
+            }
+            tiu_build.open(WidgetType.Absolute, slot, fp(4, "", h, depth, 0), 0, 0, 0, 0, h)
+            tiu_build.close()
+            return 1
+        case Elem.Empty:
+            return 0
+        default:
+            return 0
+    }
+}
+
+func emit_button(label: string, act: i64, slot: i64, depth: i64, w: i64, h: i64) {
+    tiu_build.open_t(WidgetType.Button, slot, fp(3, label, act, depth, w * 31 + h), label, 0, 0, w, h)
+    tiu_tree.set_act(tiu_build.cur_id(), act)
+    tiu_build.close()
+}
+
+}

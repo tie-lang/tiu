@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // host/src/win.tie —— tiu host 层 tie 面：Win32 窗口壳绑定（窗口 / 事件 / 上屏）
 // EN: tiu host layer, tie side — Win32 window-shell binding (window / events / present).
 // ============================================================

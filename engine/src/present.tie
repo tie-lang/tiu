@@ -1,4 +1,4 @@
-type tie<class>
+type tie<class, unsafe:mem>
 // engine/src/present.tie —— tiu 渲染引擎：帧缓冲导出为呈现格式
 // EN: tiu engine — frame-buffer export for presentation.
 // ============================================================
