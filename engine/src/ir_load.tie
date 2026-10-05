@@ -78,21 +78,60 @@ pub func parse_frame(b: table<i64>) -> Parsed {
     p.sh = eirb.rd_i64(b, 64)
     p.dpi = eirb.q16_f(eirb.rd_i64(b, 72))
     var cnt = eirb.rd_i64(b, 80)
+    // ★ 累积器提升为局部变量，**按 ref** 交给 parse_record，出口一次性写回。
+    //   为何不把 `p` 按值传进去改写：值语义下按值 struct 形参内的表字段写不会回到
+    //   调用方（`var o = p.ops; table_push(o,…); p.ops = o` 只改到参数副本），
+    //   而 ref 形参是**借用**、直写调用方表 ⇒ 与语义无关、恒正确。
+    var ops = p.ops
+    var keys = p.keys
+    var fills = p.fills
+    var colors = p.colors
+    var alphas = p.alphas
+    var x = p.x
+    var y = p.y
+    var w = p.w
+    var h = p.h
+    var rx = p.rx
+    var ry = p.ry
+    var a0 = p.a0
+    var a1 = p.a1
+    var fs = p.fs
+    var txt = p.txt
     var ofs: i64 = 88
     var i: i64 = 0
     while i < cnt {
-        ofs = parse_record(b, ofs, p)
+        ofs = parse_record(b, ofs, ops, keys, fills, colors, alphas, x, y, w, h, rx, ry, a0, a1, fs, txt)
         if ofs < 0 {
             break
         }
         i = i + 1
     }
+    p.ops = ops
+    p.keys = keys
+    p.fills = fills
+    p.colors = colors
+    p.alphas = alphas
+    p.x = x
+    p.y = y
+    p.w = w
+    p.h = h
+    p.rx = rx
+    p.ry = ry
+    p.a0 = a0
+    p.a1 = a1
+    p.fs = fs
+    p.txt = txt
     return p
 }
 
 // 解析单条 record（返回下一条偏移；-1 = 越界）。字段：
 // op(8) key(8) geo_len(8) geo paint_len(8) paint clip(8) meta_len(8) meta。
-func parse_record(b: table<i64>, ofs: i64, p: Parsed) -> i64 {
+func parse_record(b: table<i64>, ofs: i64,
+                  ref ops: table<i64>, ref keys: table<i64>, ref fills: table<i64>,
+                  ref colors: table<i64>, ref alphas: table<i64>, ref x: table<f64>,
+                  ref y: table<f64>, ref w: table<f64>, ref h: table<f64>,
+                  ref rx: table<f64>, ref ry: table<f64>, ref a0: table<f64>,
+                  ref a1: table<f64>, ref fs: table<f64>, ref txt: table<string>) -> i64 {
     var n = len(b)
     if ofs + 24 > n {
         return -1
@@ -115,23 +154,9 @@ func parse_record(b: table<i64>, ofs: i64, p: Parsed) -> i64 {
     var meta = read_str(b, meta_ofs + 8, meta_len)
     var next = meta_ofs + 8 + meta_len
 
-    // 图元行
-    var ops = p.ops
-    table_push(ops, op)
-    p.ops = ops
-    var keys = p.keys
-    table_push(keys, key)
-    p.keys = keys
-    var x = p.x
-    var y = p.y
-    var w = p.w
-    var h = p.h
-    var rx = p.rx
-    var ry = p.ry
-    var a0 = p.a0
-    var a1 = p.a1
-    var fs = p.fs
-    var txt = p.txt
+    // 图元行
+    table_push(ops, op)
+    table_push(keys, key)
     var g = geo_ofs
     if op == E_OP_RECT {
         table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
@@ -196,17 +221,7 @@ func parse_record(b: table<i64>, ofs: i64, p: Parsed) -> i64 {
         table_push(x, 0.0); table_push(y, 0.0); table_push(w, 0.0); table_push(h, 0.0)
         table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
         table_push(txt, "")
-    }
-    p.x = x
-    p.y = y
-    p.w = w
-    p.h = h
-    p.rx = rx
-    p.ry = ry
-    p.a0 = a0
-    p.a1 = a1
-    p.fs = fs
-    p.txt = txt
+    }
 
     // paint 段：fill(8) color(8) gx0..gy1(4×8) stops_n(8) stops…
     //        stroke_w(8) cap(8) join(8) dash_n(8) dash… alpha(8)
@@ -222,16 +237,10 @@ func parse_record(b: table<i64>, ofs: i64, p: Parsed) -> i64 {
     var alpha = 255
     if alpha_ofs + 8 <= paint_ofs + paint_len {
         alpha = eirb.rd_i64(b, alpha_ofs)
-    }
-    var fills = p.fills
-    table_push(fills, fill)
-    p.fills = fills
-    var colors = p.colors
-    table_push(colors, colorv)
-    p.colors = colors
-    var alphas = p.alphas
-    table_push(alphas, alpha)
-    p.alphas = alphas
+    }
+    table_push(fills, fill)
+    table_push(colors, colorv)
+    table_push(alphas, alpha)
     return next
 }
 

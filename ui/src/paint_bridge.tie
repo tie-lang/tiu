@@ -58,7 +58,7 @@ pub func draw(d: DrawList, th: i64, hot: i64, active: i64) -> i64 {
 
 // 画布背景（整帧底色，先于树绘制）。
 pub func background(d: DrawList, w: i64, h: i64, th: i64) -> i64 {
-    dl.rect(d, 0.0, 0.0, to_f64(w), to_f64(h), solid(uth.bg(th)))
+    d = dl.rect(d, 0.0, 0.0, to_f64(w), to_f64(h), solid(uth.bg(th)))
     return 1
 }
 
@@ -83,7 +83,7 @@ func text_node(d: DrawList, id: i64, r: Rect, th: i64) -> i64 {
     if str_len(s) == 0 {
         return 0
     }
-    dl.text_p(d, s, to_f64(r.x), to_f64(r.y), TEXT_SIZE, solid(uth.fg(th)))
+    d = dl.text_p(d, s, to_f64(r.x), to_f64(r.y), TEXT_SIZE, solid(uth.fg(th)))
     return 1
 }
 
@@ -96,7 +96,7 @@ func button_node(d: DrawList, id: i64, r: Rect, th: i64, hot: i64, active: i64) 
     if id == active {
         base = uth.accent_down(th)
     }
-    dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(base))
+    d = dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(base))
     var n: i64 = 1
     var s = tiu_tree.text_of(id)
     var sl = str_len(s)
@@ -104,7 +104,7 @@ func button_node(d: DrawList, id: i64, r: Rect, th: i64, hot: i64, active: i64) 
         var tw = sl * CHAR_ADV
         var tx = r.x + (r.w - tw) / 2
         var ty = r.y + (r.h - LINE_H) / 2
-        dl.text_p(d, s, to_f64(tx), to_f64(ty), TEXT_SIZE, solid(uth.on_accent()))
+        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), TEXT_SIZE, solid(uth.on_accent()))
         n = n + 1
     }
     return n

@@ -112,49 +112,52 @@ pub func set_view(d: DrawList, t: Transform) -> DrawList {
 
 // ---- 图元追加（构建期） ----
 
-pub func rect(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
-    push_row(d, PO_RECT, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func rect(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_RECT, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func rrect(d: DrawList, x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64, p: Paint) {
-    push_row(d, PO_RRECT, x, y, w, h, rx, ry, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func rrect(d: DrawList, x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_RRECT, x, y, w, h, rx, ry, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func ellipse(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
-    push_row(d, PO_ELLIPSE, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func ellipse(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_ELLIPSE, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func arc(d: DrawList, x: f64, y: f64, r: f64, a0: f64, a1: f64, p: Paint) {
-    push_row(d, PO_ARC, x, y, r, 0.0, 0.0, 0.0, a0, a1, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func arc(d: DrawList, x: f64, y: f64, r: f64, a0: f64, a1: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_ARC, x, y, r, 0.0, 0.0, 0.0, a0, a1, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func line(d: DrawList, x0: f64, y0: f64, x1: f64, y1: f64, p: Paint) {
-    push_row(d, PO_LINE, x0, y0, x1, y1, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func line(d: DrawList, x0: f64, y0: f64, x1: f64, y1: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_LINE, x0, y0, x1, y1, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func path(d: DrawList, pth: Path, p: Paint) {
-    push_row(d, PO_PATH, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, pool_path(d, pth), tform.identity())
+pub func path(d: DrawList, pth: Path, p: Paint) -> DrawList {
+    var (d2, pid) = pool_path(d, pth)
+    return push_row(d2, PO_PATH, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, pid, tform.identity())
 }
 
-pub func text_p(d: DrawList, s: string, x: f64, y: f64, size: f64, p: Paint) {
-    push_row(d, PO_TEXT, x, y, size, 0.0, 0.0, 0.0, 0.0, 0.0, size, s, "", 0, p, DL_NO_PATH, tform.identity())
+pub func text_p(d: DrawList, s: string, x: f64, y: f64, size: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_TEXT, x, y, size, 0.0, 0.0, 0.0, 0.0, 0.0, size, s, "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func save_layer(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) {
-    push_row(d, PO_SAVE_LAYER, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
+pub func save_layer(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_SAVE_LAYER, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }
 
-pub func restore_layer(d: DrawList) {
-    push_row(d, PO_RESTORE_LAYER, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, Paint(), DL_NO_PATH, tform.identity())
+pub func restore_layer(d: DrawList) -> DrawList {
+    return push_row(d, PO_RESTORE_LAYER, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, Paint(), DL_NO_PATH, tform.identity())
 }
 
 // 命名字段（不参与 key/渲染语义）。表内容下标写（共享引用生效）。
-pub func set_meta(d: DrawList, m: string) {
+pub func set_meta(d: DrawList, m: string) -> DrawList {
     var meta = d.meta
     var last = len(meta) - 1
     if last >= 0 {
         meta[last] = m
     }
+    d.meta = meta
+    return d
 }
 
 // 图元数（表长度 = 共享引用，读有效）。
@@ -166,7 +169,7 @@ pub func count(d: DrawList) -> i64 {
 
 func push_row(d: DrawList, op: i64, x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64,
               a0: f64, a1: f64, fs: f64, txt: string, meta: string, font: i64,
-              p: Paint, pth_id: i64, tx: Transform) {
+              p: Paint, pth_id: i64, tx: Transform) -> DrawList {
     var c_op = d.op
     table_push(c_op, op)
     d.op = c_op
@@ -209,8 +212,10 @@ func push_row(d: DrawList, op: i64, x: f64, y: f64, w: f64, h: f64, rx: f64, ry:
     var c_clip = d.clip
     table_push(c_clip, PO_NO_CLIP)
     d.clip = c_clip
+    var (dpp, ppid) = pool_paint(d, p)
+    d = dpp
     var c_pid = d.p_id
-    table_push(c_pid, pool_paint(d, p))
+    table_push(c_pid, ppid)
     d.p_id = c_pid
     var c_pth = d.pth_id
     table_push(c_pth, pth_id)
@@ -233,10 +238,11 @@ func push_row(d: DrawList, op: i64, x: f64, y: f64, w: f64, h: f64, rx: f64, ry:
     var c_t5 = d.tx5
     table_push(c_t5, tx.f)
     d.tx5 = c_t5
+    return d
 }
 
 // Paint 入池（复制展开为列；stops/dash/cmatrix 快照到全局池）。
-func pool_paint(d: DrawList, p: Paint) -> i64 {
+func pool_paint(d: DrawList, p: Paint) -> (DrawList, i64) {
     var id = len(d.pp_fill)
     var f = d.pp_fill
     table_push(f, p.fill)
@@ -331,11 +337,11 @@ func pool_paint(d: DrawList, p: Paint) -> i64 {
     var cml = d.pp_cm_len
     table_push(cml, len(p.cmatrix))
     d.pp_cm_len = cml
-    return id
+    return (d, id)
 }
 
 // Path 入池（命令序列快照；返回池 id）。
-func pool_path(d: DrawList, pth: Path) -> i64 {
+func pool_path(d: DrawList, pth: Path) -> (DrawList, i64) {
     var ofs = len(d.pth_cmd_ofs)
     var o = d.pth_ops
     var a = d.pth_args
@@ -359,7 +365,7 @@ func pool_path(d: DrawList, pth: Path) -> i64 {
     var ln = d.pth_cmd_len
     table_push(ln, pth.n)
     d.pth_cmd_len = ln
-    return ofs
+    return (d, ofs)
 }
 
 }

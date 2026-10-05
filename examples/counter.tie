@@ -182,9 +182,9 @@ func render_frame(cv: Canvas) -> FrameBuf {
     upaint.background(d, W, H, g_theme)
 
     // 2) 装饰：标题分隔线、计数面板、状态栏
-    dl.rect(d, 20.0, 42.0, 320.0, 1.0, tint(uth.border(g_theme)))
-    dl.rect(d, 20.0, 52.0, 320.0, 44.0, tint(uth.surface(g_theme)))
-    dl.rect(d, 0.0, 200.0, 360.0, 60.0, tint(uth.surface(g_theme)))
+    d = dl.rect(d, 20.0, 42.0, 320.0, 1.0, tint(uth.border(g_theme)))
+    d = dl.rect(d, 20.0, 52.0, 320.0, 44.0, tint(uth.surface(g_theme)))
+    d = dl.rect(d, 0.0, 200.0, 360.0, 60.0, tint(uth.surface(g_theme)))
 
     // 3) 控件（绘制桥：UI 树 → 绘制记录）
     upaint.draw(d, g_theme, g_hot, g_active)

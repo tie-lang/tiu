@@ -163,8 +163,8 @@ func main() -> i64 {
 func render_frame(cv: Canvas) -> FrameBuf {
     var d = cvs.record(cv)
     upaint.background(d, W, H, g_theme)
-    dl.rect(d, 16.0, 44.0, 328.0, 1.0, tint(uth.border(g_theme)))
-    dl.rect(d, 0.0, 236.0, 360.0, 44.0, tint(uth.surface(g_theme)))
+    d = dl.rect(d, 16.0, 44.0, 328.0, 1.0, tint(uth.border(g_theme)))
+    d = dl.rect(d, 0.0, 236.0, 360.0, 44.0, tint(uth.surface(g_theme)))
     upaint.draw(d, g_theme, g_hot, g_active)
     var ir = cvs.submit(cv, d)
     var p = eload.parse_frame(ir)
