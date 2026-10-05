@@ -43,7 +43,7 @@ pub func rd_u16(t: table<i64>, ofs: i64) -> i64 {
 }
 
 // 追加 i64 小端 8 字节（构造测试字节用）。
-pub func put_i64(out: table<i64>, v: i64) {
+pub func put_i64(ref out: table<i64>, v: i64) {
     table_push(out, v & 0xFF)
     table_push(out, (v >> 8) & 0xFF)
     table_push(out, (v >> 16) & 0xFF)
@@ -55,7 +55,7 @@ pub func put_i64(out: table<i64>, v: i64) {
 }
 
 // 追加 u8。
-pub func put_u8(out: table<i64>, v: i64) {
+pub func put_u8(ref out: table<i64>, v: i64) {
     table_push(out, v & 0xFF)
 }
 
@@ -68,12 +68,12 @@ pub func q16(v: f64) -> i64 {
 }
 
 // 追加 Q16 定点。
-pub func put_q(out: table<i64>, v: f64) {
+pub func put_q(ref out: table<i64>, v: f64) {
     put_i64(out, q16(v))
 }
 
 // 追加字符串：len + UTF-8 字节。
-pub func put_str(out: table<i64>, s: string) {
+pub func put_str(ref out: table<i64>, s: string) {
     var n = str_len(s)
     put_i64(out, n)
     var i: i64 = 0

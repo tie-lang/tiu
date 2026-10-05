@@ -27,12 +27,12 @@ pub func q16_f(v: i64) -> f64 {
 }
 
 // 追加 1 字节。
-pub func put_u8(out: table<i64>, v: i64) {
+pub func put_u8(ref out: table<i64>, v: i64) {
     table_push(out, v & 0xFF)
 }
 
 // 追加 i64 小端 8 字节。
-pub func put_i64(out: table<i64>, v: i64) {
+pub func put_i64(ref out: table<i64>, v: i64) {
     table_push(out, v & 0xFF)
     table_push(out, (v >> 8) & 0xFF)
     table_push(out, (v >> 16) & 0xFF)
@@ -44,13 +44,13 @@ pub func put_i64(out: table<i64>, v: i64) {
 }
 
 // 追加 u16 小端 2 字节。
-pub func put_u16(out: table<i64>, v: i64) {
+pub func put_u16(ref out: table<i64>, v: i64) {
     table_push(out, v & 0xFF)
     table_push(out, (v >> 8) & 0xFF)
 }
 
 // 追加字符串：len(i64) + UTF-8 字节（str_byte 内建逐字节）。
-pub func put_str(out: table<i64>, s: string) {
+pub func put_str(ref out: table<i64>, s: string) {
     var n = str_len(s)
     put_i64(out, n)
     var i: i64 = 0
@@ -61,7 +61,7 @@ pub func put_str(out: table<i64>, s: string) {
 }
 
 // 追加 Q16 定点坐标（f64 → i64）。
-pub func put_q(out: table<i64>, v: f64) {
+pub func put_q(ref out: table<i64>, v: f64) {
     put_i64(out, q16(v))
 }
 

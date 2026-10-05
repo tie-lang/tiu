@@ -291,7 +291,7 @@ func path_args_at(d: DrawList, base: i64, k: i64) -> table<f64> {
     return out
 }
 
-func append_all(out: table<i64>, src: table<i64>) {
+func append_all(ref out: table<i64>, src: table<i64>) {
     var i: i64 = 0
     while i < len(src) {
         table_push(out, src[i])
