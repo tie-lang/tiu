@@ -288,6 +288,12 @@ pub func layout(root: i64, c: Constraints) {
 pub func layout_dirty(root: i64, dirty: table<i64>) {
     // 1) 清重排标记
     g_reflow = table_new_i64()
+    // ★ 一次补齐到全部节点槽数：`mark_reflow` 只沿**被标记的祖先链**增长该表，
+    //   而 propagate/measure 按 **DFS 全序**读取 `g_reflow[n]` —— 未标记且 id 更大的
+    //   节点会落到表尾之外。此前靠「越界读返回 0」（= 未标记，语义上恰好正确）兜住，
+    //   属**依赖越界读的偶然正确**；--check-bounds 下实测于 `g_reflow[n]` 报
+    //   `index 2, len 2` 两处。补齐后读全部在界内，语义与行为完全不变。
+    ensure_len(g_reflow, tiu_tree.total() - 1)
     // 2) 标记：dirty 为空 = 全量（全部节点重排）；否则标记脏节点祖先链
     if len(dirty) == 0 {
         var order = tiu_tree.dfs_order()
