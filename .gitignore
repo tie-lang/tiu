@@ -25,3 +25,6 @@ Thumbs.db
 
 # ---- 一次性语法试验碎片 ----
 tests/_scratch/
+
+# 探针（本地工作材料，不入库）
+**/probe_*.tie
