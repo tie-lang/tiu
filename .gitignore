@@ -28,3 +28,6 @@ tests/_scratch/
 
 # 探针（本地工作材料，不入库）
 **/probe_*.tie
+# tpkg 规范
+target/
+_local_only/
