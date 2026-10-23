@@ -9,7 +9,8 @@ type tie<logic>
 //   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/ui_bridge_probe.tie -l2 -t0 -o out.exe
 import "../ui/src/ui_bridge.tie"
 import "../ui/src/tree.tie"
-import "../ui/src/layout.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
 
 var g_hits: i64 = 0
 
@@ -47,12 +48,12 @@ func main() -> i64 {
         println("FAIL tiu.count " + to_string(tc))
         return 1
     }
-    if tiu_tree.ty_of(root) != 4 {
+    if tiu_tree.ty_of(root) != 1 {
         println("FAIL root type " + to_string(tiu_tree.ty_of(root)))
         return 1
     }
-    if tiu_tree.fix_w(root) != 320 || tiu_tree.fix_h(root) != 200 {
-        println("FAIL root size")
+    if ui_bridge.window_w() != 320 || ui_bridge.window_h() != 200 {
+        println("FAIL window size " + to_string(ui_bridge.window_w()) + "x" + to_string(ui_bridge.window_h()))
         return 1
     }
     var lab = tiu_tree.first_child(root)
@@ -61,8 +62,8 @@ func main() -> i64 {
         return 1
     }
 
-    // 四、布局：绝对定位窗口按固定尺寸落地
-    tiu_layout.layout(root, Constraints.tight(320, 200))
+    // 四、布局：窗口根按视口尺寸落地
+    tiu_layout2.layout(root, 320, 200)
     var rr = tiu_tree.rect(root)
     if rr.w != 320 || rr.h != 200 {
         println("FAIL rect " + to_string(rr.w) + "x" + to_string(rr.h))
