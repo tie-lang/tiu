@@ -1,0 +1,67 @@
+type tie<logic, unsafe:mem>
+// form_element.tie —— 元素语法表单示例：输入框、提交按钮、校验提示随状态重算。
+// 输入内容在无输入法事件时先由外部赋值（g_user / g_mail）驱动；提交走函数值事件。
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/ui_bridge.tie"
+
+var g_user: string = ""
+var g_mail: string = ""
+var g_msg: string = "请填写用户名与邮箱"
+var g_bad: i64 = 0
+
+func on_submit(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if str_len(g_user) == 0 {
+        g_msg = "用户名不能为空"
+        g_bad = 1
+        return 1
+    }
+    if str_len(g_mail) == 0 {
+        g_msg = "邮箱不能为空"
+        g_bad = 1
+        return 1
+    }
+    g_msg = "已提交：" + g_user + " <" + g_mail + ">"
+    g_bad = 0
+    return 1
+}
+
+func view() -> i64 {
+    ui.reset()
+    @ window "tiu · form" (size: 360x300) {
+        @ column "root" (w: fill, h: fill, pad: 16, gap: 10) {
+            @ heading "title" (text: "注册")
+            @ input "user" (w: fill, h: 32, placeholder: "用户名", value: g_user)
+            @ input "mail" (w: fill, h: 32, placeholder: "邮箱", value: g_mail)
+            @ label "msg" (text: g_msg)
+            @ row "actions" (gap: 8) {
+                @ button "submit" (w: 96, h: 34, text: "提交", on_click: on_submit) { }
+            }
+        }
+    }
+    return ui.count()
+}
+
+func main() -> i64 {
+    g_user = "jiro"
+    var n = view()
+    var root = ui_bridge.build_at(360, 300)
+    var r = tiu_tree.rect(root)
+    println("节点数=" + to_string(n) + " 窗口=" + to_string(r.w) + "x" + to_string(r.h))
+    println("提交前=" + ui.attr_of(ui.find("msg"), "text"))
+    // 邮箱留空：应拒绝
+    ui.fire_at(ui.find("submit"), "click", 8, 8, "click")
+    view()
+    println("缺邮箱=" + ui.attr_of(ui.find("msg"), "text"))
+    // 补齐邮箱：应通过
+    g_mail = "jiro@example.com"
+    ui.fire_at(ui.find("submit"), "click", 8, 8, "click")
+    view()
+    var ok = ui.attr_of(ui.find("msg"), "text")
+    println("提交后=" + ok)
+    if g_bad == 0 && str_has(ok, "jiro@example.com") {
+        println("form element ok")
+    }
+    return 0
+}

@@ -1,0 +1,62 @@
+type tie<logic, unsafe:mem>
+// counter_element.tie —— 元素语法最小示例：状态驱动文本 + 函数值事件。
+// 视图每帧重新写一遍元素树（声明式），文本与尺寸都按当前状态重算。
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/ui_bridge.tie"
+
+var g_count: i64 = 0
+
+// 事件处理器签名与 std/ui 的函数值事件表一致：(节点, x, y, 事件名) -> i64
+func on_inc(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_count = g_count + 1
+    return 1
+}
+
+func on_dec(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if g_count > 0 {
+        g_count = g_count - 1
+    }
+    return 1
+}
+
+// 一帧视图：清空旧描述树后按当前状态重建
+func view() -> i64 {
+    ui.reset()
+    @ window "tiu · counter" (size: 360x260) {
+        @ column "root" (w: fill, h: fill, pad: 16, gap: 8) {
+            @ heading "title" (text: "Counter")
+            @ label "value" (text: "计数 " + to_string(g_count))
+            @ row "actions" (gap: 8) {
+                @ button "inc" (w: 96, h: 36, text: "+1", on_click: on_inc) { }
+                @ button "dec" (w: 96, h: 36, text: "-1", on_click: on_dec) { }
+            }
+        }
+    }
+    return ui.count()
+}
+
+func main() -> i64 {
+    var n = view()
+    println("节点数=" + to_string(n))
+    var root = ui_bridge.build_at(360, 260)
+    var col = ui.find("root")
+    var win = ui.find("title")
+    var r = tiu_tree.rect(root)
+    println("窗口=" + to_string(r.w) + "x" + to_string(r.h))
+    println("列>标题=" + to_string(col) + ">" + to_string(win))
+    // 命中第一个按钮并触发它的 on_click
+    var b1 = ui.find("inc")
+    var v1 = ui.find("value")
+    var before = ui.attr_of(v1, "text")
+    println("点击前=" + before)
+    ui.fire_at(b1, "click", 10, 10, "click")
+    view()
+    var after = ui.attr_of(ui.find("value"), "text")
+    println("点击后=" + after + " 计数=" + to_string(g_count))
+    if g_count == 1 && after != before {
+        println("counter element ok")
+    }
+    return 0
+}

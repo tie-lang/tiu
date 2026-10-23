@@ -1,0 +1,53 @@
+type tie<logic, unsafe:mem>
+// list_element.tie —— 元素语法列表示例：控制流在元素体内生成行，删除按钮用函数值事件。
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/ui_bridge.tie"
+
+var g_rows: i64 = 5
+
+func on_del(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if g_rows > 0 {
+        g_rows = g_rows - 1
+    }
+    return 1
+}
+
+func view() -> i64 {
+    ui.reset()
+    var i: i64 = 0
+    @ window "tiu · list" (size: 360x320) {
+        @ column "root" (w: fill, h: fill, pad: 12, gap: 6) {
+            @ heading "title" (text: "列表（" + to_string(g_rows) + " 项）")
+            @ scroll "body" (w: fill, h: fill, overflow: scroll) {
+                while i < g_rows {
+                    @ row "row" (w: fill, h: 34, gap: 8, pad: 4) {
+                        @ label "txt" (text: "第 " + to_string(i + 1) + " 行")
+                        @ button "del" (w: 64, h: 26, text: "删除", on_click: on_del) { }
+                    }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    return ui.count()
+}
+
+func main() -> i64 {
+    var n = view()
+    var root = ui_bridge.build_at(360, 320)
+    var r = tiu_tree.rect(root)
+    println("节点数=" + to_string(n) + " 窗口=" + to_string(r.w) + "x" + to_string(r.h))
+    println("标题=" + ui.attr_of(ui.find("title"), "text"))
+    var first = ui.find("row")
+    var fr = tiu_tree.rect(ui_bridge.node_of_ui(first))
+    println("首行=" + to_string(fr.x) + "," + to_string(fr.y) + " " + to_string(fr.w) + "x" + to_string(fr.h))
+    ui.fire_at(ui.find("del"), "click", 4, 4, "click")
+    view()
+    println("删除后标题=" + ui.attr_of(ui.find("title"), "text"))
+    if g_rows == 4 {
+        println("list element ok")
+    }
+    return 0
+}
