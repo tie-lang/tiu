@@ -72,7 +72,7 @@ func main() -> i64 {
     }
     println("[example] tiu_host.obj ok")
 
-    // 2) 三个示例逐个构建
+    // 2) 四个示例逐个构建
     if build("counter_element") != 0 {
         return 1
     }
@@ -82,15 +82,18 @@ func main() -> i64 {
     if build("list_element") != 0 {
         return 1
     }
+    if build("gallery_element") != 0 {
+        return 1
+    }
 
-    // 3) 自检：--check 走同一条帧循环（无窗口）；--demo 开真实窗口跑 90 轮
+    // 3) 自检：--check 走同一条帧循环（无窗口）；--demo 开真实窗口跑 120 轮
     var args = "--check"
     if demo {
         args = "--demo"
     }
-    var names = ["counter_element", "form_element", "list_element"]
+    var names = ["counter_element", "form_element", "list_element", "gallery_element"]
     var i: i64 = 0
-    while i < 3 {
+    while i < 4 {
         var exe = g_out + "\\" + names[i] + ".exe " + args
         var rc = sh(exe)
         if rc != 0 {
@@ -98,6 +101,6 @@ func main() -> i64 {
         }
         i = i + 1
     }
-    println("[example] all three examples ok (" + args + ")")
+    println("[example] all four examples ok (" + args + ")")
     return 0
 }

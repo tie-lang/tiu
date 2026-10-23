@@ -1,0 +1,223 @@
+type tie<logic, unsafe:mem>
+// examples/gallery_element.tie —— tiu 示例：组件画廊（元素语法 + 统一帧循环）
+// ============================================================
+// EN: tiu sample — a small widget gallery written in element syntax on the
+// unified frame loop.
+//
+// 这个示例是给「读代码」用的：一屏之内把 tiu 的分层、元素语法、布局属性、
+// 事件派发与状态驱动重绘都走一遍，且不依赖任何手算坐标。
+//
+// 分层（自上而下）：
+//   元素语法  @ window / @ column / @ row / @ label / @ heading / @ button
+//             由 tiec 降解成 std/ui 的中立描述树（ui.begin/attr_str/on/...）
+//   std/ui   只描述「有什么控件、什么属性、什么事件」，不认识像素
+//   ui_bridge 把中立树翻成 tiu 骨架 + 类型化属性，并跑布局求解
+//   layout2  fill / hug / 百分比 / 间距 / 内边距 / 轴分布
+//   paint    面板、圆角、文本（TTF）、裁剪
+//   raster   软件光栅 → 帧缓冲 → 宿主上屏
+//
+// 运行（tiu 仓根）：
+//   build\host\gallery.exe           打开窗口，一直运行到关窗
+//   build\host\gallery.exe --demo    跑 120 轮后自动退出（冒烟/录屏）
+//   build\host\gallery.exe --check   无窗口自检：同一条帧循环 + 像素断言
+//
+// 构建（与其它示例相同；需要 clang 与已编好的平台壳）：
+//   见 examples/build.tie 的链路：tiec --emit-ir → clang -c → clang 链接
+//
+// EN: frame loop is shared; --check runs the same loop headlessly and asserts pixels.
+
+import "../ui/src/window_host.tie"
+import "../ui/src/tree.tie"
+import "../ui/src/ui_bridge.tie"
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+import "/std/args.tie"
+
+const W: i64 = 460
+const H: i64 = 340
+const FONT: string = "C:/Windows/Fonts/consola.ttf"
+
+// ---- 应用状态（应用层持有；框架不托管状态）----
+var g_count: i64 = 0          // 计数器
+var g_pick: string = "无"      // 列表选中项
+var g_frames: i64 = 0         // 视图被调用的帧数（自检用）
+
+// ---- 事件处理器：签名由 std/ui 约定 (节点, x, y, 事件名) -> i64 ----
+func on_inc(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_count = g_count + 1
+    return 1
+}
+
+func on_dec(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if g_count > 0 {
+        g_count = g_count - 1
+    }
+    return 1
+}
+
+func on_reset(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_count = 0
+    return 1
+}
+
+// 列表项：用同一个处理器、按节点名区分选中项——事件里拿到的就是节点 id。
+func on_pick_a(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "选项 A"
+    return 1
+}
+
+func on_pick_b(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "选项 B"
+    return 1
+}
+
+func on_pick_c(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "选项 C"
+    return 1
+}
+
+// ---- 视图：整棵树用元素语法写，没有任何手算坐标 ----
+// 布局属性含义：
+//   size: 460x340   窗口逻辑尺寸（也是 fill 的基准）
+//   w: fill         横向铺满父容器；h 不写 = hug（贴合内容高度）
+//   pad: 16         内边距；gap: 10 子项间距
+//   x: space-between / center / end   主轴分布（行内水平、列内垂直）
+//   font-size: 20   文本字号（TTF 度量与绘制同源，所以布局盒就是真实字宽）
+pub func view() -> i64 {
+    g_frames = g_frames + 1
+    ui.reset()
+    @ window "tiu · 组件画廊" (size: 460x340) {
+        @ column "root" (w: fill, h: fill, pad: 16, gap: 10) {
+            // 标题行：标题靠左、计数徽标靠右
+            @ row "head" (w: fill, x: space-between) {
+                @ heading "title" (text: "tiu · 组件画廊", font-size: 20) { }
+                @ label "badge" (text: "软件光栅 · 实时", font-size: 12) { }
+            }
+
+            @ label "hint" (text: "元素语法写视图，布局与绘制都在框架内；点按钮试事件。") { }
+
+            // 计数器：三个按钮 + 一个读数
+            @ row "counter" (w: fill, gap: 8) {
+                @ button "inc" (text: "+1", w: 72, h: 30, on_click: on_inc) { }
+                @ button "dec" (text: "-1", w: 72, h: 30, on_click: on_dec) { }
+                @ button "reset" (text: "归零", w: 72, h: 30, on_click: on_reset) { }
+                @ label "count" (text: "计数 " + to_string(g_count), font-size: 16) { }
+            }
+
+            // 列表：滚动容器里放三个可选项，点谁谁高亮选中
+            @ scroll "list" (w: fill, h: 96) {
+                @ column "items" (w: fill, gap: 6) {
+                    @ button "pa" (text: "选项 A", w: fill, h: 30, on_click: on_pick_a) { }
+                    @ button "pb" (text: "选项 B", w: fill, h: 30, on_click: on_pick_b) { }
+                    @ button "pc" (text: "选项 C", w: fill, h: 30, on_click: on_pick_c) { }
+                }
+            }
+
+            @ label "picked" (text: "当前选中：" + g_pick, font-size: 14) { }
+
+            // 页脚：靠右的说明文字（x: end 就是主轴末端对齐）
+            @ row "foot" (w: fill, x: end) {
+                @ label "ver" (text: "tiu ui · software raster", font-size: 12) { }
+            }
+        }
+    }
+    return ui.count()
+}
+
+// ---- 自检：不建窗口，但走与真实运行完全相同的 frame/render ----
+func check() -> i64 {
+    tiu_win.theme(0)
+    var face = tiu_win.load_font(FONT)
+    if face < 0 {
+        println("FAIL 字体装载")
+        return 1
+    }
+    var bad: i64 = 0
+
+    var segs = tiu_win.frame(W, H, view)
+    if segs <= 0 {
+        println("FAIL 首帧无绘制段 segs=" + to_string(segs))
+        bad = bad + 1
+    }
+    var fb = tiu_win.render(W, H)
+    var bg = tiu_win.px(fb, 1, 1)
+
+    // 1) 按钮真的画出墨迹（文本 + 面板），且用的是布局求出来的矩形
+    var inc = ui_bridge.node_of_ui(ui.find("inc"))
+    var r = tiu_tree.rect(inc)
+    var ink = tiu_win.ink(fb, r.x + 3, r.y + 3, r.w - 6, r.h - 6, bg)
+    if ink <= 0 {
+        println("FAIL 按钮无墨迹 rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
+        bad = bad + 1
+    } else {
+        println("OK 按钮有墨迹 ink=" + to_string(ink) + " rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
+    }
+
+    // 2) 点击走事件轴 → 状态变化 → 下一帧文本更新
+    var cx = r.x + r.w / 2
+    var cy = r.y + r.h / 2
+    tiu_app.on_mouse_move(cx, cy)
+    tiu_app.on_mouse_down(cx, cy)
+    tiu_app.on_mouse_up(cx, cy)
+    var segs2 = tiu_win.frame(W, H, view)
+    var txt = ui.attr_of(ui.find("count"), "text")
+    if g_count != 1 {
+        println("FAIL 计数未增加 count=" + to_string(g_count))
+        bad = bad + 1
+    } else if txt != "计数 1" {
+        println("FAIL 文本未更新 text=" + txt)
+        bad = bad + 1
+    } else if segs2 <= 0 {
+        println("FAIL 事件帧无绘制段")
+        bad = bad + 1
+    } else {
+        println("OK 点击后重绘 segs=" + to_string(segs2) + " text=" + txt)
+    }
+
+    // 3) 列表项点击：选中项进状态
+    var pb = ui_bridge.node_of_ui(ui.find("pb"))
+    var rb = tiu_tree.rect(pb)
+    tiu_app.on_mouse_move(rb.x + rb.w / 2, rb.y + rb.h / 2)
+    tiu_app.on_mouse_down(rb.x + rb.w / 2, rb.y + rb.h / 2)
+    tiu_app.on_mouse_up(rb.x + rb.w / 2, rb.y + rb.h / 2)
+    tiu_win.frame(W, H, view)
+    var picked = ui.attr_of(ui.find("picked"), "text")
+    if g_pick != "选项 B" {
+        println("FAIL 列表选择未生效 pick=" + g_pick)
+        bad = bad + 1
+    } else {
+        println("OK 列表选择 picked=" + picked)
+    }
+
+    // 4) 空闲帧零重绘：没有事件、没有状态变化就不产生绘制段
+    var segs3 = tiu_win.frame(W, H, view)
+    if segs3 != 0 {
+        println("FAIL 空闲帧仍有绘制段 segs=" + to_string(segs3))
+        bad = bad + 1
+    } else {
+        println("OK 空闲帧零段 " + tiu_win.report())
+    }
+
+    if bad == 0 {
+        println("gallery ok")
+    }
+    return bad
+}
+
+func main() -> i64 {
+    if args.has("--check") {
+        return check()
+    }
+    var rounds: i64 = 0
+    if args.has("--demo") {
+        rounds = 120
+    }
+    tiu_win.theme(0)
+    tiu_win.load_font(FONT)
+    return tiu_win_host.run("tiu · 组件画廊", W, H, rounds, view)
+}
