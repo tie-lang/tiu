@@ -20,12 +20,12 @@ import "./tabutil.tie"
 // Storage: dual tables ops (command codes) + args (flat parameter
 // segments); arg counts derived per opcode.
 
-const P_MOVE: i64 = 1
-const P_LINE: i64 = 2
-const P_QUAD: i64 = 3
-const P_CUBIC: i64 = 4
-const P_ARC: i64 = 5
-const P_CLOSE: i64 = 6
+pub const P_MOVE: i64 = 1
+pub const P_LINE: i64 = 2
+pub const P_QUAD: i64 = 3
+pub const P_CUBIC: i64 = 4
+pub const P_ARC: i64 = 5
+pub const P_CLOSE: i64 = 6
 
 struct Path {
     var ops: table<i64> = table_new_i64()

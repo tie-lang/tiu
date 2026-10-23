@@ -20,11 +20,11 @@ import "./drawlist.tie"
 import "./ir_enc.tie"
 import "./ir_cmp.tie"
 
-const CS_SRGB: i64 = 0      // 色彩空间：固定引擎工作空间（sRGB）
+pub const CS_SRGB: i64 = 0      // 色彩空间：固定引擎工作空间（sRGB）
 
-const TGT_WINDOW: i64 = 0
-const TGT_OFFSCREEN: i64 = 1
-const TGT_IMAGE: i64 = 2
+pub const TGT_WINDOW: i64 = 0
+pub const TGT_OFFSCREEN: i64 = 1
+pub const TGT_IMAGE: i64 = 2
 
 struct Canvas {
     var target: i64 = TGT_WINDOW

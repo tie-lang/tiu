@@ -26,30 +26,30 @@ import "./color.tie"
 // table fields share references (tie table assignment shares = structural
 // sharing); in-place mutation only on module-internal clones.
 
-const P_FILL_SOLID: i64 = 0
-const P_FILL_LINEAR: i64 = 1
-const P_FILL_RADIAL: i64 = 2
-const P_FILL_SWEEP: i64 = 3
-const P_FILL_IMAGE: i64 = 4
+pub const P_FILL_SOLID: i64 = 0
+pub const P_FILL_LINEAR: i64 = 1
+pub const P_FILL_RADIAL: i64 = 2
+pub const P_FILL_SWEEP: i64 = 3
+pub const P_FILL_IMAGE: i64 = 4
 
-const P_CAP_BUTT: i64 = 0
-const P_CAP_ROUND: i64 = 1
-const P_CAP_SQUARE: i64 = 2
+pub const P_CAP_BUTT: i64 = 0
+pub const P_CAP_ROUND: i64 = 1
+pub const P_CAP_SQUARE: i64 = 2
 
-const P_JOIN_MITER: i64 = 0
-const P_JOIN_ROUND: i64 = 1
-const P_JOIN_BEVEL: i64 = 2
+pub const P_JOIN_MITER: i64 = 0
+pub const P_JOIN_ROUND: i64 = 1
+pub const P_JOIN_BEVEL: i64 = 2
 
-const P_BLEND_SRC_OVER: i64 = 0
-const P_BLEND_DST_OVER: i64 = 1
-const P_BLEND_MULTIPLY: i64 = 2
-const P_BLEND_SCREEN: i64 = 3
-const P_BLEND_XOR: i64 = 4
+pub const P_BLEND_SRC_OVER: i64 = 0
+pub const P_BLEND_DST_OVER: i64 = 1
+pub const P_BLEND_MULTIPLY: i64 = 2
+pub const P_BLEND_SCREEN: i64 = 3
+pub const P_BLEND_XOR: i64 = 4
 
-const P_NO_IMAGE: i64 = 0    // 图像句柄占位（资源句柄模块五落地）
+pub const P_NO_IMAGE: i64 = 0    // 图像句柄占位（资源句柄模块五落地）
 
 // 定点标度：offset * Q16 = offset_q16。
-const P_Q16: i64 = 65536
+pub const P_Q16: i64 = 65536
 
 struct Paint {
     var fill: i64 = P_FILL_SOLID
