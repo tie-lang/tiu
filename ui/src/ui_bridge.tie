@@ -59,8 +59,15 @@ func wtype(kind: string) -> WidgetType {
     if kind == "row" {
         return WidgetType.Row
     }
-    if kind == "column" || kind == "panel" || kind == "window" || kind == "stack" {
+    if kind == "column" || kind == "panel" || kind == "window" {
         return WidgetType.Column
+    }
+    if kind == "grid" {
+        return WidgetType.Grid
+    }
+    // overlay / layer / stack 都是叠层容器：子项按 anchor + dx/dy 落位，无主轴。
+    if kind == "overlay" || kind == "layer" || kind == "stack" {
+        return WidgetType.Overlay
     }
     if kind == "button" {
         return WidgetType.Button
@@ -611,15 +618,20 @@ pub func node_of_ui(uid: i64) -> i64 {
 // （实测零处理器与单处理器两种未命中场景都是 Segmentation fault，而同一形状的
 // has_fn_event 未命中能正常返回 false）。节点没有绑处理器时直接短路，等于同时把这个
 // 缺陷挡在事件派发之外；等标准库修好后本短路仍然只是省一次线性扫描。
+// 派发一个事件到节点绑定：返回值遵循事件轴（tiu_event）的传播约定——
+// 1 = 有处理器且已调用（调用方据此停止传播），0 = 无处理器（继续冒泡）。
+// 不能再用 -1 表示「没有处理器」：事件轴的 sink 把任何非 0 都当作「已处理」，
+// -1 会让事件在根节点就停下、永远到不了真正绑定处理器的子节点。
 pub func dispatch(node: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
     var uid = ui_id_of(node)
     if uid < 0 {
-        return 0 - 1
+        return 0
     }
     if !ui.has_fn_event(uid, event) {
-        return 0 - 1
+        return 0
     }
-    return ui.fire_at(uid, event, x, y, kind)
+    ui.fire_at(uid, event, x, y, kind)
+    return 1
 }
 
 // 主题 token 快捷查询（样式层尚未接入绘制，先保留查询面）

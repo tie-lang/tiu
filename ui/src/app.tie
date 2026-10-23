@@ -53,16 +53,14 @@ var g_ap_evnodes: table<i64> = []
 // 事件 sink：转发给 ui_bridge.dispatch。
 // 写成模块级函数是因为 tiu_event 的 sink 形参要函数值（不能带捕获状态）。
 //
-// 返回值要换成 tiu_event 的传播语义：sink 返回非 0 表示「已处理，停止传播」，
-// 而 ui_bridge.dispatch 用 -1 表示「没有处理器」。两者直接对接会让 -1 被当成
-// 已处理，事件在根节就停下、到不了真正绑了处理器的按钮，因此这里把 -1 翻成 0。
+// ui_bridge.dispatch 与事件轴同用「1=已处理 / 0=未处理」语义，这里只需在
+// 已处理时顺手记账（处理器已跑过 ⇒ 该节点要补段重画）。
 pub func dispatch_sink(node: i64, name: string, x: i64, y: i64, kind: string) -> i64 {
     var r = ui_bridge.dispatch(node, name, x, y, kind)
-    if r == 0 - 1 {
-        return 0
+    if r != 0 {
+        g_ap_handlers = g_ap_handlers + 1
+        push_evnode(node)
     }
-    g_ap_handlers = g_ap_handlers + 1
-    push_evnode(node)
     return r
 }
 
