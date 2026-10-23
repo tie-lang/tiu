@@ -1,0 +1,82 @@
+type tie<logic>
+// text_metrics_probe.tie —— 布局文本度量与光栅共用同一来源的验收探针
+// ============================================================
+// 判据（设计稿 §6「度量与光栅共用同一来源」）：
+//   1) 未装字体时走过渡估算 advance = 0.6em；
+//   2) 装载 TTF 后 measure_text 逐字符累加 efont.advance（26.6），
+//      与 engine/src/raster.tie 的 pen 推进同源；
+//   3) text_line_h 在装载后等于 efont.line_height。
+// EN: layout text metrics must come from the same TTF advances the raster uses.
+
+import "../ui/src/layout2.tie"
+import "../engine/src/font.tie"
+
+func main() -> i32 {
+    var fails: i64 = 0
+
+    // ---- 1) 未装字体：过渡估算 ----
+    if tiu_layout2.face() == -1 {
+        println("OK   未装字体 | face=-1")
+    } else {
+        fails = fails + 1
+        println("FAIL 初始 face 应为 -1")
+    }
+    var est = tiu_layout2.measure_text("Hello", 16)
+    if est == 3072 {
+        println("OK   估算路径 | Hello@16 = " + tiu_layout2.fp_text(est))
+    } else {
+        fails = fails + 1
+        println("FAIL 估算宽度 " + to_string(est))
+    }
+
+    // ---- 2) 装载 TTF 后走真实 advance ----
+    var face = efont.load("C:/Windows/Fonts/consola.ttf")
+    if face >= 0 {
+        println("OK   字体已装载 | face=" + to_string(face))
+    } else {
+        fails = fails + 1
+        println("FAIL 字体装载失败")
+    }
+    tiu_layout2.set_face(face)
+
+    // Consolas 等宽：16px 每字符 advance=563（26.6），5 字符 = 2815
+    var w16 = tiu_layout2.measure_text("Hello", 16)
+    if w16 == 2815 {
+        println("OK   TTF 度量累加 | Hello@16 = " + tiu_layout2.fp_text(w16))
+    } else {
+        fails = fails + 1
+        println("FAIL TTF 宽度 " + to_string(w16))
+    }
+    // 24px：advance 845，5 字符 = 4225（字号真的生效）
+    var w24 = tiu_layout2.measure_text("Hello", 24)
+    if w24 == 4225 {
+        println("OK   字号生效 | Hello@24 = " + tiu_layout2.fp_text(w24))
+    } else {
+        fails = fails + 1
+        println("FAIL 24px 宽度 " + to_string(w24))
+    }
+    // 单字符与空串
+    if tiu_layout2.measure_text("H", 16) == 563 && tiu_layout2.measure_text("", 16) == 0 {
+        println("OK   单字符/空串 | H=563 empty=0")
+    } else {
+        fails = fails + 1
+        println("FAIL 单字符或空串")
+    }
+
+    // ---- 3) 行高与光栅同源 ----
+    var lh = tiu_layout2.text_line_h(16)
+    var lh_font = efont.line_height(face, 16.0)
+    if lh == lh_font && lh == 1199 {
+        println("OK   行高同源 | " + tiu_layout2.fp_text(lh))
+    } else {
+        fails = fails + 1
+        println("FAIL 行高 lh=" + to_string(lh) + " font=" + to_string(lh_font))
+    }
+
+    if fails == 0 {
+        println("summary PASS")
+        return 0
+    }
+    println("summary FAIL " + to_string(fails))
+    return 1
+}

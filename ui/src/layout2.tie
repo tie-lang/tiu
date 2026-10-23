@@ -37,6 +37,14 @@ type tie<class>
 
 import "./tree.tie"
 import "./props.tie"
+import "../../engine/src/font.tie"
+import "../../engine/src/utfmin.tie"
+
+// 字体面（-1 = 未装载，退回过渡估算）。
+// 一旦 set_face() 装载了真实字体，measure_text/text_line_h 与光栅
+// （engine/src/raster.tie 的 text_px）走同一份 advance/line_height，
+// 即稿 §6「度量与光栅共用同一来源」。
+var g_face: i64 = -1
 
 // ---- 26.6 定点 ----
 const FP_ONE: i64 = 64
@@ -84,6 +92,16 @@ var g_win_h: i64 = 0
 var g_diag: table<string> = []
 
 namespace tiu_layout2 {
+
+// 字体面开关：装载后文本度量与光栅同源（见文件头 g_face 注释）。
+pub func set_face(f: i64) {
+    g_face = f
+}
+
+pub func face() -> i64 {
+    return g_face
+}
+
 // ============================================================
 // 定点与单位换算
 // ============================================================
@@ -346,16 +364,32 @@ pub func measure_text(s: string, font_size: i64) -> i64 {
     if n <= 0 {
         return 0
     }
+    if g_face >= 0 {
+        // 真值路径：逐字符累加 efont.advance（26.6），与光栅 pen 推进同源。
+        var fd = to_f64(fs)
+        var tot: i64 = 0
+        var i: i64 = 0
+        while i < n {
+            var cp = utfmin.to_cp(str_char(s, i))
+            tot = tot + efont.advance(g_face, cp, fd)
+            i = i + 1
+        }
+        return tot
+    }
+    // 未装字体时的过渡估算：advance(fs) = fs × 3/5 px。
     // 总宽按整串一次算（不是逐字截断再相加），保证「宽度 = Σadvance」精确成立：
     //   advance(fs) = fs × 3/5 px ⇒ 总宽 = fs × 3/5 × n，定点后一次除法。
     return (fs * 3 * FP_ONE * n) / 5;
 }
 
 // 文本单行高度 = 字号（稿 §6：行高按字号；折行未接入，见文件头 I3）
-func text_line_h(font_size: i64) -> i64 {
+pub func text_line_h(font_size: i64) -> i64 {
     var fs = font_size
     if fs <= 0 {
         fs = 16
+    }
+    if g_face >= 0 {
+        return efont.line_height(g_face, to_f64(fs))
     }
     return fs * FP_ONE
 }
