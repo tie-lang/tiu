@@ -12,7 +12,7 @@ type tie<class>
 //     的活节点即目标（倒序天然取到最深命中）。
 //   - 冒泡 = leaf → root 链（事件轴路由的冒泡阶段输入）。
 //   - 滚动命中平移（O(1) 偏移）由上层消费；本模块输出命中目标与冒泡路径。
-// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\hit.tie（探针见 tests/）
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\hit.tie（探针见 _local_only/probes/）
 
 import "./tree.tie"
 

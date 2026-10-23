@@ -34,7 +34,7 @@ type tie<class>
 // 锚点 top-start、内边距与间距 0、字号 16、圆角 0、样式 ""。
 // min/max 的默认是「不设限」，用 kind = -1 表示（0 是 hug，不能兼任哨兵）。
 //
-// 编译：tiec ui\src\props.tie --no-cache -o props.a（探针见 tests/layout_golden.tie）
+// 编译：tiec ui\src\props.tie --no-cache -o props.a（探针见 _local_only/probes/layout_golden.tie）
 
 import "./tree.tie"
 

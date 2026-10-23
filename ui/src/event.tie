@@ -18,7 +18,7 @@ type tie<class>
 //      scroll 事件；不重布局。
 // 本模块不 import 上层（ui_bridge / paint / app）：路由终点由调用方以 sink 传入，
 // 保证事件轴只依赖 树 + 命中，可在无 UI 树的情况下单测。
-// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\event.tie（探针见 tests/event_probe.tie）
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\event.tie（探针见 _local_only/probes/event_probe.tie）
 
 import "./tree.tie"
 import "./hit.tie"

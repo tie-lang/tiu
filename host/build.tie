@@ -4,7 +4,7 @@ type tie<logic>
 // ============================================================
 // 链路（沿用 ext/gfx p.6.8.9-6.8.12 已验证的构建范式）：
 //   1) clang-cl /MT 编 host/win32/tiu_host.cpp → tiu_host.obj（Win32 平台壳）
-//   2) tiec 编 tests/probe_host.tie --emit-ir → probe_host.ll
+//   2) tiec 编 _local_only/probes/probe_host.tie --emit-ir → probe_host.ll
 //   3) clang -c 编 .ll → probe_host.obj
 //   4) clang -fuse-ld=link 链接 probe_host.obj + tiu_host.obj + trm_lite.a
 //      + 系统库（user32 / gdi32 / shell32）+ compiler-rt → probe_host.exe

@@ -43,7 +43,7 @@ tiu 全部以 **tie 语言**实现，用自举 tiec 编译（要求本机克隆
 - `host/` 平台壳（窗口 / 消息泵 / 上屏 / 事件；tie 绑定的最小平台层，见下）
 - `examples/` 示例应用（可运行的窗口程序，见下）
 - `docs/` 设计与实施文档（从 tie-main 收拢；tie-main 侧保留原件）
-- `tests/` 探针（gold IR / gold 图 / 双模式等价 / 端到端可见闭环 / 交互闭环）
+- 探针在仓外 `_local_only/probes/`（不入库）；入库的只有 `docs/` 与示例（gold IR / gold 图 / 双模式等价 / 端到端可见闭环 / 交互闭环）
 
 ## 示例 / Examples
 

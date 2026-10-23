@@ -13,7 +13,7 @@ type tie<class>
 //   - 结构 key 前缀 = 根到节点的 slot 链（slot 是稳定兄弟定位符，widgets §4.2）。
 // 坐标：i64 逻辑坐标（逻辑空间，DPI 归一由运行时底座处理）。
 // 命名规范：命名空间内函数不加 tiu_tree_ 前缀。
-// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\tree.tie（探针见 tests/）
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\tree.tie（探针见 _local_only/probes/）
 
 // ---- 控件类型（enum 无 payload；存储为 i64 码）----
 enum WidgetType {
