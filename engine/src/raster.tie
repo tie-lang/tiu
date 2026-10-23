@@ -13,6 +13,7 @@ type tie<class>
 
 import "./semantics.tie"
 import "./glyph.tie"
+import "./font.tie"
 import "./ir_load.tie"
 import "./gold.tie"
 import "./utfmin.tie"
@@ -24,6 +25,24 @@ struct FrameBuf {
 }
 
 namespace erast {
+
+// TrueType 字体面：-2 = 未尝试加载，-1 = 加载失败（回退位图字形）。
+var g_tf_path: string = "C:/Windows/Fonts/consola.ttf"
+var g_tf_face: i64 = -2
+
+// 设置文本字体文件；下次文本绘制时惰性加载。
+pub func text_font(path: string) {
+    g_tf_path = path
+    g_tf_face = -2
+}
+
+// 当前字体面 id（< 0 表加载失败，调用方回退位图）。
+pub func text_face_id() -> i64 {
+    if g_tf_face == -2 {
+        g_tf_face = efont.load(g_tf_path)
+    }
+    return g_tf_face
+}
 
 // 渲染整帧（Parsed → FrameBuf）。op 集合：RECT/RRECT(rx=0)/TEXT
 // 纯色填充；其余 op v0 跳过（文档记录：模块二/三）。
@@ -86,9 +105,59 @@ func rect_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     }
 }
 
-// ---- 文本（5×7 位图字形 blit） ----
+// ---- 文本（TrueType 光栅字形；字号取 op 的 font-size） ----
 
 func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
+    var face = text_face_id()
+    if face < 0 {
+        text_px_bitmap(fb, p, i, color, alpha)
+        return
+    }
+    var (dx, dy) = dev(p, p.x[i], p.y[i])
+    var size = p.fs[i] * p.dpi
+    if size < 1.0 {
+        size = 1.0
+    }
+    // op 的 y = 行盒顶；字形基线 = 顶 + ascent。
+    var baseline = dy + efont.ascent(face, size)
+    var s = p.txt[i]
+    var n = str_len(s)
+    var pen = dx
+    var ci: i64 = 0
+    while ci < n {
+        var cp = utfmin.to_cp(str_char(s, ci))
+        var e = efont.glyph_raster(face, cp, size)
+        if efont.atlas_valid(e) {
+            var gx0 = i64_round(pen) + efont.atlas_bx(e)
+            var gy0 = i64_round(baseline) + efont.atlas_by(e)
+            var gw = efont.atlas_w(e)
+            var gh = efont.atlas_h(e)
+            var j: i64 = 0
+            while j < gh {
+                var k: i64 = 0
+                while k < gw {
+                    var cov = efont.atlas_cov(e, j * gw + k)
+                    if cov > 0 {
+                        var a2 = (alpha * cov + 127) / 255
+                        if a2 > 0 {
+                            put_px(fb, gx0 + k, gy0 + j, color, a2)
+                        }
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            pen = pen + to_f64(efont.atlas_adv(e)) / 64.0
+        } else {
+            pen = pen + to_f64(efont.advance(face, cp, size)) / 64.0
+        }
+        ci = ci + 1
+    }
+}
+
+// ---- 文本回退（5×7 位图字形，字体加载失败时） ----
+
+func text_px_bitmap(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     var (dx, dy) = dev(p, p.x[i], p.y[i])
     var ox = i64_round(dx)
     var oy = i64_round(dy)

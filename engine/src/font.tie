@@ -1,0 +1,1459 @@
+type tie<class, unsafe:mem>
+// engine/src/font.tie —— tiu 渲染引擎：TrueType 字体链（efont）
+// ============================================================
+// 设计边界（字体链）：只支持 TrueType `glyf` 轮廓。
+//   * 解析 sfnt 表：head / hhea / hmtx / maxp / cmap(4、12) / loca / glyf；
+//   * 复合字形递归展开（只认 ARGS_ARE_XY_VALUES 的整数偏移，深度上限 4）；
+//   * 二次贝塞尔扁平化 → 扫描线非零环绕填充 → 4×4 超采样覆盖率抗锯齿；
+//   * 不做 hinting、GPOS/GSUB、可变字体、CFF/OTF、复杂文本整形。
+//   * 字形位图进 atlas 缓存，键 =（面句柄，码位，字号）。字体文件只在
+//     load() 时读盘一次并常驻；度量查询全部走已解析表，不重复读盘。
+// EN: TrueType (glyf) only: sfnt table parsing, metrics, composite glyphs,
+// quadratic flattening + nonzero-winding scanline coverage rasterization,
+// and a per-(face, codepoint, size) atlas cache. No hinting/OTF/CFF/shaping.
+
+// ---- KERNEL32 文件读取 extern（零 Rust 桥：不经 std/fs 的 file_read 桥）----
+// 为什么不用 CRT stdio：tiec 的链接集只导入 KERNEL32（实测 `llvm-objdump -p`
+// 只列出 KERNEL32.dll），`_wfopen`/`fread`/`fclose` 这类 CRT 符号解析不到却被
+// 静默绑成空指针，首次调用即访问违例：进程崩溃、stdout 缓冲丢失、退出码 127。
+// 因此文件读取走 KERNEL32：CreateFileW + ReadFile + CloseHandle。
+// 为什么不用 std/fs：file_read 走 tie-interp（Rust）桥，任何读字体的程序都会被
+// 拖上 tie_interp.lib 链接依赖；字体链只读字节，Win32 足够，且 CreateFileW
+// 原生吃 UTF-16 路径（与 host/src/win.tie 同一手法）。
+// 注：DWORD 形参用 i32，BOOL 返回值用 i32；`CreateFileW` 返回句柄按 i64 处理。
+unsafe extern fn CreateFileW(p0: ptr<u8>, p1: i32, p2: i32, p3: i64, p4: i32, p5: i32, p6: i64) -> i64
+unsafe extern fn ReadFile(p0: i64, p1: ptr<u8>, p2: i32, p3: ptr<u8>, p4: i64) -> i32
+unsafe extern fn CloseHandle(p0: i64) -> i32
+
+// ---------- 错误码（负数；0 表示成功） ----------
+pub const E_OK: i64 = 0
+pub const E_NO_FILE: i64 = -1
+pub const E_TOO_SMALL: i64 = -2
+pub const E_CFF: i64 = -3
+pub const E_BAD_SFNT: i64 = -4
+pub const E_NO_HEAD: i64 = -5
+pub const E_NO_HHEA: i64 = -6
+pub const E_NO_HMTX: i64 = -7
+pub const E_NO_MAXP: i64 = -8
+pub const E_NO_CMAP: i64 = -9
+pub const E_NO_LOCA: i64 = -10
+pub const E_NO_GLYF: i64 = -11
+pub const E_BAD_CMAP: i64 = -12
+pub const E_BAD_FACE: i64 = -13
+pub const E_BAD_SIZE: i64 = -14
+pub const E_FACE_FULL: i64 = -15
+pub const E_BAD_HEAD: i64 = -16
+
+// atlas 覆盖率池预算（字节）。超出时整表淘汰（见 at_flush）。
+const ATLAS_BUDGET: i64 = 16777216
+const MAX_FACES: i64 = 64
+
+// ---------- 面表（列式：一个字体面 = 各表同一行） ----------
+var g_path: table<string> = []
+var g_data: table<table<i64>> = []
+var g_upem: table<i64> = []
+var g_asc: table<i64> = []
+var g_desc: table<i64> = []
+var g_fgap: table<i64> = []
+var g_ng: table<i64> = []
+var g_loca: table<table<i64>> = []
+var g_glyfo: table<i64> = []
+var g_glyfl: table<i64> = []
+var g_hmtxo: table<i64> = []
+var g_nhm: table<i64> = []
+var g_cmpo: table<i64> = []
+var g_cmpf: table<i64> = []
+
+// ---------- 轮廓收集缓冲（设备 26.6 定点，y 向下） ----------
+var g_cox: table<i64> = []
+var g_coy: table<i64> = []
+var g_of: table<i64> = []   // 1 = on-curve，0 = off-curve 控制点
+var g_oc: table<i64> = []   // 每个轮廓末点下标（含）
+
+// ---------- 扁平化后的边（x0,y0 → x1,y1，设备 26.6 定点） ----------
+var g_ex0: table<i64> = []
+var g_ey0: table<i64> = []
+var g_ex1: table<i64> = []
+var g_ey1: table<i64> = []
+
+// ---------- atlas（列式条目表 + 覆盖率池 + 开放寻址索引） ----------
+var g_af: table<i64> = []    // face
+var g_acp: table<i64> = []   // codepoint
+var g_asq: table<i64> = []   // size × 64（26.6 量化）
+var g_agid: table<i64> = []  // glyph id
+var g_aw: table<i64> = []
+var g_ah: table<i64> = []
+var g_abx: table<i64> = []   // 位图左 bearing（像素）
+var g_aby: table<i64> = []   // 位图顶 bearing（像素，相对基线向上为负）
+var g_aadv: table<i64> = []  // advance，26.6
+var g_aofs: table<i64> = []  // 覆盖率池偏移
+var g_alen: table<i64> = []  // 覆盖率字节数 = w*h
+var g_cov: table<i64> = []   // 覆盖率池（0..255）
+var g_fslots: table<i64> = [] // 索引槽：0 = 空，n = 条目下标 + 1
+
+namespace efont {
+
+// ============================================================
+// 字节读取（大端；越界返回 0，解析前已做长度校验）
+// ============================================================
+func rd_u8(d: table<i64>, o: i64) -> i64 {
+    if o < 0 || o >= len(d) {
+        return 0
+    }
+    return d[o] & 255
+}
+
+func rd_s8(d: table<i64>, o: i64) -> i64 {
+    var v = rd_u8(d, o)
+    if v >= 128 {
+        return v - 256
+    }
+    return v
+}
+
+func rd_u16(d: table<i64>, o: i64) -> i64 {
+    return (rd_u8(d, o) << 8) | rd_u8(d, o + 1)
+}
+
+func rd_s16(d: table<i64>, o: i64) -> i64 {
+    var v = rd_u16(d, o)
+    if v >= 32768 {
+        return v - 65536
+    }
+    return v
+}
+
+func rd_u32(d: table<i64>, o: i64) -> i64 {
+    var hi = rd_u16(d, o) << 16
+    return hi | rd_u16(d, o + 2)
+}
+
+// ============================================================
+// 整数辅助：向下取整除法 / 向上取整除法 / 就近取整除法
+// ============================================================
+func fdiv(a: i64, b: i64) -> i64 {
+    if b <= 0 {
+        return 0
+    }
+    if a >= 0 {
+        return a / b
+    }
+    return -((-a + b - 1) / b)
+}
+
+func cdiv(a: i64, b: i64) -> i64 {
+    return -fdiv(-a, b)
+}
+
+func div_round(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0
+    }
+    if a >= 0 {
+        return (a + b / 2) / b
+    }
+    return -((-a + b / 2) / b)
+}
+
+// 字号 → 26.6 量化单位（1 单位 = 1/64 像素）；非法返回 0。
+func size_q(size: f64) -> i64 {
+    if size <= 0.0 {
+        return 0
+    }
+    if size > 4096.0 {
+        return 0
+    }
+    return to_i64(size * 64.0 + 0.5)
+}
+
+// ============================================================
+// sfnt 表目录
+// ============================================================
+func find_table(d: table<i64>, tag: i64) -> (o: i64, l: i64) {
+    var ntab = rd_u16(d, 4)
+    var i = 0
+    while i < ntab {
+        var e = 12 + i * 16
+        if rd_u32(d, e) == tag {
+            return (rd_u32(d, e + 8), rd_u32(d, e + 12))
+        }
+        i = i + 1
+    }
+    return (-1, 0)
+}
+
+// 选择 cmap 子表：优先 (3,10) 格式 12，其次 (0,*) 格式 12；
+// 再退 (3,1)/(0,*) 格式 4，最后接受其它格式 4（含 (3,0) 符号表）。
+func pick_cmap(d: table<i64>, co: i64, cl: i64) -> (off: i64, fmt: i64) {
+    var n = rd_u16(d, co + 2)
+    if n <= 0 || n > 1024 {
+        return (-1, 0)
+    }
+    var best: i64 = -1
+    var bestscore: i64 = 0
+    var bestfmt: i64 = 0
+    var i = 0
+    while i < n {
+        var e = co + 4 + i * 8
+        var pid = rd_u16(d, e)
+        var eid = rd_u16(d, e + 2)
+        var rel = rd_u32(d, e + 4)
+        var off = co + rel
+        var score: i64 = 0
+        if off + 4 <= co + cl && off < len(d) {
+            var fmt = rd_u16(d, off)
+            if fmt == 12 && off + 16 <= len(d) {
+                if pid == 3 && eid == 10 {
+                    score = 100
+                } else if pid == 0 {
+                    score = 90
+                } else {
+                    score = 20
+                }
+            } else if fmt == 4 && off + 14 <= len(d) {
+                if pid == 3 && eid == 1 {
+                    score = 80
+                } else if pid == 0 {
+                    score = 70
+                } else if pid == 3 && eid == 0 {
+                    score = 10
+                } else {
+                    score = 5
+                }
+            }
+            if score > bestscore {
+                bestscore = score
+                best = off
+                bestfmt = fmt
+            }
+        }
+        i = i + 1
+    }
+    return (best, bestfmt)
+}
+
+// cmap 格式 4（段映射）
+func cmap4(d: table<i64>, so: i64, cp: i64) -> i64 {
+    var segx2 = rd_u16(d, so + 6)
+    if segx2 <= 0 || segx2 > 40000 {
+        return 0
+    }
+    var segs = segx2 / 2
+    var endbase = so + 14
+    var startbase = so + 16 + segx2
+    var delbase = so + 16 + segx2 * 2
+    var robase = so + 16 + segx2 * 3
+    var i = 0
+    while i < segs {
+        var ec = rd_u16(d, endbase + i * 2)
+        if cp <= ec {
+            var sc = rd_u16(d, startbase + i * 2)
+            if cp >= sc {
+                var delta = rd_s16(d, delbase + i * 2)
+                var ro = rd_u16(d, robase + i * 2)
+                if ro == 0 {
+                    return (cp + delta) & 65535
+                }
+                var gaddr = robase + i * 2 + ro + (cp - sc) * 2
+                var g = rd_u16(d, gaddr)
+                if g == 0 {
+                    return 0
+                }
+                return (g + delta) & 65535
+            }
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// cmap 格式 12（分组映射；二分查找）
+func cmap12(d: table<i64>, so: i64, cp: i64) -> i64 {
+    var ng = rd_u32(d, so + 12)
+    if ng <= 0 || ng > 500000 {
+        return 0
+    }
+    var lo: i64 = 0
+    var hi = ng - 1
+    while lo <= hi {
+        var mid = (lo + hi) / 2
+        var g = so + 16 + mid * 12
+        var s = rd_u32(d, g)
+        var e = rd_u32(d, g + 4)
+        if cp < s {
+            hi = mid - 1
+        } else if cp > e {
+            lo = mid + 1
+        } else {
+            return rd_u32(d, g + 8) + (cp - s)
+        }
+    }
+    return 0
+}
+
+// ============================================================
+// 加载：读盘一次，解析并常驻；失败返回负错误码
+// ============================================================
+// UTF-16LE 路径（双字节 NUL 结尾）写入新缓冲；调用方 free。
+unsafe func wide_path(p: string) -> ptr<u8> {
+    var n = str_len(p)
+    var buf: ptr<u8> = alloc(n * 4 + 2)
+    var o: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var cp = char_code(str_char(p, i))
+        if cp > 0xFFFF {
+            var v = cp - 0x10000
+            var hi = 0xD800 + (v >> 10)
+            var lo = 0xDC00 + (v & 0x3FF)
+            deref_write(ptr_add(buf, o), to_u8(hi & 0xFF))
+            deref_write(ptr_add(buf, o + 1), to_u8((hi >> 8) & 0xFF))
+            deref_write(ptr_add(buf, o + 2), to_u8(lo & 0xFF))
+            deref_write(ptr_add(buf, o + 3), to_u8((lo >> 8) & 0xFF))
+            o = o + 4
+        } else {
+            deref_write(ptr_add(buf, o), to_u8(cp & 0xFF))
+            deref_write(ptr_add(buf, o + 1), to_u8((cp >> 8) & 0xFF))
+            o = o + 2
+        }
+        i = i + 1
+    }
+    deref_write(ptr_add(buf, o), to_u8(0))
+    deref_write(ptr_add(buf, o + 1), to_u8(0))
+    return buf
+}
+
+// 4 字节小端整数（Win32 out 参数回读用）。
+unsafe func dword_at(p: ptr<u8>) -> i64 {
+    var v = to_i64(deref(p))
+    v = v + (to_i64(deref(ptr_add(p, 1))) << 8)
+    v = v + (to_i64(deref(ptr_add(p, 2))) << 16)
+    v = v + (to_i64(deref(ptr_add(p, 3))) << 24)
+    return v
+}
+
+// 读文件全部字节为 table<i64>；不存在/为空/读失败一律返回空表。
+// 分块读（每块 1 MiB）到 EOF：不依赖 GetFileSizeEx，也不假定单次 ReadFile 读满。
+unsafe func read_file_bytes(path: string) -> table<i64> {
+    var out = table_new_i64()
+    var wp = wide_path(path)
+    // dwDesiredAccess=FILE_READ_DATA(1)、dwShareMode=读/写/删(7)、
+    // OPEN_EXISTING(3)、FILE_ATTRIBUTE_NORMAL(0x80)。
+    var h = CreateFileW(wp, 1, 7, 0, 3, 0x80, 0)
+    free(wp)
+    if h == 0 || h == -1 {
+        return out
+    }
+    var buf: ptr<u8> = alloc(1048576)
+    var nb: ptr<u8> = alloc(4)
+    deref_write(nb, to_u8(0))
+    deref_write(ptr_add(nb, 1), to_u8(0))
+    deref_write(ptr_add(nb, 2), to_u8(0))
+    deref_write(ptr_add(nb, 3), to_u8(0))
+    var alive = 1
+    while alive == 1 {
+        var ok = ReadFile(h, buf, 1048576, nb, 0)
+        var got = dword_at(nb)
+        if ok == 0 || got <= 0 {
+            alive = 0
+        } else {
+            var i: i64 = 0
+            while i < got {
+                table_push(out, to_i64(deref(ptr_add(buf, i))))
+                i = i + 1
+            }
+            if got < 1048576 {
+                alive = 0
+            }
+        }
+    }
+    free(nb)
+    free(buf)
+    CloseHandle(h)
+    return out
+}
+
+pub func load(path: string) -> i64 {
+    if len(g_path) >= MAX_FACES {
+        return E_FACE_FULL
+    }
+    var d: table<i64> = []
+    unsafe { d = read_file_bytes(path) }
+    var n = len(d)
+    if n == 0 {
+        return E_NO_FILE
+    }
+    if n < 12 {
+        return E_TOO_SMALL
+    }
+    var ver = rd_u32(d, 0)
+    if ver == 0x4F54544F {      // OTTO → CFF/OTF
+        return E_CFF
+    }
+    if ver != 0x00010000 && ver != 0x74727565 {
+        return E_BAD_SFNT
+    }
+    var ntab = rd_u16(d, 4)
+    if ntab <= 0 || ntab > 512 || 12 + ntab * 16 > n {
+        return E_BAD_SFNT
+    }
+
+    // head
+    var (ho, hl) = find_table(d, 0x68656164)
+    if ho <= 0 || hl < 54 || ho + 54 > n {
+        return E_NO_HEAD
+    }
+    if rd_u32(d, ho + 12) != 0x5F0F3CF5 {
+        return E_BAD_HEAD
+    }
+    var upem = rd_u16(d, ho + 18)
+    if upem < 16 || upem > 16384 {
+        return E_BAD_HEAD
+    }
+    var locfmt = rd_s16(d, ho + 50)
+    if locfmt != 0 && locfmt != 1 {
+        return E_BAD_HEAD
+    }
+
+    // hhea
+    var (ao, al) = find_table(d, 0x68686561)
+    if ao <= 0 || al < 36 || ao + 36 > n {
+        return E_NO_HHEA
+    }
+    var asc = rd_s16(d, ao + 4)
+    var desc = rd_s16(d, ao + 6)
+    var gap = rd_s16(d, ao + 8)
+    var nhm = rd_u16(d, ao + 34)
+    if nhm <= 0 {
+        return E_NO_HHEA
+    }
+
+    // maxp
+    var (mo, ml) = find_table(d, 0x6D617870)
+    if mo <= 0 || ml < 6 || mo + 6 > n {
+        return E_NO_MAXP
+    }
+    var ng = rd_u16(d, mo + 4)
+    if ng <= 0 {
+        return E_NO_MAXP
+    }
+
+    // hmtx
+    var (hmo, hml) = find_table(d, 0x686D7478)
+    if hmo <= 0 || hml <= 0 || hmo + hml > n {
+        return E_NO_HMTX
+    }
+    if nhm * 4 > hml {
+        return E_NO_HMTX
+    }
+
+    // cmap
+    var (co, cl) = find_table(d, 0x636D6170)
+    if co <= 0 || cl < 4 || co + cl > n {
+        return E_NO_CMAP
+    }
+    var (so, fmt) = pick_cmap(d, co, cl)
+    if so < 0 {
+        return E_BAD_CMAP
+    }
+    if fmt != 4 && fmt != 12 {
+        return E_BAD_CMAP
+    }
+
+    // loca
+    var (lo, ll) = find_table(d, 0x6C6F6361)
+    if lo <= 0 || ll <= 0 || lo + ll > n {
+        return E_NO_LOCA
+    }
+    var nloc = ng + 1
+    var need = nloc * 2
+    if locfmt == 1 {
+        need = nloc * 4
+    }
+    if need > ll {
+        return E_NO_LOCA
+    }
+    var loca = table_new_i64()
+    var prev: i64 = 0
+    var i = 0
+    while i < nloc {
+        var v: i64 = 0
+        if locfmt == 0 {
+            v = rd_u16(d, lo + i * 2) * 2
+        } else {
+            v = rd_u32(d, lo + i * 4)
+        }
+        if v < prev {
+            return E_NO_LOCA
+        }
+        table_push(loca, v)
+        prev = v
+        i = i + 1
+    }
+
+    // glyf
+    var (go, gl) = find_table(d, 0x676C7966)
+    if go <= 0 || gl <= 0 || go + gl > n {
+        return E_NO_GLYF
+    }
+    if prev > gl {
+        return E_NO_GLYF
+    }
+
+    // 全部校验通过后才写入面表（避免半注册面）
+    var face = len(g_path)
+    table_push(g_path, path)
+    table_push(g_data, d)
+    table_push(g_upem, upem)
+    table_push(g_asc, asc)
+    table_push(g_desc, desc)
+    table_push(g_fgap, gap)
+    table_push(g_ng, ng)
+    table_push(g_loca, loca)
+    table_push(g_glyfo, go)
+    table_push(g_glyfl, gl)
+    table_push(g_hmtxo, hmo)
+    table_push(g_nhm, nhm)
+    table_push(g_cmpo, so)
+    table_push(g_cmpf, fmt)
+    return face
+}
+
+pub func err_name(ec: i64) -> string {
+    if ec == E_OK {
+        return "ok"
+    }
+    if ec == E_NO_FILE {
+        return "E_NO_FILE: cannot read font file"
+    }
+    if ec == E_TOO_SMALL {
+        return "E_TOO_SMALL: file shorter than sfnt header"
+    }
+    if ec == E_CFF {
+        return "E_CFF: CFF/OTF outlines unsupported (glyf only)"
+    }
+    if ec == E_BAD_SFNT {
+        return "E_BAD_SFNT: bad sfnt version/table directory"
+    }
+    if ec == E_NO_HEAD {
+        return "E_NO_HEAD: missing head table"
+    }
+    if ec == E_NO_HHEA {
+        return "E_NO_HHEA: missing/short hhea table"
+    }
+    if ec == E_NO_HMTX {
+        return "E_NO_HMTX: missing/short hmtx table"
+    }
+    if ec == E_NO_MAXP {
+        return "E_NO_MAXP: missing/short maxp table"
+    }
+    if ec == E_NO_CMAP {
+        return "E_NO_CMAP: missing cmap table"
+    }
+    if ec == E_NO_LOCA {
+        return "E_NO_LOCA: missing/short/invalid loca table"
+    }
+    if ec == E_NO_GLYF {
+        return "E_NO_GLYF: missing/short glyf table"
+    }
+    if ec == E_BAD_CMAP {
+        return "E_BAD_CMAP: no usable cmap subtable (format 4 or 12)"
+    }
+    if ec == E_BAD_FACE {
+        return "E_BAD_FACE: invalid face handle"
+    }
+    if ec == E_BAD_SIZE {
+        return "E_BAD_SIZE: font size out of range (0, 4096]"
+    }
+    if ec == E_FACE_FULL {
+        return "E_FACE_FULL: face table full"
+    }
+    if ec == E_BAD_HEAD {
+        return "E_BAD_HEAD: head magic/unitsPerEm/indexToLocFormat invalid"
+    }
+    return "E_UNKNOWN"
+}
+
+pub func face_count() -> i64 {
+    return len(g_path)
+}
+
+pub func face_path(face: i64) -> string {
+    if face < 0 || face >= len(g_path) {
+        return ""
+    }
+    return g_path[face]
+}
+
+// ============================================================
+// 度量
+// ============================================================
+pub func units_per_em(face: i64) -> i64 {
+    if face < 0 || face >= len(g_upem) {
+        return 0
+    }
+    return g_upem[face]
+}
+
+// 码位 → 字形下标；未映射返回 0（.notdef）。
+pub func glyph_index(face: i64, cp: i64) -> i64 {
+    if face < 0 || face >= len(g_path) {
+        return -1
+    }
+    if cp < 0 {
+        return 0
+    }
+    var d = g_data[face]
+    var so = g_cmpo[face]
+    var fmt = g_cmpf[face]
+    var gid: i64 = 0
+    if fmt == 4 {
+        gid = cmap4(d, so, cp)
+    } else if fmt == 12 {
+        gid = cmap12(d, so, cp)
+    }
+    if gid < 0 {
+        gid = 0
+    }
+    if gid >= g_ng[face] {
+        gid = 0
+    }
+    return gid
+}
+
+pub func has_glyph(face: i64, cp: i64) -> bool {
+    var gid = glyph_index(face, cp)
+    if gid <= 0 {
+        return false
+    }
+    var loca = g_loca[face]
+    if gid + 1 >= len(loca) {
+        return false
+    }
+    return loca[gid + 1] > loca[gid]
+}
+
+// 字形下标 → advance（字体单位）
+func hmtx_adv(face: i64, gid: i64) -> i64 {
+    var nhm = g_nhm[face]
+    var ng = g_ng[face]
+    var idx = gid
+    if idx < 0 {
+        idx = 0
+    }
+    if idx >= ng {
+        idx = ng - 1
+    }
+    if idx >= nhm {
+        idx = nhm - 1
+    }
+    return rd_u16(g_data[face], g_hmtxo[face] + idx * 4)
+}
+
+func advance_gid(face: i64, gid: i64, size: f64) -> i64 {
+    if face < 0 || face >= len(g_path) {
+        return 0
+    }
+    var sq = size_q(size)
+    if sq <= 0 {
+        return 0
+    }
+    var up = g_upem[face]
+    var aw = hmtx_adv(face, gid)
+    return (aw * sq + up / 2) / up
+}
+
+// 码位 → advance（26.6 定点；1 单位 = 1/64 像素）。
+pub func advance(face: i64, cp: i64, size: f64) -> i64 {
+    var gid = glyph_index(face, cp)
+    if gid < 0 {
+        return 0
+    }
+    return advance_gid(face, gid, size)
+}
+
+// 基线以上的 ascent（像素，正数），已按字号缩放。
+pub func ascent(face: i64, size: f64) -> f64 {
+    if face < 0 || face >= len(g_asc) {
+        return 0.0
+    }
+    var up = g_upem[face]
+    if up <= 0 {
+        return 0.0
+    }
+    return to_f64(g_asc[face]) * size / to_f64(up)
+}
+
+// 基线以下的 descent（像素，负数），已按字号缩放。
+pub func descent(face: i64, size: f64) -> f64 {
+    if face < 0 || face >= len(g_desc) {
+        return 0.0
+    }
+    var up = g_upem[face]
+    if up <= 0 {
+        return 0.0
+    }
+    return to_f64(g_desc[face]) * size / to_f64(up)
+}
+
+// 行高（26.6 定点）：ascent − descent + lineGap，按字号缩放。
+pub func line_height(face: i64, size: f64) -> i64 {
+    if face < 0 || face >= len(g_asc) {
+        return 0
+    }
+    var sq = size_q(size)
+    if sq <= 0 {
+        return 0
+    }
+    var up = g_upem[face]
+    var h = g_asc[face] - g_desc[face] + g_fgap[face]
+    return (h * sq + up / 2) / up
+}
+
+// ============================================================
+// 轮廓收集（含复合字形递归）
+// ============================================================
+func glyph_collect(face: i64, gid: i64, depth: i64, a: i64, b: i64, c: i64, d: i64, dx: i64, dy: i64, sq: i64) {
+    if depth > 4 {
+        return
+    }
+    if face < 0 || face >= len(g_path) {
+        return
+    }
+    if gid < 0 || gid >= g_ng[face] {
+        return
+    }
+    var loca = g_loca[face]
+    var off = loca[gid]
+    var nxt = loca[gid + 1]
+    if nxt <= off {
+        return
+    }
+    if off >= g_glyfl[face] || nxt > g_glyfl[face] {
+        return
+    }
+    var data = g_data[face]
+    var base = g_glyfo[face] + off
+    var nc = rd_s16(data, base)
+    if nc >= 0 {
+        collect_simple(face, data, base, nc, a, b, c, d, dx, dy, sq)
+    } else {
+        collect_composite(face, data, base, depth, a, b, c, d, dx, dy, sq)
+    }
+}
+
+func collect_simple(face: i64, data: table<i64>, base: i64, nc: i64, a: i64, b: i64, c: i64, d: i64, dx: i64, dy: i64, sq: i64) {
+    if nc <= 0 || nc > 4096 {
+        return
+    }
+    var ends = table_new_i64()
+    var last: i64 = -1
+    var i = 0
+    while i < nc {
+        var e = rd_u16(data, base + 10 + i * 2)
+        if e < last || e > 100000 {
+            return
+        }
+        table_push(ends, e)
+        last = e
+        i = i + 1
+    }
+    var npts = last + 1
+    if npts <= 0 || npts > 100000 {
+        return
+    }
+    var ip = base + 10 + nc * 2
+    var il = rd_u16(data, ip)
+    var q = ip + 2 + il
+
+    // 标志（含重复位 0x08）
+    var fl = table_new_i64()
+    var guard: i64 = 0
+    while len(fl) < npts && guard < 200000 {
+        guard = guard + 1
+        var f = rd_u8(data, q)
+        q = q + 1
+        table_push(fl, f)
+        if (f & 8) != 0 {
+            var rep = rd_u8(data, q)
+            q = q + 1
+            var r: i64 = 0
+            while r < rep && len(fl) < npts {
+                table_push(fl, f)
+                r = r + 1
+            }
+        }
+    }
+    if len(fl) < npts {
+        return
+    }
+
+    // x 增量
+    var xs = table_new_i64()
+    var x: i64 = 0
+    i = 0
+    while i < npts {
+        var f = fl[i]
+        var dv: i64 = 0
+        if (f & 2) != 0 {
+            var b0 = rd_u8(data, q)
+            q = q + 1
+            if (f & 16) != 0 {
+                dv = b0
+            } else {
+                dv = -b0
+            }
+        } else if (f & 16) == 0 {
+            dv = rd_s16(data, q)
+            q = q + 2
+        }
+        x = x + dv
+        table_push(xs, x)
+        i = i + 1
+    }
+
+    // y 增量
+    var ys = table_new_i64()
+    var y: i64 = 0
+    i = 0
+    while i < npts {
+        var f = fl[i]
+        var dv: i64 = 0
+        if (f & 4) != 0 {
+            var b0 = rd_u8(data, q)
+            q = q + 1
+            if (f & 32) != 0 {
+                dv = b0
+            } else {
+                dv = -b0
+            }
+        } else if (f & 32) == 0 {
+            dv = rd_s16(data, q)
+            q = q + 2
+        }
+        y = y + dv
+        table_push(ys, y)
+        i = i + 1
+    }
+
+    // 复合变换 + 字体单位 → 设备 26.6 定点（y 向下）
+    var up = g_upem[face]
+    var base_idx = len(g_cox)
+    i = 0
+    while i < npts {
+        var fx = div_round(a * xs[i] + c * ys[i], 16384) + dx
+        var fy = div_round(b * xs[i] + d * ys[i], 16384) + dy
+        table_push(g_cox, div_round(fx * sq, up))
+        table_push(g_coy, -div_round(fy * sq, up))
+        table_push(g_of, fl[i] & 1)
+        i = i + 1
+    }
+    i = 0
+    while i < nc {
+        table_push(g_oc, base_idx + ends[i])
+        i = i + 1
+    }
+}
+
+func collect_composite(face: i64, data: table<i64>, base: i64, depth: i64, a: i64, b: i64, c: i64, d: i64, dx: i64, dy: i64, sq: i64) {
+    var p = base + 10
+    var more: i64 = 1
+    var guard: i64 = 0
+    while more != 0 && guard < 32 {
+        guard = guard + 1
+        var flags = rd_u16(data, p)
+        var cg = rd_u16(data, p + 2)
+        p = p + 4
+        // 只支持坐标偏移（ARGS_ARE_XY_VALUES）；点匹配模式停止（保留已收集部分）
+        if (flags & 2) == 0 {
+            return
+        }
+        var ax: i64 = 0
+        var ay: i64 = 0
+        if (flags & 1) != 0 {
+            ax = rd_s16(data, p)
+            ay = rd_s16(data, p + 2)
+            p = p + 4
+        } else {
+            ax = rd_s8(data, p)
+            ay = rd_s8(data, p + 1)
+            p = p + 2
+        }
+        var ca: i64 = 16384
+        var cb: i64 = 0
+        var cc: i64 = 0
+        var cd: i64 = 16384
+        if (flags & 8) != 0 {
+            ca = rd_s16(data, p)
+            cd = ca
+            p = p + 2
+        } else if (flags & 64) != 0 {
+            ca = rd_s16(data, p)
+            cd = rd_s16(data, p + 2)
+            p = p + 4
+        } else if (flags & 128) != 0 {
+            ca = rd_s16(data, p)
+            cb = rd_s16(data, p + 2)
+            cc = rd_s16(data, p + 4)
+            cd = rd_s16(data, p + 6)
+            p = p + 8
+        }
+        // 组合变换：父 M × 子 N
+        var na = div_round(a * ca + c * cb, 16384)
+        var nb = div_round(b * ca + d * cb, 16384)
+        var nc2 = div_round(a * cc + c * cd, 16384)
+        var nd = div_round(b * cc + d * cd, 16384)
+        var ndx = div_round(a * ax + c * ay, 16384) + dx
+        var ndy = div_round(b * ax + d * ay, 16384) + dy
+        glyph_collect(face, cg, depth + 1, na, nb, nc2, nd, ndx, ndy, sq)
+        more = flags & 32
+    }
+}
+
+// ============================================================
+// 扁平化：二次贝塞尔 → 折线边
+// ============================================================
+func add_seg(x0: i64, y0: i64, x1: i64, y1: i64) {
+    if y0 == y1 {
+        return
+    }
+    if len(g_ex0) >= 60000 {
+        return
+    }
+    table_push(g_ex0, x0)
+    table_push(g_ey0, y0)
+    table_push(g_ex1, x1)
+    table_push(g_ey1, y1)
+}
+
+// 二次贝塞尔 (x0,y0)-(x1,y1)-(x2,y2) 扁平化。
+// 段数 n 满足 |p0-2p1+p2|/(4n^2) <= ~0.19px（设备 12/64 px），上限 32。
+func quad(x0: i64, y0: i64, x1: i64, y1: i64, x2: i64, y2: i64) {
+    var ddx = x0 - 2 * x1 + x2
+    var ddy = y0 - 2 * y1 + y2
+    var dd = ddx * ddx + ddy * ddy
+    var n: i64 = 1
+    var stop: i64 = 0
+    while n < 32 && stop == 0 {
+        var lim = 48 * n * n
+        if dd <= lim * lim {
+            stop = 1
+        } else {
+            n = n + 1
+        }
+    }
+    var px = x0
+    var py = y0
+    var i: i64 = 1
+    while i <= n {
+        var t = (i * 65536) / n
+        var mt = 65536 - t
+        var w0 = (mt * mt) >> 16
+        var w1 = (2 * t * mt) >> 16
+        var w2 = (t * t) >> 16
+        var qx = (w0 * x0 + w1 * x1 + w2 * x2) >> 16
+        var qy = (w0 * y0 + w1 * y1 + w2 * y2) >> 16
+        add_seg(px, py, qx, qy)
+        px = qx
+        py = qy
+        i = i + 1
+    }
+    add_seg(px, py, x2, y2)
+}
+
+func emit_contour(s: i64, e: i64) {
+    var m = e - s + 1
+    if m < 2 {
+        return
+    }
+    var st: i64 = -1
+    var i = 0
+    while i < m {
+        if g_of[s + i] == 1 {
+            st = i
+            i = m
+        } else {
+            i = i + 1
+        }
+    }
+    if st < 0 {
+        // 全部为离线控制点：相邻控制点中点为隐含在线点
+        var sx = (g_cox[s + m - 1] + g_cox[s]) / 2
+        var sy = (g_coy[s + m - 1] + g_coy[s]) / 2
+        var px = sx
+        var py = sy
+        var k = 0
+        while k < m {
+            var cx = g_cox[s + k]
+            var cy = g_coy[s + k]
+            var nk = k + 1
+            if nk >= m {
+                nk = 0
+            }
+            var ex = (cx + g_cox[s + nk]) / 2
+            var ey = (cy + g_coy[s + nk]) / 2
+            quad(px, py, cx, cy, ex, ey)
+            px = ex
+            py = ey
+            k = k + 1
+        }
+        return
+    }
+    var px = g_cox[s + st]
+    var py = g_coy[s + st]
+    var startx = px
+    var starty = py
+    var j: i64 = 1
+    while j <= m {
+        var idx = st + j
+        while idx >= m {
+            idx = idx - m
+        }
+        var on = g_of[s + idx]
+        var x = g_cox[s + idx]
+        var y = g_coy[s + idx]
+        if on == 1 {
+            add_seg(px, py, x, y)
+            px = x
+            py = y
+            j = j + 1
+        } else {
+            var nidx = idx + 1
+            while nidx >= m {
+                nidx = nidx - m
+            }
+            var nx = g_cox[s + nidx]
+            var ny = g_coy[s + nidx]
+            if g_of[s + nidx] == 1 {
+                quad(px, py, x, y, nx, ny)
+                px = nx
+                py = ny
+                j = j + 2
+            } else {
+                var mx = (x + nx) / 2
+                var my = (y + ny) / 2
+                quad(px, py, x, y, mx, my)
+                px = mx
+                py = my
+                j = j + 1
+            }
+        }
+    }
+    if px != startx || py != starty {
+        add_seg(px, py, startx, starty)
+    }
+}
+
+func build_edges() {
+    g_ex0 = table_new_i64()
+    g_ey0 = table_new_i64()
+    g_ex1 = table_new_i64()
+    g_ey1 = table_new_i64()
+    var n = len(g_oc)
+    var s: i64 = 0
+    var i = 0
+    while i < n {
+        var e = g_oc[i]
+        emit_contour(s, e)
+        s = e + 1
+        i = i + 1
+    }
+}
+
+// ============================================================
+// 扫描线填充（非零环绕）+ 4×4 超采样覆盖率
+// ============================================================
+func span_acc(acc: ref table<i64>, xa: i64, xb: i64, px0: i64, w: i64) {
+    if xb <= xa || w <= 0 {
+        return
+    }
+    var p = fdiv(xa, 64)
+    var last = fdiv(xb - 1, 64)
+    if p < px0 {
+        p = px0
+    }
+    var lim = px0 + w - 1
+    if last > lim {
+        last = lim
+    }
+    while p <= last {
+        var l = p * 64
+        if l < xa {
+            l = xa
+        }
+        var r = (p + 1) * 64
+        if r > xb {
+            r = xb
+        }
+        var ov = r - l
+        if ov > 0 {
+            var idx = p - px0
+            acc[idx] = acc[idx] + ov
+        }
+        p = p + 1
+    }
+}
+
+func rasterize(w: i64, h: i64, px0: i64, py0: i64, cov: i64) {
+    var ne = len(g_ex0)
+    var acc = table_new_i64()
+    var i = 0
+    while i < w {
+        table_push(acc, 0)
+        i = i + 1
+    }
+    var xs = table_new_i64()
+    var dr = table_new_i64()
+    var row = 0
+    while row < h {
+        var k = 0
+        while k < 4 {
+            var ys = py0 * 64 + row * 64 + k * 16 + 8
+            xs = table_new_i64()
+            dr = table_new_i64()
+            var e = 0
+            while e < ne {
+                var y0i = g_ey0[e]
+                var y1i = g_ey1[e]
+                var hit: i64 = 0
+                if (y0i <= ys && y1i > ys) || (y1i <= ys && y0i > ys) {
+                    hit = 1
+                }
+                if hit == 1 {
+                    var x0i = g_ex0[e]
+                    var x1i = g_ex1[e]
+                    var xc = x0i + (ys - y0i) * (x1i - x0i) / (y1i - y0i)
+                    var dir: i64 = 1
+                    if y1i < y0i {
+                        dir = -1
+                    }
+                    var ins = len(xs)
+                    table_push(xs, xc)
+                    table_push(dr, dir)
+                    while ins > 0 && xs[ins - 1] > xc {
+                        xs[ins] = xs[ins - 1]
+                        dr[ins] = dr[ins - 1]
+                        xs[ins - 1] = xc
+                        dr[ins - 1] = dir
+                        ins = ins - 1
+                    }
+                }
+                e = e + 1
+            }
+            var wind: i64 = 0
+            var prevx: i64 = 0
+            var c = 0
+            while c < len(xs) {
+                var xnow = xs[c]
+                if wind != 0 {
+                    span_acc(acc, prevx, xnow, px0, w)
+                }
+                wind = wind + dr[c]
+                prevx = xnow
+                c = c + 1
+            }
+            k = k + 1
+        }
+        var p = 0
+        while p < w {
+            var v = (acc[p] * 255 + 128) / 256
+            if v > 255 {
+                v = 255
+            }
+            g_cov[cov + row * w + p] = v
+            acc[p] = 0
+            p = p + 1
+        }
+        row = row + 1
+    }
+}
+
+// 设备定点包围盒 → 像素包围盒（x0/y0 取向下取整）。
+func bounds() -> (minx: i64, miny: i64, maxx: i64, maxy: i64) {
+    if len(g_cox) == 0 {
+        return (0, 0, 0, 0)
+    }
+    var minx = g_cox[0]
+    var maxx = g_cox[0]
+    var miny = g_coy[0]
+    var maxy = g_coy[0]
+    var i = 1
+    while i < len(g_cox) {
+        var x = g_cox[i]
+        var y = g_coy[i]
+        if x < minx {
+            minx = x
+        }
+        if x > maxx {
+            maxx = x
+        }
+        if y < miny {
+            miny = y
+        }
+        if y > maxy {
+            maxy = y
+        }
+        i = i + 1
+    }
+    return (minx, miny, maxx, maxy)
+}
+
+// ============================================================
+// atlas 索引（开放寻址；槽值 = 条目下标 + 1）
+// ============================================================
+func at_hash(face: i64, cp: i64, sq: i64) -> i64 {
+    var h = face * 1000003
+    h = (h + cp * 131) % 2147483647
+    h = (h + sq * 17) % 2147483647
+    return h
+}
+
+func at_init() {
+    if len(g_fslots) == 0 {
+        var cap: i64 = 1024
+        var t = table_new_i64()
+        var i = 0
+        while i < cap {
+            table_push(t, 0)
+            i = i + 1
+        }
+        g_fslots = t
+    }
+}
+
+func at_grow() {
+    var cap = len(g_fslots) * 2
+    if cap < 1024 {
+        cap = 1024
+    }
+    var ns = table_new_i64()
+    var i = 0
+    while i < cap {
+        table_push(ns, 0)
+        i = i + 1
+    }
+    g_fslots = ns
+    var mask = cap - 1
+    var e = 0
+    while e < len(g_af) {
+        var h = at_hash(g_af[e], g_acp[e], g_asq[e]) & mask
+        while g_fslots[h] != 0 {
+            h = (h + 1) & mask
+        }
+        g_fslots[h] = e + 1
+        e = e + 1
+    }
+}
+
+func at_find(face: i64, cp: i64, sq: i64) -> i64 {
+    if len(g_fslots) == 0 {
+        return -1
+    }
+    var cap = len(g_fslots)
+    var mask = cap - 1
+    var h = at_hash(face, cp, sq) & mask
+    var i = 0
+    while i < cap {
+        var v = g_fslots[h]
+        if v == 0 {
+            return -1
+        }
+        var e = v - 1
+        if g_af[e] == face && g_acp[e] == cp && g_asq[e] == sq {
+            return e
+        }
+        h = (h + 1) & mask
+        i = i + 1
+    }
+    return -1
+}
+
+// 整表淘汰：覆盖率池或索引/条目表超预算时清空（文档化的唯一淘汰策略）。
+func at_flush() {
+    g_af = table_new_i64()
+    g_acp = table_new_i64()
+    g_asq = table_new_i64()
+    g_agid = table_new_i64()
+    g_aw = table_new_i64()
+    g_ah = table_new_i64()
+    g_abx = table_new_i64()
+    g_aby = table_new_i64()
+    g_aadv = table_new_i64()
+    g_aofs = table_new_i64()
+    g_alen = table_new_i64()
+    g_cov = table_new_i64()
+    g_fslots = table_new_i64()
+}
+
+func at_add(face: i64, cp: i64, sq: i64, gid: i64, w: i64, h: i64, bx: i64, by: i64, adv: i64, ofs: i64, alen: i64) -> i64 {
+    at_init()
+    if (len(g_af) + 1) * 2 >= len(g_fslots) {
+        at_grow()
+    }
+    var e = len(g_af)
+    table_push(g_af, face)
+    table_push(g_acp, cp)
+    table_push(g_asq, sq)
+    table_push(g_agid, gid)
+    table_push(g_aw, w)
+    table_push(g_ah, h)
+    table_push(g_abx, bx)
+    table_push(g_aby, by)
+    table_push(g_aadv, adv)
+    table_push(g_aofs, ofs)
+    table_push(g_alen, alen)
+    var mask = len(g_fslots) - 1
+    var hh = at_hash(face, cp, sq) & mask
+    while g_fslots[hh] != 0 {
+        hh = (hh + 1) & mask
+    }
+    g_fslots[hh] = e + 1
+    return e
+}
+
+// ============================================================
+// 字形栅格化 → atlas 条目
+// ============================================================
+pub func glyph_raster(face: i64, cp: i64, size: f64) -> i64 {
+    if face < 0 || face >= len(g_path) {
+        return E_BAD_FACE
+    }
+    var sq = size_q(size)
+    if sq <= 0 {
+        return E_BAD_SIZE
+    }
+    var e = at_find(face, cp, sq)
+    if e >= 0 {
+        return e
+    }
+    var gid = glyph_index(face, cp)
+    if gid < 0 {
+        gid = 0
+    }
+    var adv = advance_gid(face, gid, size)
+
+    g_cox = table_new_i64()
+    g_coy = table_new_i64()
+    g_of = table_new_i64()
+    g_oc = table_new_i64()
+    glyph_collect(face, gid, 0, 16384, 0, 0, 16384, 0, 0, sq)
+
+    var w: i64 = 0
+    var h: i64 = 0
+    var bx: i64 = 0
+    var by: i64 = 0
+    if len(g_cox) > 0 {
+        var (minx, miny, maxx, maxy) = bounds()
+        bx = fdiv(minx, 64)
+        by = fdiv(miny, 64)
+        w = cdiv(maxx, 64) - bx
+        h = cdiv(maxy, 64) - by
+    }
+    if w < 0 {
+        w = 0
+    }
+    if h < 0 {
+        h = 0
+    }
+    var need = w * h
+    if need > ATLAS_BUDGET {
+        w = 0
+        h = 0
+        need = 0
+    }
+
+    // 预算淘汰：清空后重新从 0 分配
+    if len(g_cov) + need > ATLAS_BUDGET || len(g_af) > 262144 {
+        at_flush()
+    }
+    var ofs = len(g_cov)
+    var z = 0
+    while z < need {
+        table_push(g_cov, 0)
+        z = z + 1
+    }
+    if w > 0 && h > 0 {
+        build_edges()
+        rasterize(w, h, bx, by, ofs)
+    }
+    return at_add(face, cp, sq, gid, w, h, bx, by, adv, ofs, need)
+}
+
+// ---------- atlas 条目访问器 ----------
+pub func atlas_valid(e: i64) -> bool {
+    if e < 0 || e >= len(g_af) {
+        return false
+    }
+    return true
+}
+
+pub func atlas_w(e: i64) -> i64 {
+    if e < 0 || e >= len(g_aw) {
+        return 0
+    }
+    return g_aw[e]
+}
+
+pub func atlas_h(e: i64) -> i64 {
+    if e < 0 || e >= len(g_ah) {
+        return 0
+    }
+    return g_ah[e]
+}
+
+pub func atlas_bx(e: i64) -> i64 {
+    if e < 0 || e >= len(g_abx) {
+        return 0
+    }
+    return g_abx[e]
+}
+
+pub func atlas_by(e: i64) -> i64 {
+    if e < 0 || e >= len(g_aby) {
+        return 0
+    }
+    return g_aby[e]
+}
+
+pub func atlas_adv(e: i64) -> i64 {
+    if e < 0 || e >= len(g_aadv) {
+        return 0
+    }
+    return g_aadv[e]
+}
+
+pub func atlas_cp(e: i64) -> i64 {
+    if e < 0 || e >= len(g_acp) {
+        return -1
+    }
+    return g_acp[e]
+}
+
+pub func atlas_gid(e: i64) -> i64 {
+    if e < 0 || e >= len(g_agid) {
+        return -1
+    }
+    return g_agid[e]
+}
+
+// 覆盖率字节（0..255）；越界返回 0。
+pub func atlas_cov(e: i64, i: i64) -> i64 {
+    if e < 0 || e >= len(g_aofs) {
+        return 0
+    }
+    if i < 0 || i >= g_alen[e] {
+        return 0
+    }
+    return g_cov[g_aofs[e] + i]
+}
+
+pub func atlas_count() -> i64 {
+    return len(g_af)
+}
+
+pub func atlas_bytes() -> i64 {
+    return len(g_cov)
+}
+
+}   // namespace efont

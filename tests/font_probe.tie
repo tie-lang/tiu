@@ -1,0 +1,144 @@
+type tie<logic>
+// tests/font_probe.tie —— TrueType 字体链探针（度量单一真源）
+// EN: TrueType font chain probe — metrics are the single source of truth.
+// ============================================================
+// 覆盖：字体加载与表解析、units_per_em、等宽字体 ASCII advance 全等、
+// 比例字体 W/i 字宽差异、advance 随字号单调、字符串宽度 = 逐字 advance 之和、
+// 字形光栅（atlas 有效/尺寸/覆盖率/窄列）、atlas 缓存命中、缺码位不崩溃、行高。
+// 编译（tie 仓根下）：
+//   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/font_probe.tie \
+//     -l2 -t0 --no-warn --no-cache -o ../tiu/_local_only/bin/font_probe.exe
+import "../engine/src/font.tie"
+import "../engine/src/utfmin.tie"
+
+var g_fail: i64 = 0
+
+func ck(name: string, ok: bool, detail: string) {
+    if ok {
+        println("OK   " + name + " | " + detail)
+    } else {
+        println("FAIL " + name + " | " + detail)
+        g_fail = g_fail + 1
+    }
+}
+
+// 单行文本宽度（26.6 定点）= 逐字 advance 之和
+func width_of(face: i64, s: string, size: f64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = 0
+    var n = str_len(s)
+    while i < n {
+        var c = str_char(s, i)
+        var cp = utfmin.to_cp(c)
+        acc = acc + efont.advance(face, cp, size)
+        i = i + 1
+    }
+    return acc
+}
+
+func main() -> i64 {
+    var mono = efont.load("C:/Windows/Fonts/consola.ttf")
+    ck("load consola", mono >= 0, "face=" + to_string(mono))
+    if mono < 0 {
+        println("summary FAIL=" + to_string(g_fail))
+        return 1
+    }
+    var aria = efont.load("C:/Windows/Fonts/arial.ttf")
+    ck("load arial", aria >= 0, "face=" + to_string(aria))
+
+    var upem = efont.units_per_em(mono)
+    ck("units_per_em", upem >= 16, "upem=" + to_string(upem))
+
+    // 一、等宽字体：ASCII 可打印区 advance 全等
+    var base = efont.advance(mono, 65, 16.0)   // 'A'
+    var bad: i64 = 0
+    var cp: i64 = 32
+    while cp <= 126 {
+        if efont.advance(mono, cp, 16.0) != base {
+            bad = bad + 1
+        }
+        cp = cp + 1
+    }
+    ck("consola ascii 等宽", bad == 0, "base=" + to_string(base) + " 偏差字符数=" + to_string(bad))
+
+    // 二、量级合理：16 px 等宽字宽 6..12 px（26.6 定点）
+    ck("advance 量级", base >= 6 * 64, "base=" + to_string(base) + " (" + to_string(base / 64) + "px)")
+    ck("advance 量级上限", base <= 12 * 64, "base=" + to_string(base))
+
+    // 三、比例字体：'W' 明显宽于 'i'
+    var aw = efont.advance(aria, 87, 16.0)
+    var ai = efont.advance(aria, 105, 16.0)
+    ck("arial W > i", aw > ai, "W=" + to_string(aw) + " i=" + to_string(ai))
+
+    // 四、advance 随字号单调增
+    var a12 = efont.advance(mono, 65, 12.0)
+    var a16 = efont.advance(mono, 65, 16.0)
+    var a24 = efont.advance(mono, 65, 24.0)
+    ck("advance 随字号单调", a12 < a16, "12px=" + to_string(a12) + " 16px=" + to_string(a16))
+    ck("advance 随字号单调二", a16 < a24, "16px=" + to_string(a16) + " 24px=" + to_string(a24))
+    var a32 = efont.advance(mono, 65, 32.0)
+    ck("advance 定点精确加倍", a32 == 2 * a16, "32px=" + to_string(a32) + " 2*16px=" + to_string(2 * a16))
+
+    // 五、字符串宽度 = 逐字之和（26.6 定点精确相等）
+    var hw = width_of(mono, "Hello", 16.0)
+    ck("Hello = 逐字之和", hw == 5 * base, "Hello=" + to_string(hw) + " 5*base=" + to_string(5 * base))
+
+    // 六、字形光栅：'l' 应是窄而高的实心柱
+    var gl = efont.glyph_raster(mono, 108, 16.0)
+    ck("raster 'l' 有效", efont.atlas_valid(gl), "entry=" + to_string(gl))
+    var gw = efont.atlas_w(gl)
+    var gh = efont.atlas_h(gl)
+    ck("'l' 高度", gh >= 8, "h=" + to_string(gh))
+    ck("'l' 宽度", gw <= 8, "w=" + to_string(gw))
+    var cov: i64 = 0
+    var narrow_rows: i64 = 0
+    var wide_rows: i64 = 0
+    var cy: i64 = 0
+    while cy < gh {
+        var cols_row: i64 = 0
+        var cx: i64 = 0
+        while cx < gw {
+            var v = efont.atlas_cov(gl, cy * gw + cx)
+            cov = cov + v
+            if v > 0 {
+                cols_row = cols_row + 1
+            }
+            cx = cx + 1
+        }
+        if cols_row > 0 {
+            if cols_row <= 4 {
+                narrow_rows = narrow_rows + 1
+            } else {
+                wide_rows = wide_rows + 1
+            }
+        }
+        cy = cy + 1
+    }
+    ck("'l' 覆盖率非零", cov > 0, "covsum=" + to_string(cov))
+    ck("'l' 竖干细", narrow_rows * 2 >= gh, "窄行=" + to_string(narrow_rows) + "/" + to_string(gh))
+    ck("'l' 横笔宽", wide_rows >= 1, "宽行=" + to_string(wide_rows))
+
+    // 七、atlas 缓存命中：同 (面, 码位, 字号) 返回同一条目
+    var gl2 = efont.glyph_raster(mono, 108, 16.0)
+    ck("atlas 缓存命中", gl == gl2, "第一次=" + to_string(gl) + " 第二次=" + to_string(gl2))
+
+    // 八、缺码位：不崩溃，且判定为无字形
+    var miss = efont.has_glyph(mono, 1114111)
+    ck("缺码位不崩溃", !miss, "has_glyph(U+10FFFF)=" + to_string(efont.glyph_index(mono, 1114111)))
+
+    // 九、行高：ascent - descent + gap，应大于半个 advance
+    var lh = efont.line_height(mono, 16.0)
+    ck("行高", lh > base / 2, "line_height=" + to_string(lh) + " (" + to_string(lh / 64) + "px)")
+    var asc = efont.ascent(mono, 16.0)
+    ck("ascent > 0", asc > 0.0, "ascent=" + to_string(asc))
+
+    // 十、atlas 规模：本例只光栅了一个字形
+    ck("atlas 条目数", efont.atlas_count() >= 1, "count=" + to_string(efont.atlas_count()))
+
+    if g_fail > 0 {
+        println("summary FAIL=" + to_string(g_fail))
+        return 1
+    }
+    println("summary PASS")
+    return 0
+}

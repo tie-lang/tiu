@@ -1,0 +1,149 @@
+type tie<logic>
+// tests/text_render_probe.tie —— TTF 文本渲染探针（绘制表 → IR → 软件光栅）
+// EN: TTF text rendering probe — draw list → IR bytes → software raster.
+// ============================================================
+// 覆盖：字体面惰性加载、文本产生墨迹、墨迹宽 ≈ advance 之和、字号真的生效
+// （同一字符串 32px 明显宽于 16px，修复「font-size 无效」）、字形宽度来自 hmtx
+// （等宽字体同 advance + 比例字体 W 明显宽于 i）、基线定位（墨迹底边贴着
+// ascent 基线）、抗锯齿（存在中间覆盖率）、空串无墨迹。
+// 编译（tie 仓根下）：
+//   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/text_render_probe.tie \
+//     -l2 -t0 --no-warn --no-cache -o ../tiu/_local_only/bin/text_render_probe.exe
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/semantics.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/font.tie"
+
+var g_fail: i64 = 0
+
+struct Ink {
+    var count: i64 = 0
+    var partial: i64 = 0
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = -1
+    var y1: i64 = -1
+}
+
+func ck(name: string, ok: bool, detail: string) {
+    if ok {
+        println("OK   " + name + " | " + detail)
+    } else {
+        println("FAIL " + name + " | " + detail)
+        g_fail = g_fail + 1
+    }
+}
+
+func ink_of(fb: FrameBuf) -> Ink {
+    var r = Ink()
+    r.x0 = 1 << 30
+    r.y0 = 1 << 30
+    var y: i64 = 0
+    while y < fb.h {
+        var x: i64 = 0
+        while x < fb.w {
+            var px = fb.px[y * fb.w + x]
+            if px != 0 {
+                r.count = r.count + 1
+                var a = sem.ch_a(px)
+                if a > 0 && a < 255 {
+                    r.partial = r.partial + 1
+                }
+                if x < r.x0 {
+                    r.x0 = x
+                }
+                if y < r.y0 {
+                    r.y0 = y
+                }
+                if x > r.x1 {
+                    r.x1 = x
+                }
+                if y > r.y1 {
+                    r.y1 = y
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return r
+}
+
+// 走完整通道：离屏画布 → 绘制表文本 → IR 字节 → loader → 软件光栅
+func render_text(s: string, size: f64, w: i64, h: i64) -> FrameBuf {
+    var cv = cvs.new_offscreen(w, h, 1.0)
+    var d = cvs.record(cv)
+    d = dl.text_p(d, s, 4.0, 4.0, size, paint.solid(color.rgba(255, 255, 255, 255)))
+    var ir = cvs.submit(cv, d)
+    var p = eload.parse_frame(ir)
+    return erast.render(p)
+}
+
+func width_of(ink: Ink) -> i64 {
+    return ink.x1 - ink.x0 + 1
+}
+
+func height_of(ink: Ink) -> i64 {
+    return ink.y1 - ink.y0 + 1
+}
+
+func main() -> i64 {
+    var face = erast.text_face_id()
+    ck("字体面可加载", face >= 0, "face=" + to_string(face))
+    if face < 0 {
+        println("summary FAIL=" + to_string(g_fail))
+        return 1
+    }
+
+    // 一、16px "Hello" 产生墨迹
+    var a = ink_of(render_text("Hello", 16.0, 120, 40))
+    ck("16px 有墨迹", a.count > 50, "墨迹像素=" + to_string(a.count))
+    var w16 = width_of(a)
+    // advance 之和 = 2815/64 ≈ 44px；墨迹左右各留约 1px 侧边距
+    ck("16px 墨迹宽接近 advance 宽", w16 >= 36, "宽=" + to_string(w16))
+    ck("16px 墨迹宽上限", w16 <= 46, "宽=" + to_string(w16))
+    var h16 = height_of(a)
+    ck("16px 墨迹高合理", h16 >= 8, "高=" + to_string(h16))
+    ck("16px 墨迹高上限", h16 <= 16, "高=" + to_string(h16))
+
+    // 二、基线定位：op 的 y=4 为行盒顶，基线 = 4 + ascent(≈11.88px) ≈ 15.9
+    //     'H' 底边应贴着基线（±2px），不会飘在行盒顶部。
+    ck("基线贴合", a.y1 >= 13, "墨迹底=" + to_string(a.y1))
+    ck("基线贴合上限", a.y1 <= 18, "墨迹底=" + to_string(a.y1))
+
+    // 三、字号真的生效：同一字符串 32px 显著宽于 16px（原缺陷：TEXT_SIZE 被忽略）
+    var b = ink_of(render_text("Hello", 32.0, 220, 60))
+    var w32 = width_of(b)
+    ck("32px 更宽", w32 >= w16 * 3 / 2, "16px=" + to_string(w16) + " 32px=" + to_string(w32))
+    ck("32px 更高", height_of(b) > h16, "16px=" + to_string(h16) + " 32px=" + to_string(height_of(b)))
+
+    // 四、字形宽度来自 hmtx，不是固定间距。两条一起才能证明宽度非硬编码：
+    //     等宽字体（默认 Consolas）下 W 与 i 的 advance 必须相同，但 ink 宽仍随字形；
+    //     比例字体（Arial）下 W 的 ink 明显宽于 i。
+    var iw = ink_of(render_text("W", 16.0, 80, 40))
+    var ii = ink_of(render_text("i", 16.0, 80, 40))
+    ck("等宽字体 W/i 同 advance", efont.advance(face, 87, 16.0) == efont.advance(face, 105, 16.0), "W=" + to_string(efont.advance(face, 87, 16.0)) + " i=" + to_string(efont.advance(face, 105, 16.0)))
+    ck("等宽字体 W 仍宽于 i", width_of(iw) > width_of(ii), "W=" + to_string(width_of(iw)) + " i=" + to_string(width_of(ii)))
+    erast.text_font("C:\\Windows\\Fonts\\arial.ttf")
+    var aw = ink_of(render_text("W", 16.0, 80, 40))
+    var ai = ink_of(render_text("i", 16.0, 80, 40))
+    ck("比例字体 W 明显宽于 i", width_of(aw) > width_of(ai) + 4, "W=" + to_string(width_of(aw)) + " i=" + to_string(width_of(ai)))
+    ck("比例字体面已切换", erast.text_face_id() != face, "face=" + to_string(erast.text_face_id()))
+
+    // 五、抗锯齿：存在中间覆盖率（非纯 0/255）
+    ck("存在抗锯齿中间灰", a.partial > 0, "中间灰像素=" + to_string(a.partial))
+
+    // 六、空串不产墨迹、不崩溃
+    var e = ink_of(render_text("", 16.0, 60, 30))
+    ck("空串无墨迹", e.count == 0, "墨迹像素=" + to_string(e.count))
+
+    if g_fail > 0 {
+        println("summary FAIL=" + to_string(g_fail))
+        return 1
+    }
+    println("summary PASS")
+    return 0
+}
