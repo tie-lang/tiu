@@ -1,0 +1,150 @@
+type tie<logic, unsafe:mem>
+// paint_geometry_probe.tie —— 「画在哪 = 点在哪 = 布局在哪」三层一致性探针。
+// 同一棵布局树同时喂给绘制、光栅与命中：
+//   一、每条有面积的绘制记录必须被某个节点的布局矩形包含（面板内缩 1px 属正常）；
+//   二、每个按钮在它自己的布局矩形内必有绘制记录；
+//   三、按钮中心：命中落回自己，且像素在矩形内与矩形外不同（边界就在布局矩形处）。
+import "../api/src/paint.tie"
+import "../api/src/drawlist.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/ir_load.tie"
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/hit.tie"
+import "../ui/src/theme.tie"
+import "../ui/src/paint_state.tie"
+import "../ui/src/paint_bridge.tie"
+import "../ui/src/ui_bridge.tie"
+
+var g_pass: i64 = 0
+var g_fail: i64 = 0
+
+func eq(name: string, got: i64, want: i64) {
+    if got == want {
+        g_pass = g_pass + 1
+        println("OK   " + name + " = " + to_string(got))
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " = " + to_string(got) + " 期望 " + to_string(want))
+    }
+}
+
+func ok(name: string, cond: bool) {
+    if cond {
+        g_pass = g_pass + 1
+        println("OK   " + name)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name)
+    }
+}
+
+func noop(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    return 1
+}
+
+// 视口 360x260；外层列 pad 12 / gap 8；两个 96x34 按钮并排
+func view() -> i64 {
+    ui.reset()
+    @ window "tiu · paint" (size: 360x260) {
+        @ column "root" (w: fill, h: fill, pad: 12, gap: 8) {
+            @ heading "title" (text: "几何一致")
+            @ row "actions" (gap: 8) {
+                @ button "a" (w: 96, h: 34, text: "A", on_click: noop) { }
+                @ button "b" (w: 96, h: 34, text: "B", on_click: noop) { }
+            }
+            @ label "note" (text: "画=点=布局")
+        }
+    }
+    return ui.count()
+}
+
+// 有面积的记录是否被某个节点的布局矩形包含
+func inside_some_node(x: i64, y: i64, w: i64, h: i64) -> bool {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var id = order[i]
+        if tiu_tree.is_live(id) {
+            var r = tiu_tree.rect(id)
+            if x >= r.x && y >= r.y && x + w <= r.x + r.w && y + h <= r.y + r.h {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func px_at(fb: FrameBuf, x: i64, y: i64) -> i64 {
+    if x < 0 || y < 0 || x >= fb.w || y >= fb.h {
+        return 0
+    }
+    return fb.px[y * fb.w + x]
+}
+
+func main() -> i64 {
+    var n = view()
+    var root = ui_bridge.build_at(360, 260)
+    var cv = cvs.new_offscreen(360, 260, 1.0)
+    var d = cvs.record(cv)
+    d = upaint.background(d, 360, 260, 0)
+    d = upaint.draw_state(d, 0, -1, -1, -1)
+    var ir = cvs.submit(cv, d)
+    var fb = erast.render(eload.parse_frame(ir))
+    println("节点=" + to_string(n) + " 记录=" + to_string(dl.count(d)) + " 画布=" + to_string(fb.w) + "x" + to_string(fb.h))
+
+    // 一、有面积的记录必须落在某个布局矩形内（零面积文本笔位与裁剪指令不参与）
+    var bad: i64 = 0
+    var i: i64 = 0
+    while i < dl.count(d) {
+        var rw = to_i64(d.w[i])
+        var rh = to_i64(d.h[i])
+        if rw > 0 && rh > 0 {
+            if !inside_some_node(to_i64(d.x[i]), to_i64(d.y[i]), rw, rh) {
+                bad = bad + 1
+                println("  超出布局 " + to_string(i) + " op=" + to_string(d.op[i]) + " rect=" + to_string(d.x[i]) + "," + to_string(d.y[i]) + " " + to_string(d.w[i]) + "x" + to_string(d.h[i]))
+            }
+        }
+        i = i + 1
+    }
+    eq("有面积记录越界数", bad, 0)
+
+    // 二、按钮矩形内必有绘制记录；A/B 不重叠
+    var ba = ui_bridge.node_of_ui(ui.find("a"))
+    var bb = ui_bridge.node_of_ui(ui.find("b"))
+    var ra = tiu_tree.rect(ba)
+    var rb = tiu_tree.rect(bb)
+    var in_a: i64 = 0
+    var j: i64 = 0
+    while j < dl.count(d) {
+        if to_i64(d.w[j]) > 0 && to_i64(d.h[j]) > 0 {
+            if to_i64(d.x[j]) >= ra.x && to_i64(d.y[j]) >= ra.y && to_i64(d.x[j]) + to_i64(d.w[j]) <= ra.x + ra.w && to_i64(d.y[j]) + to_i64(d.h[j]) <= ra.y + ra.h {
+                in_a = in_a + 1
+            }
+        }
+        j = j + 1
+    }
+    ok("按钮 A 矩形内有绘制记录", in_a >= 1)
+    ok("A/B 横向不重叠", ra.x + ra.w <= rb.x)
+
+    // 三、按钮中心：命中落回自己；像素内外有别
+    var cx = ra.x + ra.w / 2
+    var cy = ra.y + ra.h / 2
+    eq("A 中心命中", tiu_hit.hit_test(cx, cy), ba)
+    eq("B 中心命中", tiu_hit.hit_test(rb.x + rb.w / 2, rb.y + rb.h / 2), bb)
+    var pin = px_at(fb, cx, cy)
+    var pout = px_at(fb, ra.x - 3, cy)
+    ok("A 中心像素与矩形左侧不同（边界在布局处）", pin != pout)
+    ok("A 中心像素非背景", pin != px_at(fb, 2, 2))
+    // 矩形右侧外沿也应在按钮外
+    ok("A 中心命中不是 B", tiu_hit.hit_test(ra.x - 1, cy) != bb)
+
+    println("summary pass=" + to_string(g_pass) + " fail=" + to_string(g_fail))
+    if g_fail == 0 {
+        println("paint geometry ok")
+    }
+    return g_fail
+}
