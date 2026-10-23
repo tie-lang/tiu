@@ -25,9 +25,9 @@ import "../../api/src/color.tie"
 import "../../api/src/paint.tie"
 import "../../api/src/drawlist.tie"
 
-const CHAR_ADV: i64 = 8       // 位图字形步进（与引擎 glyph 一致）
-const LINE_H: i64 = 16        // 行高（布局层同值）
-const TEXT_SIZE: f64 = 16.0
+pub const CHAR_ADV: i64 = 8       // 位图字形步进（与引擎 glyph 一致）
+pub const LINE_H: i64 = 16        // 行高（布局层同值）
+pub const TEXT_SIZE: f64 = 16.0
 
 // 控件类型码缓存（避免逐节点走 switch）
 var g_ty_text: i64 = -1

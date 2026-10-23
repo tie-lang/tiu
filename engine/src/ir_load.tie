@@ -15,16 +15,16 @@ import "./irb.tie"
 import "./utfmin.tie"
 
 // 图元 op 常量（对齐 API 冻结件 PO_* 数值）。
-const E_OP_RECT: i64 = 1
-const E_OP_RRECT: i64 = 2
-const E_OP_ELLIPSE: i64 = 3
-const E_OP_ARC: i64 = 4
-const E_OP_LINE: i64 = 5
-const E_OP_PATH: i64 = 6
-const E_OP_TEXT: i64 = 7
-const E_OP_IMAGE: i64 = 8
-const E_OP_SAVE_LAYER: i64 = 100
-const E_OP_RESTORE_LAYER: i64 = 101
+pub const E_OP_RECT: i64 = 1
+pub const E_OP_RRECT: i64 = 2
+pub const E_OP_ELLIPSE: i64 = 3
+pub const E_OP_ARC: i64 = 4
+pub const E_OP_LINE: i64 = 5
+pub const E_OP_PATH: i64 = 6
+pub const E_OP_TEXT: i64 = 7
+pub const E_OP_IMAGE: i64 = 8
+pub const E_OP_SAVE_LAYER: i64 = 100
+pub const E_OP_RESTORE_LAYER: i64 = 101
 
 // 引擎内部图元表示（列式；n = len(ops)）。
 struct Parsed {
@@ -154,9 +154,9 @@ func parse_record(b: table<i64>, ofs: i64,
     var meta = read_str(b, meta_ofs + 8, meta_len)
     var next = meta_ofs + 8 + meta_len
 
-    // 图元行
-    table_push(ops, op)
-    table_push(keys, key)
+    // 图元行
+    table_push(ops, op)
+    table_push(keys, key)
     var g = geo_ofs
     if op == E_OP_RECT {
         table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
@@ -221,7 +221,7 @@ func parse_record(b: table<i64>, ofs: i64,
         table_push(x, 0.0); table_push(y, 0.0); table_push(w, 0.0); table_push(h, 0.0)
         table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
         table_push(txt, "")
-    }
+    }
 
     // paint 段：fill(8) color(8) gx0..gy1(4×8) stops_n(8) stops…
     //        stroke_w(8) cap(8) join(8) dash_n(8) dash… alpha(8)
@@ -237,10 +237,10 @@ func parse_record(b: table<i64>, ofs: i64,
     var alpha = 255
     if alpha_ofs + 8 <= paint_ofs + paint_len {
         alpha = eirb.rd_i64(b, alpha_ofs)
-    }
-    table_push(fills, fill)
-    table_push(colors, colorv)
-    table_push(alphas, alpha)
+    }
+    table_push(fills, fill)
+    table_push(colors, colorv)
+    table_push(alphas, alpha)
     return next
 }
 

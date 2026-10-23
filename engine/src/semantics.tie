@@ -18,7 +18,7 @@ type tie<class>
 // (integer math); 0/1 coverage. Every software path goes through
 // these functions only.
 
-const SEM_WORKSPACE_SRGB: i64 = 0
+pub const SEM_WORKSPACE_SRGB: i64 = 0
 
 namespace sem {
 

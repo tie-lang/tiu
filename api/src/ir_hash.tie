@@ -8,8 +8,8 @@ type tie<class>
 //
 // EN: FNV-1a 64 deterministic fingerprint for stable key derivation.
 
-const FNV_OFFSET: i64 = -3750763034362895579   // 0xcbf29ce484222325
-const FNV_PRIME: i64 = 1099511628211           // 0x100000001b3
+pub const FNV_OFFSET: i64 = -3750763034362895579   // 0xcbf29ce484222325
+pub const FNV_PRIME: i64 = 1099511628211           // 0x100000001b3
 
 namespace irh {
 

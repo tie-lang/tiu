@@ -20,18 +20,20 @@ type tie<class>
 // Value semantics, immutable. Layer record describes saveLayer bounds
 // + paint; offscreen aliasing belongs to the engine.
 
-const PO_RECT: i64 = 1
-const PO_RRECT: i64 = 2
-const PO_ELLIPSE: i64 = 3
-const PO_ARC: i64 = 4
-const PO_LINE: i64 = 5
-const PO_PATH: i64 = 6
-const PO_TEXT: i64 = 7
-const PO_IMAGE: i64 = 8
-const PO_SAVE_LAYER: i64 = 100
-const PO_RESTORE_LAYER: i64 = 101
+// 图元 op 码与图层 op 码是绘制表 IR 的公开契约（drawlist/ir_enc 与
+// 引擎 loader 都按这些常量解释记录），故显式导出。
+pub const PO_RECT: i64 = 1
+pub const PO_RRECT: i64 = 2
+pub const PO_ELLIPSE: i64 = 3
+pub const PO_ARC: i64 = 4
+pub const PO_LINE: i64 = 5
+pub const PO_PATH: i64 = 6
+pub const PO_TEXT: i64 = 7
+pub const PO_IMAGE: i64 = 8
+pub const PO_SAVE_LAYER: i64 = 100
+pub const PO_RESTORE_LAYER: i64 = 101
 
-const PO_NO_CLIP: i64 = -1   // clip 引用占位（clip 池模块二落地）
+pub const PO_NO_CLIP: i64 = -1   // clip 引用占位（clip 池模块二落地）
 
 struct Prim {
     var op: i64 = 0

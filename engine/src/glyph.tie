@@ -10,9 +10,9 @@ type tie<class>
 // EN: 5×7 bitmap glyphs (text start): glyph rows encoded as readable
 // 35-char strings; bit0 = leftmost column.
 
-const GLYPH_W: i64 = 5
-const GLYPH_H: i64 = 7
-const GLYPH_ADV: i64 = 6    // 字距（含 1 空列）
+pub const GLYPH_W: i64 = 5
+pub const GLYPH_H: i64 = 7
+pub const GLYPH_ADV: i64 = 6    // 字距（含 1 空列）
 
 namespace eglyph {
 

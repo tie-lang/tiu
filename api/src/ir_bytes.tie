@@ -9,7 +9,7 @@ type tie<class>
 // each 0-255). This module is the frozen record-layout encoder
 // (plan T2.1) consumed by both API library and render engine.
 
-const Q16: i64 = 65536
+pub const Q16: i64 = 65536
 
 namespace irb {
 
