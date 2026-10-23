@@ -5,10 +5,16 @@ type tie<class>
 // 分层契约（用户裁定）：tiec 只做语法降解；`std/ui.tie` 只做中立描述；
 // 本文件属于 tiu，负责「ui 节点 → 控件类型 + 类型化属性 → 布局求解」。
 //
-// 与旧版的区别：不再走 `tiu_build` 的 open/close 指令流（那条路只能表达
-// 「类型 + 固定宽高 + 偏移」，属性能力全靠绘制侧猜）。现在直接建 `tiu_tree`
-// 节点并把每个属性翻译进 `tiu_props` 的类型化表，然后交给 `layout2` 求解——
-// 属性是否真的生效，由布局产物（g_x/g_y/g_w/g_h）说了算。
+// 属性路径：不再让 `tiu_build` 的 open/close 指令流去表达属性（那条路只能表达
+// 「类型 + 固定宽高 + 偏移」，属性能力全靠绘制侧猜）。现在把每个属性翻译进
+// `tiu_props` 的类型化表，然后交给 `layout2` 求解——属性是否真的生效，由布局
+// 产物（g_x/g_y/g_w/g_h）说了算。
+//
+// 两条构建路径：
+//   - `build_at`：单帧路径，先 reset 树与属性表再整棵重建（一次性构建 / 探针用）。
+//   - `build_frame`：帧循环路径，不 reset 树与属性表，按 (parent, slot) 复用上一帧
+//     节点（走 `tiu_build` 的复用骨架），只更新内容与版本号。复用骨架解决的是
+//     「同一 slot 上的节点 id 要稳定」——没有稳定 id 就没有可比较的版本号。
 //
 // 属性词表来源：`std/ui.tie` 的类型化设置器把值写成规范文本（`Size.to_attr`
 // 等），本文件用 `attr_parse.tie` 解析，不自行假设文本形态。
@@ -20,6 +26,7 @@ import "./tree.tie"
 import "./props.tie"
 import "./layout2.tie"
 import "./attr_parse.tie"
+import "./build.tie"
 import "/std/ui.tie" as ui
 
 // 桥侧映射：tiu 节点 ↔ ui 节点（每帧 build() 重建）
@@ -28,6 +35,21 @@ var g_map_ui: table<i64> = []
 // 本帧视口尺寸（vw/vh 与根尺寸基准）
 var g_view_w: i64 = 0
 var g_view_h: i64 = 0
+
+// ---- 帧循环账本（build_frame 用）----
+// 节点 id 跨帧稳定（tiu_build 按 (parent, slot) 复用），所以账本按节点 id 存。
+var g_sig: table<string> = []   // node id -> 上帧内容签名
+var g_ver: table<i64> = []      // node id -> 上帧版本号
+var g_seq: i64 = 0              // 单调版本发号器（只增不减，旧号永不复用）
+// 上一帧的 (parent, slot) -> 节点：发射时按 slot 查上帧节点来比对内容签名
+var g_pp: table<i64> = []
+var g_ps: table<i64> = []
+var g_pn: table<i64> = []
+// 上一帧布局矩形：布局后比对，矩形变了也要换版本号（否则移动/改宽不重画）
+var g_prx: table<i64> = []
+var g_pry: table<i64> = []
+var g_prw: table<i64> = []
+var g_prh: table<i64> = []
 
 namespace ui_bridge {
 
@@ -209,15 +231,158 @@ func apply_props(uid: i64, node: i64) {
     }
 }
 
-// 递归发射：先建自己（父链决定顺序），再按非文本子节点顺序递归。
+// ---- (parent, slot) -> 节点 索引（上一帧的树形）----
+func find_prev_node(parent: i64, slot: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_pp) {
+        if g_pp[i] == parent && g_ps[i] == slot {
+            return g_pn[i]
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 用当前树重建 (parent, slot) -> 节点 索引（每帧 finish 之后调用）。
+func rebuild_prev_index() {
+    g_pp = table_new_i64()
+    g_ps = table_new_i64()
+    g_pn = table_new_i64()
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        table_push(g_pp, tiu_tree.parent_of(n))
+        table_push(g_ps, tiu_tree.slot_of(n))
+        table_push(g_pn, n)
+        i = i + 1
+    }
+}
+
+// 节点 id 生命周期结束（树被重置过）：清空账本，版本号从 1 重新发。
+func ledger_clear() {
+    g_sig = table_new_string()
+    g_ver = table_new_i64()
+    g_seq = 0
+    g_pp = table_new_i64()
+    g_ps = table_new_i64()
+    g_pn = table_new_i64()
+    g_prx = table_new_i64()
+    g_pry = table_new_i64()
+    g_prw = table_new_i64()
+    g_prh = table_new_i64()
+}
+
+// 取新版本号。差分只比相等，所以旧号不能复用：
+// 若把 A→B→A 的变化算成同一个号，中间那一帧就会被当成净帧漏画。
+func ub_bump() -> i64 {
+    g_seq = g_seq + 1
+    return g_seq
+}
+
+// 记下本帧某节点的内容签名与版本号。
+func remember(node: i64, sig: string, ver: i64) {
+    while len(g_sig) <= node {
+        table_push(g_sig, "")
+    }
+    g_sig[node] = sig
+    while len(g_ver) <= node {
+        table_push(g_ver, 0 - 1)
+    }
+    g_ver[node] = ver
+}
+
+// 内容签名：控件类型 + 折叠文本 + 全部属性键值。
+// 键名与值都进签名：只比文本会漏掉宽度、边距、字号一类纯属性变化。
+func sig_of(uid: i64, kind: string, s: string) -> string {
+    var sig = kind + "|" + to_string(str_len(s)) + "|" + s
+    var n = ui.attr_count(uid)
+    sig = sig + "|" + to_string(n)
+    var i: i64 = 0
+    while i < n {
+        var k = ui.attr_key_at(uid, i)
+        var v = ui.attr_val_at(uid, i)
+        sig = sig + "|" + k + "=" + to_string(str_len(v)) + ":" + v
+        i = i + 1
+    }
+    return sig
+}
+
+// 版本号决策：同 (parent, slot) 上帧节点内容签名相同 -> 沿用它的版本号（净帧），
+// 否则发新号（脏帧）。ver 必须在 tiu_build.open 之前算好：open 会无条件覆盖 ver。
+func ver_for(parent: i64, slot: i64, sig: string) -> i64 {
+    var pn = find_prev_node(parent, slot)
+    if pn >= 0 && pn < len(g_sig) && pn < len(g_ver) {
+        if g_sig[pn] == sig {
+            return g_ver[pn]
+        }
+    }
+    return ub_bump()
+}
+
+// 节点属性回到默认值：保留型树里复用的节点带着上一帧的属性，
+// 必须先清零再按本帧声明重写，否则「删掉一个属性」不会生效。
+func reset_props(node: i64) {
+    tiu_props.set_w(node, 0, 0, 0)
+    tiu_props.set_h(node, 0, 0, 0)
+    tiu_props.set_min_w(node, 0 - 1, 0)
+    tiu_props.set_max_w(node, 0 - 1, 0)
+    tiu_props.set_min_h(node, 0 - 1, 0)
+    tiu_props.set_max_h(node, 0 - 1, 0)
+    tiu_props.set_dist_x(node, 0)
+    tiu_props.set_dist_y(node, 0)
+    tiu_props.set_dx(node, 0)
+    tiu_props.set_dy(node, 0)
+    tiu_props.set_overflow(node, 0)
+    tiu_props.set_anchor(node, 0)
+    tiu_props.set_pad_all(node, 0)
+    tiu_props.set_gap(node, 0)
+    tiu_props.set_radius(node, 0)
+    tiu_props.set_font_size(node, 0)
+    tiu_props.set_style(node, "")
+    tiu_props.clear_cols(node)
+}
+
+// 布局之后调用：矩形与上一帧不同 -> 换新版本号。
+// 「没改属性但布局动了」（兄弟变宽把自己挤走、容器重新分配）只有这一处能发现，
+// 漏了就会留下残影。首次布局的节点没有上帧矩形，不补号（它本来就是新的）。
+func sync_rect_versions() {
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        var r = tiu_tree.rect(n)
+        var known = n < len(g_prx)
+        var same = false
+        if known {
+            same = g_prx[n] == r.x && g_pry[n] == r.y && g_prw[n] == r.w && g_prh[n] == r.h
+        }
+        if known && !same {
+            var v = ub_bump()
+            tiu_tree.set_ver(n, v)
+            g_ver[n] = v
+        }
+        while len(g_prx) <= n {
+            table_push(g_prx, 0)
+            table_push(g_pry, 0)
+            table_push(g_prw, 0)
+            table_push(g_prh, 0)
+        }
+        g_prx[n] = r.x
+        g_pry[n] = r.y
+        g_prw[n] = r.w
+        g_prh[n] = r.h
+        i = i + 1
+    }
+}
+
+// 递归发射：先按 (parent, slot) 复用/新建自己，再按非文本子节点的顺序递归。
+// 复用的前提是「本帧的 slot 与上帧的 slot 语义相同」——slot 取非文本子序，
+// 结构不变时等价于「同一个控件位置」。
 func emit_node(uid: i64, parent: i64, slot: i64) -> i64 {
     var kind = ui.kind_at(uid)
     var ty = wtype(kind)
-    var node = tiu_tree.mount(parent, slot, ty)
     var s = text_of(uid)
-    if s != "" {
-        tiu_tree.set_text(node, s)
-    }
     // 窗口元素：视口尺寸来自 size 属性（"320x200"），缺省沿用调用方的值。
     if kind == "window" {
         var sz = ui.attr_of(uid, "size")
@@ -232,6 +397,16 @@ func emit_node(uid: i64, parent: i64, slot: i64) -> i64 {
             }
         }
     }
+    var sig = sig_of(uid, kind, s)
+    var ver = ver_for(parent, slot, sig)
+    // 用 build 的 open 占位：内部完成「同 slot 同 type 复用 / 异 type 换节点 /
+    // 无上帧新建」，之后本节点就是当前父，子节点递归时自然挂到它下面。
+    tiu_build.open(ty, slot, ver, str_len(s), 0, 0, 0, 0)
+    var node = tiu_build.cur_id()
+    remember(node, sig, ver)
+    // 文本与属性无条件重写：复用节点会带着上一帧的旧值。
+    tiu_tree.set_text(node, s)
+    reset_props(node)
     apply_props(uid, node)
     // 映射表：按节点 id 直接下标存
     while len(g_map_node) <= node {
@@ -253,10 +428,12 @@ func emit_node(uid: i64, parent: i64, slot: i64) -> i64 {
         }
         k = k + 1
     }
+    tiu_build.close()
     return node
 }
 
 // 显式视口尺寸；供无 window 元素的场景与探针使用。
+// 单帧路径：树与属性表整体重建（节点 id 从头分配，账本一并作废）。
 pub func build_at(w: i64, h: i64) -> i64 {
     g_map_node = table_new_i64()
     g_map_ui = table_new_i64()
@@ -264,8 +441,12 @@ pub func build_at(w: i64, h: i64) -> i64 {
     g_view_h = h
     tiu_tree.reset()
     tiu_props.reset()
+    ledger_clear()
+    tiu_build.begin()
     var roots = ui.root_count()
     if roots <= 0 {
+        tiu_build.finish()
+        rebuild_prev_index()
         return 0 - 1
     }
     var root = 0 - 1
@@ -273,7 +454,11 @@ pub func build_at(w: i64, h: i64) -> i64 {
         root = emit_node(ui.root_at(0), 0 - 1, 0)
     } else {
         // 多根：合成一个占满视口的列容器，保持「单根 + 求解」的不变量。
-        root = tiu_tree.mount(0 - 1, 0 - 1, WidgetType.Column)
+        var rver = ub_bump()
+        tiu_build.open(WidgetType.Column, 0 - 1, rver, 0, 0, 0, 0, 0)
+        root = tiu_build.cur_id()
+        remember(root, "synthetic|column", rver)
+        reset_props(root)
         tiu_props.set_w(root, 1, 0, 0)
         tiu_props.set_h(root, 1, 0, 0)
         var i: i64 = 0
@@ -281,13 +466,70 @@ pub func build_at(w: i64, h: i64) -> i64 {
             emit_node(ui.root_at(i), root, i)
             i = i + 1
         }
+        tiu_build.close()
     }
     // 根若没有显式尺寸，按视口铺满（窗口语义）。
     if tiu_props.w_kind(root) == 0 && tiu_props.h_kind(root) == 0 {
         tiu_props.set_w(root, 1, 0, 0)
         tiu_props.set_h(root, 1, 0, 0)
     }
+    tiu_build.finish()
+    rebuild_prev_index()
     tiu_layout2.layout(root, g_view_w, g_view_h)
+    sync_rect_versions()
+    return root
+}
+
+// 构建一帧（保留型树 + slot 复用）：不重置树、不清属性表。
+// 返回根节点 id；空视图返回 -1。
+//
+// 版本号语义：节点 ver 变化 <=> 该节点需要重画。ver 由两处驱动：
+//   1) 发射时比内容签名（控件类型 + 文本 + 全部属性）；
+//   2) 布局后比矩形（宽高/位置变化也要重画，而这类变化不一定改属性）。
+// 两处任一变化就换新版本号，所以差分不会漏段，也不会无变化空烧。
+pub func build_frame(w: i64, h: i64) -> i64 {
+    g_map_node = table_new_i64()
+    g_map_ui = table_new_i64()
+    g_view_w = w
+    g_view_h = h
+    // 树被外部重置过（新生命周期）-> 节点 id 从头分配，账本必须一起清。
+    if tiu_tree.root() < 0 {
+        ledger_clear()
+    }
+    tiu_build.begin()
+    var roots = ui.root_count()
+    if roots <= 0 {
+        tiu_build.finish()
+        rebuild_prev_index()
+        return 0 - 1
+    }
+    var root = 0 - 1
+    if roots == 1 {
+        root = emit_node(ui.root_at(0), 0 - 1, 0)
+    } else {
+        var rver = ver_for(0 - 1, 0 - 1, "synthetic|column")
+        tiu_build.open(WidgetType.Column, 0 - 1, rver, 0, 0, 0, 0, 0)
+        root = tiu_build.cur_id()
+        remember(root, "synthetic|column", rver)
+        reset_props(root)
+        tiu_props.set_w(root, 1, 0, 0)
+        tiu_props.set_h(root, 1, 0, 0)
+        var i: i64 = 0
+        while i < roots {
+            emit_node(ui.root_at(i), root, i)
+            i = i + 1
+        }
+        tiu_build.close()
+    }
+    // 根若没有显式尺寸，按视口铺满（窗口语义）。
+    if tiu_props.w_kind(root) == 0 && tiu_props.h_kind(root) == 0 {
+        tiu_props.set_w(root, 1, 0, 0)
+        tiu_props.set_h(root, 1, 0, 0)
+    }
+    tiu_build.finish()
+    rebuild_prev_index()
+    tiu_layout2.layout(root, g_view_w, g_view_h)
+    sync_rect_versions()
     return root
 }
 
@@ -326,6 +568,20 @@ pub func window_h() -> i64 {
     return g_view_h
 }
 
+// 某 ui 节点对应 tiu 节点的版本号（-1 = 未映射）
+pub func ver_of_ui(uid: i64) -> i64 {
+    var node = node_of_ui(uid)
+    if node < 0 {
+        return 0 - 1
+    }
+    return tiu_tree.ver_of(node)
+}
+
+// 本帧参与的节点数（与 tiu_tree.count() 同义，便于调用方断言段数基准）
+pub func frame_count() -> i64 {
+    return tiu_tree.count()
+}
+
 // tiu 节点 → std/ui 节点（未映射返回 -1）
 pub func ui_id_of(node: i64) -> i64 {
     if node < 0 {
@@ -350,9 +606,17 @@ pub func node_of_ui(uid: i64) -> i64 {
 
 // 事件派发：把 tiu 命中节点映射回 ui 节点后交给 std/ui 的函数值事件表。
 // 返回处理器返回值；无处理器或节点未映射时返回 -1。
+//
+// 先问 has_fn_event 再 fire_at 是必要的防御：std/ui 的 fire_at 在「未命中」分支上会崩溃
+// （实测零处理器与单处理器两种未命中场景都是 Segmentation fault，而同一形状的
+// has_fn_event 未命中能正常返回 false）。节点没有绑处理器时直接短路，等于同时把这个
+// 缺陷挡在事件派发之外；等标准库修好后本短路仍然只是省一次线性扫描。
 pub func dispatch(node: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
     var uid = ui_id_of(node)
     if uid < 0 {
+        return 0 - 1
+    }
+    if !ui.has_fn_event(uid, event) {
         return 0 - 1
     }
     return ui.fire_at(uid, event, x, y, kind)

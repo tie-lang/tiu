@@ -167,8 +167,9 @@ func emit_prev_delta(pi: i64) {
     table_push(g_dnode, -1)
 }
 
-// 保存当前帧为 prev 快照（差分对照基准；帧循环中每帧调一次）
-pub func begin_frame() {
+// 清空 prev 快照（不做快照，等价于「上一帧什么都没有」）。
+// 用途：新 UI 生命周期 / 视口变化后要求整树重画时，让下一次对账无条件全脏。
+pub func clear_frame() {
     g_pparent = table_new_i64()
     g_pslot = table_new_i64()
     g_ptype = table_new_i64()
@@ -179,6 +180,23 @@ pub func begin_frame() {
     g_pw = table_new_i64()
     g_ph = table_new_i64()
     g_pidx = table_new_i64()
+}
+
+// 内部：清空帧内脏状态与段输出（diff / diff_all 共用）
+func reset_out() {
+    g_dirty = table_new_i64()
+    g_unmount = table_new_i64()
+    g_dkeys = []
+    g_drx = table_new_i64()
+    g_dry = table_new_i64()
+    g_drw = table_new_i64()
+    g_drh = table_new_i64()
+    g_dnode = table_new_i64()
+}
+
+// 保存当前帧为 prev 快照（差分对照基准；帧循环中每帧调一次）
+pub func begin_frame() {
+    clear_frame()
     var order = tiu_tree.dfs_order()
     var i: i64 = 0
     while i < len(order) {
@@ -203,14 +221,7 @@ pub func begin_frame() {
 // 差分：对照 prev 与当前树，产出增量段（T2.3：子树 key 前缀 + dirty rect）。
 // 返回段数；0 = 静态帧零编码。未变子树不产段（整树隔离）。
 pub func diff() -> i64 {
-    g_dirty = table_new_i64()
-    g_unmount = table_new_i64()
-    g_dkeys = []
-    g_drx = table_new_i64()
-    g_dry = table_new_i64()
-    g_drw = table_new_i64()
-    g_drh = table_new_i64()
-    g_dnode = table_new_i64()
+    reset_out()
     // 1) 当前树活节点对账
     var order = tiu_tree.dfs_order()
     var i: i64 = 0
@@ -282,5 +293,54 @@ pub func delta_rect(i: i64) -> Rect {
 // 第 i 段：归属节点 id（卸载段 = -1）
 pub func delta_node(i: i64) -> i64 {
     return g_dnode[i]
+}
+
+// 当前帧节点是否已判脏（diff() 之后查询；diff_all() 之后恒为真）
+pub func node_dirty(n: i64) -> bool {
+    return cur_dirty(n)
+}
+
+// 全量计划：整树重建后的首帧逐节点产段（DFS 序），矩形 = 节点自身矩形。
+// 为什么需要独立入口：diff() 遵循「一个顶层脏子树只产一条段」的增量契约，
+// 整树第一帧时所有节点都脏、只有根不是「父也脏」的子节点，于是 diff() 只产
+// 1 条段；而整树重画需要「每个节点都要画」的计划，故这里逐节点发段。
+// 输出表与访问器与 diff() 完全一致；g_dirty 同时标脏全部节点（事件段去重用）。
+pub func diff_all() -> i64 {
+    reset_out()
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        var n = order[i]
+        var r = tiu_tree.rect(n)
+        mark_cur_dirty(n)
+        table_push(g_dkeys, tiu_tree.path_of(n))
+        table_push(g_drx, r.x)
+        table_push(g_dry, r.y)
+        table_push(g_drw, r.w)
+        table_push(g_drh, r.h)
+        table_push(g_dnode, n)
+        i = i + 1
+    }
+    return len(g_dkeys)
+}
+
+// 事件状态污点段：hover / focus / scroll / press 等不体现在 ver 上的状态变化。
+// 只按节点自身矩形补一段、不做祖先上卷（状态只影响该节点本身的绘制）。
+// 前提：本帧已调用 diff() 或 diff_all()（输出表已重置）；节点不存在返回 -1。
+pub func emit_local(n: i64) -> i64 {
+    if n < 0 {
+        return -1
+    }
+    if !tiu_tree.is_live(n) {
+        return -1
+    }
+    var r = tiu_tree.rect(n)
+    table_push(g_dkeys, tiu_tree.path_of(n))
+    table_push(g_drx, r.x)
+    table_push(g_dry, r.y)
+    table_push(g_drw, r.w)
+    table_push(g_drh, r.h)
+    table_push(g_dnode, n)
+    return len(g_dkeys) - 1
 }
 }

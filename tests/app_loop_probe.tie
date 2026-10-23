@@ -1,0 +1,250 @@
+type tie<logic, unsafe:mem>
+// app_loop_probe.tie —— 帧循环探针：声明式视图 → 保留型树 → 差分重绘计划。
+// 覆盖：首帧全量、同视图空闲零重绘、内容变化产段、宽度变化产段、
+//       点击处理器执行并判脏、事件污点消费后不重复产段、视口变化整树重建。
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/diff.tie"
+import "../ui/src/event.tie"
+import "../ui/src/ui_bridge.tie"
+import "../ui/src/app.tie"
+
+var g_pass: i64 = 0
+var g_fail: i64 = 0
+var g_clicks: i64 = 0
+
+func check(name: string, got: i64, want: i64) {
+    if got == want {
+        g_pass = g_pass + 1
+        println("OK   " + name + " = " + to_string(got))
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " got=" + to_string(got) + " want=" + to_string(want))
+    }
+}
+
+// 布尔转整数，方便用同一套统计
+func b2i(b: bool) -> i64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// 元素里用 on_click: probe_click 绑定的处理器（签名与 ui.on 一致）
+pub func probe_click(node: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_clicks = g_clicks + 1
+    return 1
+}
+
+// 视图：同一份声明每帧重写一次（ui.reset + 元素块 = 调用方写视图那一步）
+func view_base() {
+    ui.reset()
+    @ app "loop" (w: fill, h: fill) {
+        @ column "col" (pad: 10, gap: 8) {
+            @ button "bump" (w: 160, h: 40, on_click: probe_click) { "count 0" }
+            @ button "other" (w: 90, h: 24) { "other" }
+        }
+    }
+}
+
+// 只改按钮文本
+func view_text() {
+    ui.reset()
+    @ app "loop" (w: fill, h: fill) {
+        @ column "col" (pad: 10, gap: 8) {
+            @ button "bump" (w: 160, h: 40, on_click: probe_click) { "count 1" }
+            @ button "other" (w: 90, h: 24) { "other" }
+        }
+    }
+}
+
+// 只改第二个按钮的宽度（列宽随之变化）
+func view_width() {
+    ui.reset()
+    @ app "loop" (w: fill, h: fill) {
+        @ column "col" (pad: 10, gap: 8) {
+            @ button "bump" (w: 160, h: 40, on_click: probe_click) { "count 0" }
+            @ button "other" (w: 200, h: 24) { "other" }
+        }
+    }
+}
+
+// 在当前帧的增量段里找某节点，返回段索引（无则 -1）
+func find_seg(n: i64) -> i64 {
+    var i: i64 = 0
+    while i < tiu_diff.delta_count() {
+        if tiu_diff.delta_node(i) == n {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 段矩形是否覆盖某点（手动比较四边，不依赖 Rect 上的方法名）
+func seg_covers(i: i64, px: i64, py: i64) -> bool {
+    if i < 0 {
+        return false
+    }
+    var r = tiu_diff.delta_rect(i)
+    if px < r.x {
+        return false
+    }
+    if py < r.y {
+        return false
+    }
+    if px >= r.x + r.w {
+        return false
+    }
+    if py >= r.y + r.h {
+        return false
+    }
+    return true
+}
+
+// 节点矩形是否覆盖某点
+func node_covers(n: i64, px: i64, py: i64) -> bool {
+    if n < 0 {
+        return false
+    }
+    var r = tiu_tree.rect(n)
+    if px < r.x {
+        return false
+    }
+    if py < r.y {
+        return false
+    }
+    if px >= r.x + r.w {
+        return false
+    }
+    if py >= r.y + r.h {
+        return false
+    }
+    return true
+}
+
+func main() -> i64 {
+    // 视口 320x240
+    tiu_app.reset(320, 240)
+    check("重置后无根", tiu_app.root(), 0 - 1)
+    check("重置后帧数", tiu_app.frames(), 0)
+
+    // ---------------- 帧 1：首帧提交 = 整树重建 ----------------
+    view_base()
+    tiu_app.begin()
+    var s1 = tiu_app.commit()
+    var nodes = tiu_tree.count()
+    check("帧1 节点数", nodes, 4)
+    check("帧1 full", b2i(tiu_app.full()), 1)
+    check("帧1 段数=节点数", s1, nodes)
+    check("帧1 delta_count", tiu_diff.delta_count(), nodes)
+    check("帧1 帧数", tiu_app.frames(), 1)
+    check("帧1 根", tiu_app.root(), tiu_tree.root())
+    var bump_uid = ui.find("bump")
+    var bump1 = ui_bridge.node_of_ui(bump_uid)
+    var v1 = ui_bridge.ver_of_ui(bump_uid)
+    check("帧1 按钮已映射", b2i(bump1 >= 0), 1)
+    tiu_app.mark_painted(s1)
+
+    // ---------------- 帧 2：同一视图 = 空闲零重绘 ----------------
+    view_base()
+    tiu_app.begin()
+    var s2 = tiu_app.commit()
+    check("帧2 段数", s2, 0)
+    check("帧2 full", b2i(tiu_app.full()), 0)
+    check("帧2 污点键数", tiu_app.key_count(), 0)
+    var bump2 = ui_bridge.node_of_ui(ui.find("bump"))
+    check("帧2 节点复用", bump2, bump1)
+    var v2 = ui_bridge.ver_of_ui(ui.find("bump"))
+    check("帧2 版本未变", v2, v1)
+    tiu_app.mark_painted(s2)
+
+    // ---------------- 帧 3：改文本 = 叶子一段 ----------------
+    view_text()
+    tiu_app.begin()
+    var s3 = tiu_app.commit()
+    check("帧3 段数", s3, 1)
+    check("帧3 full", b2i(tiu_app.full()), 0)
+    check("帧3 污点键数", tiu_app.key_count(), 1)
+    check("帧3 段键", b2i(tiu_app.keys()[0] == "0:0:0"), 1)
+    var seg3 = find_seg(bump2)
+    check("帧3 段命中按钮", b2i(seg3 >= 0), 1)
+    var br = tiu_tree.rect(bump2)
+    var bcx = br.x + 80
+    var bcy = br.y + 20
+    check("帧3 段覆盖按钮中心", b2i(seg_covers(seg3, bcx, bcy)), 1)
+    // 段矩形是「节点矩形沿父链并集上卷」的结果，所以宽度应等于根宽而不是按钮宽；
+    // 按钮是否真正落在段内由上面的中心覆盖断言负责。
+    var sr3 = tiu_diff.delta_rect(seg3)
+    var rootr = tiu_tree.rect(tiu_tree.root())
+    check("帧3 段矩形=父链并集宽", sr3.w, rootr.w)
+    var v3 = ui_bridge.ver_of_ui(ui.find("bump"))
+    check("帧3 版本已变", b2i(v3 != v2), 1)
+    tiu_app.mark_painted(s3)
+
+    // ---------------- 帧 4：改宽度 = 布局段 ----------------
+    view_width()
+    tiu_app.begin()
+    var s4 = tiu_app.commit()
+    check("帧4 段数", s4, 1)
+    var other = ui_bridge.node_of_ui(ui.find("other"))
+    var orr = tiu_tree.rect(other)
+    check("帧4 宽度生效", orr.w, 200)
+    // diff() 只给「自己脏且父不脏」的节点发段：这里按钮自己脏、父列也脏，
+    // 所以段挂在列上，other 本身没有独立段（但仍在列的段矩形覆盖范围内）。
+    check("帧4 段挂在列上", b2i(find_seg(other) < 0), 1)
+    check("帧4 段覆盖按钮中心", b2i(seg_covers(0, orr.x + 100, orr.y + 12)), 1)
+    tiu_app.mark_painted(s4)
+
+    // ---------------- 帧 5：点击按钮 = 处理器执行且判脏 ----------------
+    view_base()
+    var click_ret = tiu_app.on_mouse_down(bcx, bcy)
+    check("按下命中按钮", click_ret, bump2)
+    var up_ret = tiu_app.on_mouse_up(bcx, bcy)
+    check("抬起命中按钮", up_ret, bump2)
+    check("处理器被调用", g_clicks, 1)
+    check("处理器计数", tiu_app.handler_calls(), 1)
+    check("下一帧判脏", b2i(tiu_app.dirty()), 1)
+    tiu_app.begin()
+    var s5 = tiu_app.commit()
+    check("帧5 有段", b2i(s5 > 0), 1)
+    check("帧5 段命中按钮", b2i(find_seg(bump2) >= 0), 1)
+    check("帧5 后不再脏", b2i(tiu_app.dirty()), 0)
+    var v5 = ui_bridge.ver_of_ui(ui.find("bump"))
+    tiu_app.mark_painted(s5)
+
+    // ---------------- 帧 6：文本与布局版本未变，不重复产段 ----------------
+    view_base()
+    tiu_app.begin()
+    var s6 = tiu_app.commit()
+    check("帧6 段数", s6, 0)
+    check("帧6 full", b2i(tiu_app.full()), 0)
+    check("帧6 版本稳定", ui_bridge.ver_of_ui(ui.find("bump")), v5)
+    check("帧6 污点键数", tiu_app.key_count(), 0)
+    tiu_app.mark_painted(s6)
+    check("统计帧数", tiu_app.frames(), 6)
+    check("统计绘制+空闲=帧数", tiu_app.painted_frames() + tiu_app.idle_frames(), tiu_app.frames())
+    check("统计空闲帧", tiu_app.idle_frames(), 2)
+
+    // ---------------- 视口变化：整树重建 ----------------
+    tiu_app.reset(400, 200)
+    check("重置 full", b2i(tiu_app.full()), 1)
+    view_base()
+    tiu_app.begin()
+    var s7 = tiu_app.commit()
+    check("视口变化 full", b2i(tiu_app.full()), 1)
+    check("视口变化段数=节点数", s7, tiu_tree.count())
+    var rr = tiu_tree.rect(tiu_tree.root())
+    check("视口变化宽", rr.w, 400)
+    check("视口变化高", rr.h, 200)
+    tiu_app.mark_painted(s7)
+    check("重置后统计", tiu_app.painted_frames() + tiu_app.idle_frames(), tiu_app.frames())
+
+    println("summary PASS=" + to_string(g_pass) + " FAIL=" + to_string(g_fail))
+    if g_fail == 0 {
+        println("app loop ok")
+    }
+    return 0
+}

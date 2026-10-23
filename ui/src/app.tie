@@ -1,0 +1,353 @@
+type tie<class>
+// app.tie —— tiu 帧循环内核（声明式视图 → 保留型树 → 差分重绘计划）
+// EN: tiu frame loop — declarative view -> retained tree -> dirty-segment plan.
+// ============================================================
+// 职责边界：本文件不画像素、不碰栅格，只回答「这一帧要重画哪些段、哪些矩形」，
+// 由调用方按计划去画（绘制侧入口见 paint_bridge 的 draw_keys*）。
+//
+// 一帧的规范顺序（顺序错了差分就错）：
+//   1) tiu_diff.begin_frame()：把上一帧画出来的树快照为 prev —— 必须在改树之前；
+//   2) 调用方写视图（ui.reset() + 元素块）：这一步只改 `ui` 描述树，不动 tiu 树；
+//   3) build_frame：按 (parent, slot) 复用 tiu 节点、更新内容与版本号；
+//   4) tiu_layout2.layout：求解矩形；
+//   5) tiu_diff.diff()：对账 prev 与当前树，产出增量段。
+// 因为第 2 步只碰 `ui` 描述树、第 3 步才改 tiu 树，所以 `commit()` 自己在开头补
+// 一次 begin_frame() 与显式 `begin()` 等价；显式入口保留给「同一帧里先派发事件、
+// 再写视图」的调用方，读起来与上面的顺序一一对应。
+//
+// 全量帧：首次提交或视口变化时整树重建，此时走 diff_all 全量计划（每个节点一段），
+// 而不是 diff 的「每个顶层脏子树一段」。
+//
+// 事件帧：hover / focus / 滚动 / 点击这类状态变化不体现在内容签名与矩形里，
+// 差分看不见它们，所以事件派发时把受影响的节点记进局部污点表，提交时按节点
+// 自身矩形补段（`tiu_diff.emit_local`）。
+import "./tree.tie"
+import "./props.tie"
+import "./build.tie"
+import "./layout2.tie"
+import "./diff.tie"
+import "./event.tie"
+import "./ui_bridge.tie"
+
+// 视口尺寸（reset 记录；window 元素声明了 size 时以声明为准）
+var g_ap_w: i64 = 0
+var g_ap_h: i64 = 0
+// 当前根节点（空视图为 -1）
+var g_ap_root: i64 = 0 - 1
+// 统计
+var g_ap_frames: i64 = 0        // 提交帧数
+var g_ap_painted: i64 = 0       // 调用方确认「有绘制」的帧数
+var g_ap_idle: i64 = 0          // 调用方确认「零段（空闲）」的帧数
+var g_ap_segs: i64 = 0          // 最近一帧的计划段数
+var g_ap_handlers: i64 = 0      // 事件处理器执行次数
+// 状态
+var g_ap_full: bool = false     // 最近一帧是否整树重建
+var g_ap_started: bool = false  // 是否已提交过
+var g_ap_begun: bool = false    // 本帧是否已显式 begin()
+var g_ap_dirty: bool = false    // 下一帧是否必须重算（事件 / 树变化）
+// 本帧局部污点键（字符串集合，与 tiu_diff.delta_key 同源）
+var g_ap_keys: table<string> = []
+// 事件导致待补段的节点（下一次 commit 时按节点自身矩形补段）
+var g_ap_evnodes: table<i64> = []
+
+// 事件 sink：转发给 ui_bridge.dispatch。
+// 写成模块级函数是因为 tiu_event 的 sink 形参要函数值（不能带捕获状态）。
+//
+// 返回值要换成 tiu_event 的传播语义：sink 返回非 0 表示「已处理，停止传播」，
+// 而 ui_bridge.dispatch 用 -1 表示「没有处理器」。两者直接对接会让 -1 被当成
+// 已处理，事件在根节就停下、到不了真正绑了处理器的按钮，因此这里把 -1 翻成 0。
+pub func dispatch_sink(node: i64, name: string, x: i64, y: i64, kind: string) -> i64 {
+    var r = ui_bridge.dispatch(node, name, x, y, kind)
+    if r == 0 - 1 {
+        return 0
+    }
+    g_ap_handlers = g_ap_handlers + 1
+    push_evnode(node)
+    return r
+}
+
+// 记一个待补段节点（去重）。去重很关键：一次点击会依次命中
+// capture/target/bubble 与 down/up/click 多个事件，同一节点只该补一段。
+func push_evnode(n: i64) {
+    if n < 0 {
+        return
+    }
+    var i: i64 = 0
+    while i < len(g_ap_evnodes) {
+        if g_ap_evnodes[i] == n {
+            g_ap_dirty = true
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_ap_evnodes, n)
+    g_ap_dirty = true
+}
+
+// 状态变化节点：hover / focus 变了才补段。
+// 不能无条件取 tiu_event.click_node()：它一保持到下一次点击，
+// 会让每个空闲帧都补出一段，空闲零重绘就没了。
+func note_state(h0: i64, f0: i64) {
+    var h1 = tiu_event.hover()
+    if h1 != h0 {
+        push_evnode(h0)
+        push_evnode(h1)
+    }
+    var f1 = tiu_event.focus()
+    if f1 != f0 {
+        push_evnode(f0)
+        push_evnode(f1)
+    }
+}
+
+namespace tiu_app {
+
+// 重置帧循环：清空上一帧快照与统计，记录视口。
+// 保留树本身（首帧提交时按全量计划重建），返回当前根（尚未提交则为 -1）。
+pub func reset(w: i64, h: i64) -> i64 {
+    tiu_diff.clear_frame()
+    tiu_event.reset()
+    g_ap_keys = table_new_string()
+    g_ap_evnodes = table_new_i64()
+    g_ap_frames = 0
+    g_ap_painted = 0
+    g_ap_idle = 0
+    g_ap_segs = 0
+    g_ap_handlers = 0
+    g_ap_full = true
+    g_ap_started = false
+    g_ap_begun = false
+    g_ap_dirty = false
+    g_ap_w = w
+    g_ap_h = h
+    g_ap_root = 0 - 1
+    return g_ap_root
+}
+
+// 帧首：快照上一帧为 prev（对应顺序里的第 1 步）。
+// 返回已提交的帧数，仅作调试参考。
+pub func begin() -> i64 {
+    if !g_ap_begun {
+        tiu_diff.begin_frame()
+        g_ap_begun = true
+    }
+    return g_ap_frames
+}
+
+// 提交一帧：build_frame + 布局 + 对账，返回增量段数（0 = 本帧零重绘）。
+// 语义：调用方已用元素语法把本帧视图写进 `ui` 树。
+pub func commit() -> i64 {
+    if !g_ap_begun {
+        tiu_diff.begin_frame()
+    }
+    g_ap_begun = false
+    g_ap_frames = g_ap_frames + 1
+    // 复用上一帧节点；不重置树、不清属性表。
+    var root = ui_bridge.build_frame(g_ap_w, g_ap_h)
+    g_ap_root = root
+    var vw = ui_bridge.window_w()
+    var vh = ui_bridge.window_h()
+    var resized = vw != g_ap_w || vh != g_ap_h
+    if resized {
+        g_ap_w = vw
+        g_ap_h = vh
+    }
+    // 首次提交或视口变化：整树重建，增量没有意义
+    var full = !g_ap_started || resized
+    if root < 0 {
+        // 空视图：上一帧的节点都已在 finish 里卸载，没有可画的东西
+        g_ap_full = true
+        g_ap_started = true
+        g_ap_segs = 0
+        g_ap_dirty = false
+        g_ap_keys = table_new_string()
+        g_ap_evnodes = table_new_i64()
+        return 0
+    }
+    var segs: i64 = 0
+    if full {
+        segs = tiu_diff.diff_all()
+    } else {
+        segs = tiu_diff.diff()
+        segs = segs + append_event_segments()
+    }
+    g_ap_segs = segs
+    g_ap_full = full
+    g_ap_started = true
+    g_ap_dirty = false
+    if full {
+        // 整树重画时局部污点键没有意义，清空（调用方应忽略 keys）
+        g_ap_keys = table_new_string()
+        g_ap_evnodes = table_new_i64()
+    } else {
+        collect_keys()
+    }
+    if segs > 0 {
+        // 矩形可能变了：命中缓存必须失效，否则下一次点击会打在旧位置上
+        tiu_event.layout_changed()
+    }
+    return segs
+}
+
+// 上一帧（最近一次 commit）是否整树重建：首次提交或视口变化 → 应全量绘制。
+pub func full() -> bool {
+    return g_ap_full
+}
+
+// 本帧局部污点键：脏段的 key 前缀（字符串集合，去重）。
+pub func keys() -> table<string> {
+    var out = table_new_string()
+    var i: i64 = 0
+    while i < len(g_ap_keys) {
+        table_push(out, g_ap_keys[i])
+        i = i + 1
+    }
+    return out
+}
+
+pub func key_count() -> i64 {
+    return len(g_ap_keys)
+}
+
+// 调用方确认本帧实际绘制了 n 段（n = 0 记为空闲帧）。
+// 统计口径固定为 painted + idle == frames，前提是每帧都确认一次。
+pub func mark_painted(n: i64) {
+    if n > 0 {
+        g_ap_painted = g_ap_painted + 1
+    } else {
+        g_ap_idle = g_ap_idle + 1
+    }
+}
+
+pub func frames() -> i64 {
+    return g_ap_frames
+}
+
+pub func painted_frames() -> i64 {
+    return g_ap_painted
+}
+
+pub func idle_frames() -> i64 {
+    return g_ap_idle
+}
+
+// 最近一帧的计划段数（= commit 的返回值，便于调用方复查）
+pub func segments() -> i64 {
+    return g_ap_segs
+}
+
+// 事件处理器（on_click 等）累计执行次数
+pub func handler_calls() -> i64 {
+    return g_ap_handlers
+}
+
+// 下一帧是否已判脏（有事件 / 处理器执行 / 待补段）
+pub func dirty() -> bool {
+    return g_ap_dirty
+}
+
+// 当前根节点
+pub func root() -> i64 {
+    return g_ap_root
+}
+
+pub func view_w() -> i64 {
+    return g_ap_w
+}
+
+pub func view_h() -> i64 {
+    return g_ap_h
+}
+
+// ---- 事件入口：转 tiu_event 并派发；处理器执行或状态变化都会让下一帧判脏 ----
+
+pub func on_mouse_move(x: i64, y: i64) -> i64 {
+    var h0 = tiu_event.hover()
+    var f0 = tiu_event.focus()
+    var hit = tiu_event.mouse_move(x, y, dispatch_sink)
+    note_state(h0, f0)
+    return hit
+}
+
+pub func on_mouse_down(x: i64, y: i64) -> i64 {
+    var h0 = tiu_event.hover()
+    var f0 = tiu_event.focus()
+    var hit = tiu_event.mouse_down(x, y, 0, dispatch_sink)
+    note_state(h0, f0)
+    return hit
+}
+
+pub func on_mouse_up(x: i64, y: i64) -> i64 {
+    var h0 = tiu_event.hover()
+    var f0 = tiu_event.focus()
+    var hit = tiu_event.mouse_up(x, y, 0, dispatch_sink)
+    note_state(h0, f0)
+    return hit
+}
+
+// notches > 0 向下滚、< 0 向上滚；滚动步长 24 像素（与 tiu 的默认行高一致）。
+pub func on_wheel(x: i64, y: i64, notches: i64) -> i64 {
+    var h0 = tiu_event.hover()
+    var f0 = tiu_event.focus()
+    var n = tiu_event.wheel(x, y, notches, 24, dispatch_sink)
+    // 滚动改的是容器偏移，不在内容签名里 —— 必须显式补段
+    push_evnode(n)
+    note_state(h0, f0)
+    return n
+}
+
+// kind 取 tiu_event 的事件种类（E_CHAR / E_KEY_DOWN / E_KEY_UP），key 是字符码。
+pub func on_key(kind: i64, key: i64) -> i64 {
+    var h0 = tiu_event.hover()
+    var f0 = tiu_event.focus()
+    var n = tiu_event.key(kind, key, dispatch_sink)
+    note_state(h0, f0)
+    push_evnode(n)
+    return n
+}
+
+// ---- 内部 ----
+
+// 事件补段：按节点自身矩形补一段（不做祖先上卷：状态只影响节点自己）。
+// 前提是本帧已调用 diff()/diff_all()（段表已重置）；已因内容/布局判脏的节点跳过，
+// 避免同一矩形被计划两次。
+func append_event_segments() -> i64 {
+    var added: i64 = 0
+    var i: i64 = 0
+    while i < len(g_ap_evnodes) {
+        var n = g_ap_evnodes[i]
+        if !tiu_diff.node_dirty(n) {
+            if tiu_diff.emit_local(n) >= 0 {
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    g_ap_evnodes = table_new_i64()
+    return added
+}
+
+// 收集本帧段键（去重）。调用方拿它做「按 key 找到要重画的局部组件」。
+func collect_keys() {
+    g_ap_keys = table_new_string()
+    var i: i64 = 0
+    while i < tiu_diff.delta_count() {
+        var k = tiu_diff.delta_key(i)
+        if !has_key(k) {
+            table_push(g_ap_keys, k)
+        }
+        i = i + 1
+    }
+}
+
+func has_key(k: string) -> bool {
+    var i: i64 = 0
+    while i < len(g_ap_keys) {
+        if g_ap_keys[i] == k {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+}
