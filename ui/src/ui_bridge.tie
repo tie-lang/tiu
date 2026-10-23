@@ -1,0 +1,222 @@
+type tie<class>
+// ui_bridge.tie —— std/ui 描述层 → tiu_build 指令流桥
+// EN: bridge from the std/ui description layer to the tiu_build instruction stream.
+// ============================================================
+// 分层契约（2026-10-22 用户裁定）：
+//   * tiec 只把元素块降解为 `ui.*` 普通调用（语法层，不解 UI 语义）；
+//   * std/ui.tie 只做中立描述（元素树/属性/事件函数值/单元/主题），零绘制零窗口；
+//   * 本文件属于 tiu：把 std/ui 的树翻译成 tiu_build 的 open/close 指令流，
+//     供布局/绘制/命中消费；事件经本文件反查 ui 节点后交给 std/ui 派发。
+// 槽位：tiu 以 (父, slot) 定位兄弟，slot 取 ui 子节点中的顺序号（跳过文本节点）。
+// 文本：std/ui 的文本是子节点（kind = "text"，属性 content），此处折叠为父节点
+// 文本（tiu_build.open_t），故 tiu 树比 ui 树少一层文本节点。
+// 绝对定位：带 x/y 的元素降解为 WidgetType.Absolute；窗口按 size 属性取固定宽高。
+import "./tree.tie"
+import "./build.tie"
+import "/std/ui.tie" as ui
+
+// 桥侧映射：tiu 节点 ↔ ui 节点（每帧 build() 重建）
+var g_map_node: table<i64> = []
+var g_map_ui: table<i64> = []
+
+namespace ui_bridge {
+
+// 取字符串前缀的十进制整数（支持前导负号；遇到非数字停止）。
+// 元素属性值是解析期原样捕获的 token 文本（"8"、"12px"、"100%"、"480x320"），
+// 故只需前缀数值，不追求整串可解析。
+func num_of(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    var neg: bool = false
+    if i < n {
+        if str_byte(s, i) == 45 {
+            neg = true
+            i = i + 1
+        }
+    }
+    var v: i64 = 0
+    var got: bool = false
+    while i < n {
+        var c = str_byte(s, i)
+        if c < 48 || c > 57 {
+            i = n
+        } else {
+            v = v * 10 + (c - 48)
+            got = true
+            i = i + 1
+        }
+    }
+    if !got {
+        return 0
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+// 控件词汇映射：std/ui 的 kind 文本 → tiu 的 WidgetType。
+// 未登记控件按列处理（容器语义最保守，不吞内容）。
+func wtype(kind: string) -> WidgetType {
+    if kind == "row" {
+        return WidgetType.Row
+    }
+    if kind == "column" || kind == "panel" || kind == "window" || kind == "stack" {
+        return WidgetType.Column
+    }
+    if kind == "button" {
+        return WidgetType.Button
+    }
+    if kind == "label" || kind == "heading" || kind == "text" {
+        return WidgetType.Text
+    }
+    if kind == "input" || kind == "field" {
+        return WidgetType.TextInput
+    }
+    if kind == "scroll" {
+        return WidgetType.Scroll
+    }
+    if kind == "image" {
+        return WidgetType.Image
+    }
+    return WidgetType.Column
+}
+
+// 元素文本：优先属性 text，其次子文本节点（kind = "text"）的 content 属性。
+func text_of(uid: i64) -> string {
+    var t = ui.attr_of(uid, "text")
+    if t != "" {
+        return t
+    }
+    var k: i64 = 0
+    var n = ui.child_count(uid)
+    while k < n {
+        var ch = ui.child_at(uid, k)
+        if ui.kind_at(ch) == "text" {
+            return ui.attr_of(ch, "content")
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// 尺寸属性 "480x320"：取 x 分隔的两段数字前缀。
+func size_w(sz: string) -> i64 {
+    var n = str_len(sz)
+    var i: i64 = 0
+    while i < n {
+        if str_byte(sz, i) == 120 {
+            return num_of(str.slice(sz, 0, i))
+        }
+        i = i + 1
+    }
+    return num_of(sz)
+}
+
+func size_h(sz: string) -> i64 {
+    var n = str_len(sz)
+    var i: i64 = 0
+    while i < n {
+        if str_byte(sz, i) == 120 {
+            return num_of(str.slice(sz, i + 1, n))
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// 递归发射：先 open 自己，再按子顺序发射，最后 close。
+func emit_node(uid: i64, slot: i64) {
+    var kind = ui.kind_at(uid)
+    var ty = wtype(kind)
+    var s = text_of(uid)
+    var ox = num_of(ui.attr_of(uid, "x"))
+    var oy = num_of(ui.attr_of(uid, "y"))
+    var fw = num_of(ui.attr_of(uid, "w"))
+    var fh = num_of(ui.attr_of(uid, "h"))
+    if kind == "window" {
+        var sz = ui.attr_of(uid, "size")
+        if sz != "" {
+            fw = size_w(sz)
+            fh = size_h(sz)
+        }
+        ty = WidgetType.Absolute
+    } else if ui.attr_of(uid, "x") != "" || ui.attr_of(uid, "y") != "" {
+        ty = WidgetType.Absolute
+    }
+    tiu_build.open_t(ty, slot, 1, s, ox, oy, fw, fh)
+    var tt = tiu_build.cur_id()
+    while len(g_map_node) <= tt {
+        table_push(g_map_node, 0 - 1)
+    }
+    g_map_node[tt] = uid
+    while len(g_map_ui) <= uid {
+        table_push(g_map_ui, 0 - 1)
+    }
+    g_map_ui[uid] = tt
+    var k: i64 = 0
+    var sk: i64 = 0
+    var n = ui.child_count(uid)
+    while k < n {
+        var ch = ui.child_at(uid, k)
+        if ui.kind_at(ch) != "text" {
+            emit_node(ch, sk)
+            sk = sk + 1
+        }
+        k = k + 1
+    }
+    tiu_build.close()
+}
+
+// 构建一帧：std/ui 树 → tiu 树；返回根节点 id。
+pub func build() -> i64 {
+    g_map_node = table_new_i64()
+    g_map_ui = table_new_i64()
+    tiu_build.begin()
+    var i: i64 = 0
+    var n = ui.root_count()
+    while i < n {
+        emit_node(ui.root_at(i), i)
+        i = i + 1
+    }
+    tiu_build.finish()
+    return tiu_tree.root()
+}
+
+// tiu 节点 → std/ui 节点（未映射返回 -1）
+pub func ui_id_of(node: i64) -> i64 {
+    if node < 0 {
+        return 0 - 1
+    }
+    if node >= len(g_map_node) {
+        return 0 - 1
+    }
+    return g_map_node[node]
+}
+
+// std/ui 节点 → tiu 节点（未映射返回 -1）
+pub func node_of_ui(uid: i64) -> i64 {
+    if uid < 0 {
+        return 0 - 1
+    }
+    if uid >= len(g_map_ui) {
+        return 0 - 1
+    }
+    return g_map_ui[uid]
+}
+
+// 事件派发：把 tiu 命中节点映射回 ui 节点后交给 std/ui 的函数值事件表。
+// 返回处理器返回值；无处理器或节点未映射时返回 -1。
+pub func dispatch(node: i64, event: string, x: i64, y: i64, kind: string) -> i64 {
+    var uid = ui_id_of(node)
+    if uid < 0 {
+        return 0 - 1
+    }
+    return ui.fire_at(uid, event, x, y, kind)
+}
+
+// 主题 token 快捷查询（样式层尚未接入布局/绘制，先保留查询面）
+pub func theme_token(theme: string, key: string) -> string {
+    return ui.theme_get(theme, key)
+}
+}

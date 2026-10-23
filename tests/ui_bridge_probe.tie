@@ -1,0 +1,101 @@
+type tie<logic>
+// tests/ui_bridge_probe.tie —— std/ui 描述层 → tiu_build 桥的端到端探针
+// EN: end-to-end probe for the std/ui → tiu_build bridge.
+// ============================================================
+// 覆盖：元素块语法（window/label/row/button）→ std/ui 树 → 桥 → tiu 树；
+// 文本折叠（子文本节点 → 父文本）；窗口 size → 固定宽高；绝对定位类型；
+// 布局落地矩形；事件函数值经 tiu 节点反查后的派发。
+// 编译（tie 仓根下，需支持第 14 章元素语法的新 tiec）：
+//   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/ui_bridge_probe.tie -l2 -t0 -o out.exe
+import "../ui/src/ui_bridge.tie"
+import "../ui/src/tree.tie"
+import "../ui/src/layout.tie"
+
+var g_hits: i64 = 0
+
+// 事件处理器：签名与 std/ui 的函数值事件一致
+func bump(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_hits = g_hits + 1
+    return 7
+}
+
+func main() -> i64 {
+    // 一、元素块：编译期降解为 ui.* 调用
+    @ window "桥探针" (size: 320 x 200) {
+        @ label "标题" (text: "hello")
+        @ row {
+            @ button "加" (text: "+1", on_click: bump)
+            @ button "减" (text: "-1")
+        }
+    }
+
+    // 二、std/ui 树已建好（3 个容器/控件 + 2 个按钮 + 文本节点不占 UI 控件）
+    var uic = ui.count()
+    if uic < 5 {
+        println("FAIL ui.count " + to_string(uic))
+        return 1
+    }
+
+    // 三、桥：std/ui → tiu 树（文本节点折叠，故 tiu 节点数 = ui 节点数 - 文本节点数）
+    var root = ui_bridge.build()
+    if root < 0 {
+        println("FAIL bridge root")
+        return 1
+    }
+    var tc = tiu_tree.count()
+    if tc != 5 {
+        println("FAIL tiu.count " + to_string(tc))
+        return 1
+    }
+    if tiu_tree.ty_of(root) != 4 {
+        println("FAIL root type " + to_string(tiu_tree.ty_of(root)))
+        return 1
+    }
+    if tiu_tree.fix_w(root) != 320 || tiu_tree.fix_h(root) != 200 {
+        println("FAIL root size")
+        return 1
+    }
+    var lab = tiu_tree.first_child(root)
+    if tiu_tree.text_of(lab) != "hello" {
+        println("FAIL label text '" + tiu_tree.text_of(lab) + "'")
+        return 1
+    }
+
+    // 四、布局：绝对定位窗口按固定尺寸落地
+    tiu_layout.layout(root, Constraints.tight(320, 200))
+    var rr = tiu_tree.rect(root)
+    if rr.w != 320 || rr.h != 200 {
+        println("FAIL rect " + to_string(rr.w) + "x" + to_string(rr.h))
+        return 1
+    }
+
+    // 五、事件派发：tiu 节点 → ui 节点 → 函数值处理器
+    println("cp: roots=" + to_string(ui.root_count()) + " count=" + to_string(ui.count()))
+    var uid = ui.find("加")
+    println("cp: uid=" + to_string(uid) + " has=" + to_string(ui.has_fn_event(uid, "click")))
+    if uid < 0 {
+        println("FAIL ui.find")
+        return 1
+    }
+    var tn = ui_bridge.node_of_ui(uid)
+    if tn < 0 {
+        println("FAIL node_of_ui")
+        return 1
+    }
+    var hr = ui_bridge.dispatch(tn, "click", 5, 6, "tap")
+    if hr != 7 {
+        println("FAIL dispatch " + to_string(hr))
+        return 1
+    }
+    if g_hits != 1 {
+        println("FAIL hits " + to_string(g_hits))
+        return 1
+    }
+    if ui_bridge.ui_id_of(tn) != uid {
+        println("FAIL ui_id_of")
+        return 1
+    }
+
+    println("ui bridge ok")
+    return 0
+}
