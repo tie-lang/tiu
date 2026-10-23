@@ -1,0 +1,289 @@
+type tie<class>
+// attr_parse.tie —— 规范属性文本 → 数值词表
+// EN: canonical attribute text -> numeric vocabulary.
+// ============================================================
+// 为什么存在：`std/ui.tie` 的类型化设置器把值写成规范文本（`Size.to_attr`），
+// 布局属性表（`props.tie`）需要的是数值 (kind, a, b)。解析只做一次、只在这一处，
+// 桥接层不再各自手写字符串判断——否则同一份词表会在多处漂移。
+//
+// 量纲（与 `props.tie` 头注释同源）：
+//   px/pct/fr/em/pt/vw/vh 的 a 一律「百分之一」（1.5em → 150），ratio 例外（a,b 原值）
+//   长度（pad/gap/dx/dy/radius/font-size）返回整数逻辑像素
+//
+// 编译：tiec ui\src\attr_parse.tie --no-cache -o attr_parse.a
+
+// 单个字符是否为十进制数字。
+func is_digit(c: string) -> bool {
+    if str_len(c) == 0 {
+        return false
+    }
+    var k = char_code(c)
+    return k >= 48 && k <= 57
+}
+
+// 数字前缀的总长（符号 + 整数 + 小数），不含单位后缀。
+func num_prefix_len(s: string) -> i64 {
+    var n = str_len(s)
+    var i = 0
+    if i < n {
+        var c = str_char(s, i)
+        if c == "-" || c == "+" {
+            i = i + 1
+        }
+    }
+    while i < n && is_digit(str_char(s, i)) {
+        i = i + 1
+    }
+    if i < n && str_char(s, i) == "." {
+        i = i + 1
+        while i < n && is_digit(str_char(s, i)) {
+            i = i + 1
+        }
+    }
+    return i
+}
+
+// 数字前缀 → 百分之一整数；小数只取前两位（规范文本最多两位）。
+func hundredths(s: string) -> i64 {
+    var n = num_prefix_len(s)
+    var i = 0
+    var neg = false
+    if i < n {
+        var c = str_char(s, i)
+        if c == "-" {
+            neg = true
+            i = i + 1
+        } else if c == "+" {
+            i = i + 1
+        }
+    }
+    var whole = 0
+    while i < n && is_digit(str_char(s, i)) {
+        whole = whole * 10 + (char_code(str_char(s, i)) - 48)
+        i = i + 1
+    }
+    var frac = 0
+    var fd = 0
+    if i < n && str_char(s, i) == "." {
+        i = i + 1
+        while i < n && is_digit(str_char(s, i)) && fd < 2 {
+            frac = frac * 10 + (char_code(str_char(s, i)) - 48)
+            fd = fd + 1
+            i = i + 1
+        }
+    }
+    if fd == 1 {
+        frac = frac * 10
+    }
+    var v = whole * 100 + frac
+    if neg {
+        v = -v
+    }
+    return v
+}
+
+// 字符串是否以两字符后缀结尾。
+func ends_with2(s: string, a: string, b: string) -> bool {
+    var n = str_len(s)
+    if n < 2 {
+        return false
+    }
+    return str_char(s, n - 2) == a && str_char(s, n - 1) == b
+}
+
+namespace aparse {
+    // 尺寸 kind：0 hug / 1 fill / 2 px / 3 pct / 4 fr / 5 em / 6 pt / 7 vw / 8 vh / 9 ratio
+    pub func size_kind(s: string) -> i64 {
+        var n = str_len(s)
+        if n == 0 {
+            return 0
+        }
+        if s == "hug" {
+            return 0
+        }
+        if s == "fill" {
+            return 1
+        }
+        if n >= 6 && str_char(s, 0) == "r" && str_char(s, 1) == "a" && str_char(s, 2) == "t" && str_char(s, 3) == "i" && str_char(s, 4) == "o" && str_char(s, 5) == "(" {
+            return 9
+        }
+        if n >= 1 && str_char(s, n - 1) == "%" {
+            return 3
+        }
+        if ends_with2(s, "f", "r") {
+            return 4
+        }
+        if ends_with2(s, "e", "m") {
+            return 5
+        }
+        if ends_with2(s, "p", "t") {
+            return 6
+        }
+        if ends_with2(s, "v", "w") {
+            return 7
+        }
+        if ends_with2(s, "v", "h") {
+            return 8
+        }
+        return 2
+    }
+
+    // 尺寸系数 a（百分之一；ratio 返回冒号前的原值）。
+    pub func size_a(s: string) -> i64 {
+        var n = str_len(s)
+        if n == 0 || s == "hug" || s == "fill" {
+            return 0
+        }
+        if aparse.size_kind(s) == 9 {
+            // ratio(16:9) —— 从下标 6 开始取整数部分
+            var i = 6
+            var v = 0
+            while i < n && is_digit(str_char(s, i)) {
+                v = v * 10 + (char_code(str_char(s, i)) - 48)
+                i = i + 1
+            }
+            return v
+        }
+        return hundredths(s)
+    }
+
+    // 尺寸系数 b（仅 ratio 用：冒号后的原值）。
+    pub func size_b(s: string) -> i64 {
+        if aparse.size_kind(s) != 9 {
+            return 0
+        }
+        var n = str_len(s)
+        var i = 6
+        while i < n && str_char(s, i) != ":" {
+            i = i + 1
+        }
+        if i >= n {
+            return 0
+        }
+        i = i + 1
+        var v = 0
+        while i < n && is_digit(str_char(s, i)) {
+            v = v * 10 + (char_code(str_char(s, i)) - 48)
+            i = i + 1
+        }
+        return v
+    }
+
+    // 长度（pad/gap/dx/dy/radius/font-size）：四舍五入到整数逻辑像素。
+    pub func len_of(s: string) -> i64 {
+        var h = hundredths(s)
+        if h >= 0 {
+            return (h + 50) / 100
+        }
+        return -((-h + 50) / 100)
+    }
+
+    // 分布词：0 start / 1 center / 2 end / 3 space-between / 4 space-around / 5 space-evenly / 6 stretch
+    pub func dist_code(s: string) -> i64 {
+        if s == "start" {
+            return 0
+        }
+        if s == "center" {
+            return 1
+        }
+        if s == "end" {
+            return 2
+        }
+        if s == "space-between" {
+            return 3
+        }
+        if s == "space-around" {
+            return 4
+        }
+        if s == "space-evenly" {
+            return 5
+        }
+        if s == "stretch" {
+            return 6
+        }
+        return 0
+    }
+
+    // 溢出词：0 clip / 1 scroll / 2 expand / 3 error
+    pub func overflow_code(s: string) -> i64 {
+        if s == "clip" {
+            return 0
+        }
+        if s == "scroll" {
+            return 1
+        }
+        if s == "expand" {
+            return 2
+        }
+        if s == "error" {
+            return 3
+        }
+        return 0
+    }
+
+    // 锚点词：0 top-start … 9 fill
+    pub func anchor_code(s: string) -> i64 {
+        if s == "top-start" {
+            return 0
+        }
+        if s == "top" {
+            return 1
+        }
+        if s == "top-end" {
+            return 2
+        }
+        if s == "start" {
+            return 3
+        }
+        if s == "center" {
+            return 4
+        }
+        if s == "end" {
+            return 5
+        }
+        if s == "bottom-start" {
+            return 6
+        }
+        if s == "bottom" {
+            return 7
+        }
+        if s == "bottom-end" {
+            return 8
+        }
+        if s == "fill" {
+            return 9
+        }
+        return 0
+    }
+
+    // 视口尺寸 "480x320" 的宽。
+    pub func pair_w(s: string) -> i64 {
+        var n = str_len(s)
+        var i = 0
+        var v = 0
+        while i < n && is_digit(str_char(s, i)) {
+            v = v * 10 + (char_code(str_char(s, i)) - 48)
+            i = i + 1
+        }
+        return v
+    }
+
+    // 视口尺寸 "480x320" 的高。
+    pub func pair_h(s: string) -> i64 {
+        var n = str_len(s)
+        var i = 0
+        while i < n && str_char(s, i) != "x" && str_char(s, i) != "X" {
+            i = i + 1
+        }
+        if i >= n {
+            return 0
+        }
+        i = i + 1
+        var v = 0
+        while i < n && is_digit(str_char(s, i)) {
+            v = v * 10 + (char_code(str_char(s, i)) - 48)
+            i = i + 1
+        }
+        return v
+    }
+}

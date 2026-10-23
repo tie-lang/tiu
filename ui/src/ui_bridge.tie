@@ -1,59 +1,35 @@
 type tie<class>
-// ui_bridge.tie —— std/ui 描述层 → tiu_build 指令流桥
-// EN: bridge from the std/ui description layer to the tiu_build instruction stream.
+// ui_bridge.tie —— std/ui 描述层 → tiu 节点树 + 类型化布局属性
+// EN: bridge from the std/ui description layer to tiu nodes with typed layout props.
 // ============================================================
-// 分层契约（2026-10-22 用户裁定）：
-//   * tiec 只把元素块降解为 `ui.*` 普通调用（语法层，不解 UI 语义）；
-//   * std/ui.tie 只做中立描述（元素树/属性/事件函数值/单元/主题），零绘制零窗口；
-//   * 本文件属于 tiu：把 std/ui 的树翻译成 tiu_build 的 open/close 指令流，
-//     供布局/绘制/命中消费；事件经本文件反查 ui 节点后交给 std/ui 派发。
-// 槽位：tiu 以 (父, slot) 定位兄弟，slot 取 ui 子节点中的顺序号（跳过文本节点）。
-// 文本：std/ui 的文本是子节点（kind = "text"，属性 content），此处折叠为父节点
-// 文本（tiu_build.open_t），故 tiu 树比 ui 树少一层文本节点。
-// 绝对定位：带 x/y 的元素降解为 WidgetType.Absolute；窗口按 size 属性取固定宽高。
+// 分层契约（用户裁定）：tiec 只做语法降解；`std/ui.tie` 只做中立描述；
+// 本文件属于 tiu，负责「ui 节点 → 控件类型 + 类型化属性 → 布局求解」。
+//
+// 与旧版的区别：不再走 `tiu_build` 的 open/close 指令流（那条路只能表达
+// 「类型 + 固定宽高 + 偏移」，属性能力全靠绘制侧猜）。现在直接建 `tiu_tree`
+// 节点并把每个属性翻译进 `tiu_props` 的类型化表，然后交给 `layout2` 求解——
+// 属性是否真的生效，由布局产物（g_x/g_y/g_w/g_h）说了算。
+//
+// 属性词表来源：`std/ui.tie` 的类型化设置器把值写成规范文本（`Size.to_attr`
+// 等），本文件用 `attr_parse.tie` 解析，不自行假设文本形态。
+//
+// 文本折叠：std/ui 的文本是子节点（kind = "text"，属性 content），此处折叠为
+// 父节点文本，tiu 树因此比 ui 树少一层文本节点。
+// 槽位：slot 取 ui 子节点中非文本节点的顺序号，保证结构稳定时节点复用。
 import "./tree.tie"
-import "./build.tie"
+import "./props.tie"
+import "./layout2.tie"
+import "./attr_parse.tie"
 import "/std/ui.tie" as ui
 
 // 桥侧映射：tiu 节点 ↔ ui 节点（每帧 build() 重建）
 var g_map_node: table<i64> = []
 var g_map_ui: table<i64> = []
+// 本帧视口尺寸（vw/vh 与根尺寸基准）
+var g_view_w: i64 = 0
+var g_view_h: i64 = 0
 
 namespace ui_bridge {
-
-// 取字符串前缀的十进制整数（支持前导负号；遇到非数字停止）。
-// 元素属性值是解析期原样捕获的 token 文本（"8"、"12px"、"100%"、"480x320"），
-// 故只需前缀数值，不追求整串可解析。
-func num_of(s: string) -> i64 {
-    var n: i64 = str_len(s)
-    var i: i64 = 0
-    var neg: bool = false
-    if i < n {
-        if str_byte(s, i) == 45 {
-            neg = true
-            i = i + 1
-        }
-    }
-    var v: i64 = 0
-    var got: bool = false
-    while i < n {
-        var c = str_byte(s, i)
-        if c < 48 || c > 57 {
-            i = n
-        } else {
-            v = v * 10 + (c - 48)
-            got = true
-            i = i + 1
-        }
-    }
-    if !got {
-        return 0
-    }
-    if neg {
-        return 0 - v
-    }
-    return v
-}
 
 // 控件词汇映射：std/ui 的 kind 文本 → tiu 的 WidgetType。
 // 未登记控件按列处理（容器语义最保守，不吞内容）。
@@ -100,87 +76,254 @@ func text_of(uid: i64) -> string {
     return ""
 }
 
-// 尺寸属性 "480x320"：取 x 分隔的两段数字前缀。
-func size_w(sz: string) -> i64 {
-    var n = str_len(sz)
-    var i: i64 = 0
-    while i < n {
-        if str_byte(sz, i) == 120 {
-            return num_of(str.slice(sz, 0, i))
-        }
-        i = i + 1
+// 该字符串是否为轴分布词（与 `ui.dist_attr` 的闭集一致）。
+func is_dist(s: string) -> bool {
+    if s == "start" || s == "center" || s == "end" {
+        return true
     }
-    return num_of(sz)
+    if s == "space-between" || s == "space-around" || s == "space-evenly" {
+        return true
+    }
+    return s == "stretch"
 }
 
-func size_h(sz: string) -> i64 {
-    var n = str_len(sz)
-    var i: i64 = 0
-    while i < n {
-        if str_byte(sz, i) == 120 {
-            return num_of(str.slice(sz, i + 1, n))
-        }
-        i = i + 1
+// 尺寸键 → props 的宽/高表；缺省不写（保持 hug 默认）。
+func apply_w(uid: i64, node: i64, key: string) {
+    var s = ui.attr_of(uid, key)
+    if s != "" {
+        tiu_props.set_w(node, aparse.size_kind(s), aparse.size_a(s), aparse.size_b(s))
     }
-    return 0
 }
 
-// 递归发射：先 open 自己，再按子顺序发射，最后 close。
-func emit_node(uid: i64, slot: i64) {
+func apply_h(uid: i64, node: i64, key: string) {
+    var s = ui.attr_of(uid, key)
+    if s != "" {
+        tiu_props.set_h(node, aparse.size_kind(s), aparse.size_a(s), aparse.size_b(s))
+    }
+}
+
+// 把节点的全部属性写进布局属性表。未知键不处理（保持属性表可查询即可）。
+func apply_props(uid: i64, node: i64) {
+    apply_w(uid, node, "w")
+    apply_h(uid, node, "h")
+    var s = ""
+    s = ui.attr_of(uid, "min-w")
+    if s != "" {
+        tiu_props.set_min_w(node, aparse.size_kind(s), aparse.size_a(s))
+    }
+    s = ui.attr_of(uid, "max-w")
+    if s != "" {
+        tiu_props.set_max_w(node, aparse.size_kind(s), aparse.size_a(s))
+    }
+    s = ui.attr_of(uid, "min-h")
+    if s != "" {
+        tiu_props.set_min_h(node, aparse.size_kind(s), aparse.size_a(s))
+    }
+    s = ui.attr_of(uid, "max-h")
+    if s != "" {
+        tiu_props.set_max_h(node, aparse.size_kind(s), aparse.size_a(s))
+    }
+    // 轴分布：键 x / y 是分布词；若写成数字则按旧语法当位移（dx / dy）。
+    s = ui.attr_of(uid, "x")
+    if s != "" {
+        if is_dist(s) {
+            tiu_props.set_dist_x(node, aparse.dist_code(s))
+        } else {
+            tiu_props.set_dx(node, aparse.len_of(s))
+        }
+    }
+    s = ui.attr_of(uid, "y")
+    if s != "" {
+        if is_dist(s) {
+            tiu_props.set_dist_y(node, aparse.dist_code(s))
+        } else {
+            tiu_props.set_dy(node, aparse.len_of(s))
+        }
+    }
+    // 溢出与锚点
+    s = ui.attr_of(uid, "overflow")
+    if s != "" {
+        tiu_props.set_overflow(node, aparse.overflow_code(s))
+    }
+    s = ui.attr_of(uid, "anchor")
+    if s != "" {
+        tiu_props.set_anchor(node, aparse.anchor_code(s))
+    }
+    // 内边距：pad 统一值先写，pad-x / pad-y 再覆盖水平/垂直，四向显式值最后生效
+    s = ui.attr_of(uid, "pad")
+    if s != "" {
+        tiu_props.set_pad_all(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "pad-x")
+    if s != "" {
+        tiu_props.set_pad_x(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "pad-y")
+    if s != "" {
+        tiu_props.set_pad_y(node, aparse.len_of(s))
+    }
+    var t = 0
+    var r = 0
+    var b = 0
+    var l = 0
+    var has_pad = false
+    s = ui.attr_of(uid, "pad-top")
+    if s != "" {
+        t = aparse.len_of(s)
+        has_pad = true
+    }
+    s = ui.attr_of(uid, "pad-right")
+    if s != "" {
+        r = aparse.len_of(s)
+        has_pad = true
+    }
+    s = ui.attr_of(uid, "pad-bottom")
+    if s != "" {
+        b = aparse.len_of(s)
+        has_pad = true
+    }
+    s = ui.attr_of(uid, "pad-left")
+    if s != "" {
+        l = aparse.len_of(s)
+        has_pad = true
+    }
+    if has_pad {
+        tiu_props.set_pad(node, t, r, b, l)
+    }
+    // 间距、圆角、字号、样式名
+    s = ui.attr_of(uid, "gap")
+    if s != "" {
+        tiu_props.set_gap(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "radius")
+    if s != "" {
+        tiu_props.set_radius(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "font-size")
+    if s != "" {
+        tiu_props.set_font_size(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "style")
+    if s != "" {
+        tiu_props.set_style(node, s)
+    }
+}
+
+// 递归发射：先建自己（父链决定顺序），再按非文本子节点顺序递归。
+func emit_node(uid: i64, parent: i64, slot: i64) -> i64 {
     var kind = ui.kind_at(uid)
     var ty = wtype(kind)
+    var node = tiu_tree.mount(parent, slot, ty)
     var s = text_of(uid)
-    var ox = num_of(ui.attr_of(uid, "x"))
-    var oy = num_of(ui.attr_of(uid, "y"))
-    var fw = num_of(ui.attr_of(uid, "w"))
-    var fh = num_of(ui.attr_of(uid, "h"))
+    if s != "" {
+        tiu_tree.set_text(node, s)
+    }
+    // 窗口元素：视口尺寸来自 size 属性（"320x200"），缺省沿用调用方的值。
     if kind == "window" {
         var sz = ui.attr_of(uid, "size")
         if sz != "" {
-            fw = size_w(sz)
-            fh = size_h(sz)
+            var w = aparse.pair_w(sz)
+            var h = aparse.pair_h(sz)
+            if w > 0 {
+                g_view_w = w
+            }
+            if h > 0 {
+                g_view_h = h
+            }
         }
-        ty = WidgetType.Absolute
-    } else if ui.attr_of(uid, "x") != "" || ui.attr_of(uid, "y") != "" {
-        ty = WidgetType.Absolute
     }
-    tiu_build.open_t(ty, slot, 1, s, ox, oy, fw, fh)
-    var tt = tiu_build.cur_id()
-    while len(g_map_node) <= tt {
+    apply_props(uid, node)
+    // 映射表：按节点 id 直接下标存
+    while len(g_map_node) <= node {
         table_push(g_map_node, 0 - 1)
     }
-    g_map_node[tt] = uid
+    g_map_node[node] = uid
     while len(g_map_ui) <= uid {
         table_push(g_map_ui, 0 - 1)
     }
-    g_map_ui[uid] = tt
+    g_map_ui[uid] = node
     var k: i64 = 0
     var sk: i64 = 0
     var n = ui.child_count(uid)
     while k < n {
         var ch = ui.child_at(uid, k)
         if ui.kind_at(ch) != "text" {
-            emit_node(ch, sk)
+            emit_node(ch, node, sk)
             sk = sk + 1
         }
         k = k + 1
     }
-    tiu_build.close()
+    return node
 }
 
-// 构建一帧：std/ui 树 → tiu 树；返回根节点 id。
-pub func build() -> i64 {
+// 显式视口尺寸；供无 window 元素的场景与探针使用。
+pub func build_at(w: i64, h: i64) -> i64 {
     g_map_node = table_new_i64()
     g_map_ui = table_new_i64()
-    tiu_build.begin()
+    g_view_w = w
+    g_view_h = h
+    tiu_tree.reset()
+    tiu_props.reset()
+    var roots = ui.root_count()
+    if roots <= 0 {
+        return 0 - 1
+    }
+    var root = 0 - 1
+    if roots == 1 {
+        root = emit_node(ui.root_at(0), 0 - 1, 0)
+    } else {
+        // 多根：合成一个占满视口的列容器，保持「单根 + 求解」的不变量。
+        root = tiu_tree.mount(0 - 1, 0 - 1, WidgetType.Column)
+        tiu_props.set_w(root, 1, 0, 0)
+        tiu_props.set_h(root, 1, 0, 0)
+        var i: i64 = 0
+        while i < roots {
+            emit_node(ui.root_at(i), root, i)
+            i = i + 1
+        }
+    }
+    // 根若没有显式尺寸，按视口铺满（窗口语义）。
+    if tiu_props.w_kind(root) == 0 && tiu_props.h_kind(root) == 0 {
+        tiu_props.set_w(root, 1, 0, 0)
+        tiu_props.set_h(root, 1, 0, 0)
+    }
+    tiu_layout2.layout(root, g_view_w, g_view_h)
+    return root
+}
+
+// 构建一帧：视口尺寸先取 window 元素，缺省 800x600。
+pub func build() -> i64 {
+    var w = 0
+    var h = 0
     var i: i64 = 0
     var n = ui.root_count()
     while i < n {
-        emit_node(ui.root_at(i), i)
+        var r = ui.root_at(i)
+        if ui.kind_at(r) == "window" {
+            var sz = ui.attr_of(r, "size")
+            if sz != "" {
+                w = aparse.pair_w(sz)
+                h = aparse.pair_h(sz)
+            }
+        }
         i = i + 1
     }
-    tiu_build.finish()
-    return tiu_tree.root()
+    if w <= 0 {
+        w = 800
+    }
+    if h <= 0 {
+        h = 600
+    }
+    return build_at(w, h)
+}
+
+// 本帧视口尺寸。
+pub func window_w() -> i64 {
+    return g_view_w
+}
+
+pub func window_h() -> i64 {
+    return g_view_h
 }
 
 // tiu 节点 → std/ui 节点（未映射返回 -1）
@@ -215,7 +358,7 @@ pub func dispatch(node: i64, event: string, x: i64, y: i64, kind: string) -> i64
     return ui.fire_at(uid, event, x, y, kind)
 }
 
-// 主题 token 快捷查询（样式层尚未接入布局/绘制，先保留查询面）
+// 主题 token 快捷查询（样式层尚未接入绘制，先保留查询面）
 pub func theme_token(theme: string, key: string) -> string {
     return ui.theme_get(theme, key)
 }
