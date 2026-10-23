@@ -28,6 +28,10 @@ enum WidgetType {
     Scroll      // 滚动容器：内容整体偏移 + clip 裁剪区
     TextInput   // 文本输入：文本 + 占位符 + 焦点态
     Image       // 图像：资源句柄 + 绘制矩形
+    // ---- 新布局求解器（layout2）容器补齐 ----
+    // ⚠ 同样只在末尾追加：Grid(8) / Overlay(9)，不改已有序号。
+    Grid        // 网格：列宽由 props 列宽表给定，行高 hug
+    Overlay     // 覆盖：子项按 anchor + dx/dy 落位，无主轴
 }
 
 // 布局矩形（值语义；方法放 Rect 命名空间，obj.method() 转发）
@@ -85,6 +89,9 @@ pub func ty_code(ty: WidgetType) -> i64 {
         case WidgetType.Scroll: c = 5
         case WidgetType.TextInput: c = 6
         case WidgetType.Image: c = 7
+        // 新布局求解器容器：Grid=8 / Overlay=9（同样追加，不改旧码）
+        case WidgetType.Grid: c = 8
+        case WidgetType.Overlay: c = 9
         default: c = 0
     }
     return c
@@ -112,6 +119,12 @@ pub func type_name(kind: i64) -> string {
     }
     if kind == 7 {
         return "Image"
+    }
+    if kind == 8 {
+        return "Grid"
+    }
+    if kind == 9 {
+        return "Overlay"
     }
     return "Absolute"
 }

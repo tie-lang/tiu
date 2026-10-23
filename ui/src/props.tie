@@ -1,0 +1,506 @@
+type tie<class>
+// props.tie —— 类型化布局属性表（新求解器 `layout2.tie` 的唯一属性真源）
+// EN: typed per-node layout properties (SoA tables) — the single property source
+// consumed by the new solver; no solving, no caching, no inheritance here.
+// ============================================================
+// 设计依据：_local_only/design/layout-syntax.md
+//   §2 尺寸代数、§3 容器与轴、§5 溢出、§7 锚点、§8 样式。
+// 分层：本模块只做「存 / 读」，求解与继承（font-size 的 em 基准）在 layout2。
+// 存储：按节点 id 并行索引的 SoA 表；未写过的节点读到的全是默认值，因此
+//       **不需要**预分配，也不需要与树的挂载顺序同步（越界读 = 默认值）。
+//
+// 量纲约定（尺寸系数 a / b）—— 除 ratio 外一律「百分之一」（value × 100）：
+//   w: px 480  → set_w(id, 2, 48000, 0)
+//   w: 60%     → set_w(id, 3, 6000, 0)         // 分母 = 父内容盒 §2 规则 2
+//   w: 2fr     → set_w(id, 4, 200, 0)          // fr 权重同量纲缩放，比值不变
+//   h: 1.5em   → set_h(id, 5, 150, 0)          // em = 有效字号倍数
+//   h: 12pt    → set_h(id, 6, 1200, 0)         // 1pt = 4/3 逻辑像素
+//   w: 50vw    → set_w(id, 7, 5000, 0)
+//   w: 50vh    → set_w(id, 8, 5000, 0)
+//   w: ratio(16:9) → set_w(id, 9, 16, 9)       // ★ 例外：a/b 为原始整数
+// 之所以缩放：i64 参数要能表达 1.5em / 0.5px 这类小数尺寸（稿 §2 明示 1.5em），
+// 而 0.01 已是逻辑像素下无意义的精度上限，且不引入浮点。
+//
+// kind 词表（尺寸，两轴共用）：
+//   0 hug / 1 fill / 2 px / 3 pct / 4 fr / 5 em / 6 pt / 7 vw / 8 vh / 9 ratio
+// 分布词表（dist_x / dist_y，按**绝对轴**绑定 §3）：
+//   0 start / 1 center / 2 end / 3 space-between / 4 space-around / 5 space-evenly / 6 stretch
+// 溢出词表：0 clip / 1 scroll / 2 expand / 3 error
+// 锚点词表（overlay 子项 §7）：
+//   0 top-start / 1 top / 2 top-end / 3 start / 4 center / 5 end
+//   6 bottom-start / 7 bottom / 8 bottom-end / 9 fill
+//
+// 默认值（§2 规则 1 与其后各节）：尺寸 hug、分布 start、溢出 clip、
+// 锚点 top-start、内边距与间距 0、字号 16、圆角 0、样式 ""。
+// min/max 的默认是「不设限」，用 kind = -1 表示（0 是 hug，不能兼任哨兵）。
+//
+// 编译：tiec ui\src\props.tie --no-cache -o props.a（探针见 tests/layout_golden.tie）
+
+import "./tree.tie"
+
+// ---- 尺寸：每轴三张表（kind / a / b）----
+var g_wk: table<i64> = []      // 宽 kind
+var g_wa: table<i64> = []      // 宽系数 a（百分之一；ratio 为原始整数）
+var g_wb: table<i64> = []      // 宽系数 b（仅 ratio 用）
+var g_hk: table<i64> = []
+var g_ha: table<i64> = []
+var g_hb: table<i64> = []
+
+// ---- 每轴 min/max 夹取（kind = -1 不设限）----
+var g_minw_k: table<i64> = []
+var g_minw_a: table<i64> = []
+var g_maxw_k: table<i64> = []
+var g_maxw_a: table<i64> = []
+var g_minh_k: table<i64> = []
+var g_minh_a: table<i64> = []
+var g_maxh_k: table<i64> = []
+var g_maxh_a: table<i64> = []
+
+// ---- 主轴/交叉轴分布词（绝对轴 x / y，§3）----
+var g_distx: table<i64> = []
+var g_disty: table<i64> = []
+
+// ---- 溢出策略（§5）----
+var g_ovf: table<i64> = []
+
+// ---- 锚点（overlay 子项，§7）----
+var g_anchor: table<i64> = []
+
+// ---- 内边距（t/r/b/l 四方向）、间距、定位偏移、圆角、字号 ----
+var g_padt: table<i64> = []
+var g_padr: table<i64> = []
+var g_padb: table<i64> = []
+var g_padl: table<i64> = []
+var g_gap: table<i64> = []
+var g_dx: table<i64> = []
+var g_dy: table<i64> = []
+var g_radius: table<i64> = []
+var g_font: table<i64> = []      // 0 = 未显式设置（继承；见 font_size_own）
+
+// ---- 样式名（静态引用，§8）----
+var g_style: table<string> = []
+
+// ---- 网格列宽表：共享池 + 每节点区间（列规格按节点连续存放）----
+var g_col_off: table<i64> = []   // 该节点列区间在池中的起点
+var g_col_n: table<i64> = []     // 该节点列数
+var g_pool_k: table<i64> = []    // 池：列 kind
+var g_pool_a: table<i64> = []    // 池：列系数 a
+var g_pool_b: table<i64> = []    // 池：列系数 b
+
+namespace tiu_props {
+// ---------- 内部：表读写 ----------
+
+// 内部：写一张 i64 表（按需增长；id < 0 忽略）
+func put(t: ref table<i64>, id: i64, v: i64) {
+    if id < 0 {
+        return
+    }
+    while len(t) <= id {
+        table_push(t, 0)
+    }
+    t[id] = v
+}
+
+// 内部：读一张 i64 表（越界 / 负 id → 默认值）
+func get(t: table<i64>, id: i64, dflt: i64) -> i64 {
+    if id < 0 {
+        return dflt
+    }
+    if id >= len(t) {
+        return dflt
+    }
+    return t[id]
+}
+
+// ---------- 尺寸 ----------
+
+// 设宽 / 高：kind 见文件头词表；a/b 单位见文件头量纲约定。
+pub func set_w(id: i64, kind: i64, a: i64, b: i64) {
+    put(g_wk, id, kind)
+    put(g_wa, id, a)
+    put(g_wb, id, b)
+}
+
+pub func set_h(id: i64, kind: i64, a: i64, b: i64) {
+    put(g_hk, id, kind)
+    put(g_ha, id, a)
+    put(g_hb, id, b)
+}
+
+pub func w_kind(id: i64) -> i64 { return get(g_wk, id, 0) }
+pub func w_a(id: i64) -> i64 { return get(g_wa, id, 0) }
+pub func w_b(id: i64) -> i64 { return get(g_wb, id, 0) }
+pub func h_kind(id: i64) -> i64 { return get(g_hk, id, 0) }
+pub func h_a(id: i64) -> i64 { return get(g_ha, id, 0) }
+pub func h_b(id: i64) -> i64 { return get(g_hb, id, 0) }
+
+// 设 min/max 夹取：kind 取 -1（不设限）或 2 px / 3 pct / 5 em / 6 pt / 7 vw / 8 vh。
+// （稿 §2：min/max 取值 `n`、`n%`、`n em`、`n pt`、`n vw`、`n vh`；hug/fill/fr/ratio 无义。）
+pub func set_min_w(id: i64, kind: i64, a: i64) {
+    put(g_minw_k, id, kind)
+    put(g_minw_a, id, a)
+}
+
+pub func set_max_w(id: i64, kind: i64, a: i64) {
+    put(g_maxw_k, id, kind)
+    put(g_maxw_a, id, a)
+}
+
+pub func set_min_h(id: i64, kind: i64, a: i64) {
+    put(g_minh_k, id, kind)
+    put(g_minh_a, id, a)
+}
+
+pub func set_max_h(id: i64, kind: i64, a: i64) {
+    put(g_maxh_k, id, kind)
+    put(g_maxh_a, id, a)
+}
+
+pub func min_w_kind(id: i64) -> i64 { return get(g_minw_k, id, -1) }
+pub func min_w_a(id: i64) -> i64 { return get(g_minw_a, id, 0) }
+pub func max_w_kind(id: i64) -> i64 { return get(g_maxw_k, id, -1) }
+pub func max_w_a(id: i64) -> i64 { return get(g_maxw_a, id, 0) }
+pub func min_h_kind(id: i64) -> i64 { return get(g_minh_k, id, -1) }
+pub func min_h_a(id: i64) -> i64 { return get(g_minh_a, id, 0) }
+pub func max_h_kind(id: i64) -> i64 { return get(g_maxh_k, id, -1) }
+pub func max_h_a(id: i64) -> i64 { return get(g_maxh_a, id, 0) }
+
+// ---------- 分布 ----------
+
+pub func set_dist_x(id: i64, c: i64) { put(g_distx, id, c) }
+pub func set_dist_y(id: i64, c: i64) { put(g_disty, id, c) }
+pub func dist_x(id: i64) -> i64 { return get(g_distx, id, 0) }
+pub func dist_y(id: i64) -> i64 { return get(g_disty, id, 0) }
+
+// ---------- 溢出 ----------
+
+pub func set_overflow(id: i64, c: i64) { put(g_ovf, id, c) }
+pub func overflow(id: i64) -> i64 { return get(g_ovf, id, 0) }
+
+// ---------- 锚点 ----------
+
+pub func set_anchor(id: i64, c: i64) { put(g_anchor, id, c) }
+pub func anchor(id: i64) -> i64 { return get(g_anchor, id, 0) }
+
+// ---------- 内边距 / 间距 / 偏移 / 圆角 / 字号 ----------
+
+// 四方向内边距：t 上 / r 右 / b 下 / l 左（逻辑像素）
+pub func set_pad(id: i64, t: i64, r: i64, b: i64, l: i64) {
+    put(g_padt, id, t)
+    put(g_padr, id, r)
+    put(g_padb, id, b)
+    put(g_padl, id, l)
+}
+
+// 四边同值
+pub func set_pad_all(id: i64, v: i64) {
+    set_pad(id, v, v, v, v)
+}
+
+// 左右同值（上下不动）
+pub func set_pad_x(id: i64, v: i64) {
+    put(g_padl, id, v)
+    put(g_padr, id, v)
+}
+
+// 上下同值（左右不动）
+pub func set_pad_y(id: i64, v: i64) {
+    put(g_padt, id, v)
+    put(g_padb, id, v)
+}
+
+pub func pad_t(id: i64) -> i64 { return get(g_padt, id, 0) }
+pub func pad_r(id: i64) -> i64 { return get(g_padr, id, 0) }
+pub func pad_b(id: i64) -> i64 { return get(g_padb, id, 0) }
+pub func pad_l(id: i64) -> i64 { return get(g_padl, id, 0) }
+
+// 主轴相邻子项间距（§3：只接受长度；grid 同时作用于行列）
+pub func set_gap(id: i64, g: i64) { put(g_gap, id, g) }
+pub func gap(id: i64) -> i64 { return get(g_gap, id, 0) }
+
+// overlay 子项的锚点偏移（§7：可为负）
+pub func set_dx(id: i64, v: i64) { put(g_dx, id, v) }
+pub func set_dy(id: i64, v: i64) { put(g_dy, id, v) }
+pub func dx(id: i64) -> i64 { return get(g_dx, id, 0) }
+pub func dy(id: i64) -> i64 { return get(g_dy, id, 0) }
+
+pub func set_radius(id: i64, v: i64) { put(g_radius, id, v) }
+pub func radius(id: i64) -> i64 { return get(g_radius, id, 0) }
+
+// 字号：显式设置值（px）。0 = 未设置（em 基准沿祖先链继承，见 layout2）。
+pub func set_font_size(id: i64, v: i64) { put(g_font, id, v) }
+
+// 显式字号（0 = 未显式设置）—— 继承判定用
+pub func font_size_own(id: i64) -> i64 { return get(g_font, id, 0) }
+
+// 字号取值（带默认）：未显式设置时返回 16（§6 默认 16）
+pub func font_size(id: i64) -> i64 {
+    var v = get(g_font, id, 0)
+    if v <= 0 {
+        return 16
+    }
+    return v
+}
+
+// ---------- 样式名 ----------
+
+pub func set_style(id: i64, name: string) {
+    if id < 0 {
+        return
+    }
+    while len(g_style) <= id {
+        table_push(g_style, "")
+    }
+    g_style[id] = name
+}
+
+pub func style(id: i64) -> string {
+    if id < 0 {
+        return ""
+    }
+    if id >= len(g_style) {
+        return ""
+    }
+    return g_style[id]
+}
+
+// ---------- 网格列宽表 ----------
+
+// 清空某节点的列规格
+pub func clear_cols(id: i64) {
+    if id < 0 {
+        return
+    }
+    put(g_col_off, id, 0)
+    put(g_col_n, id, 0)
+}
+
+// 追加一列。列规格在共享池中按节点连续存放：若该节点旧区间已不在池尾
+// （期间别的节点追加过列），先把旧区间整体搬到池尾再追加，保证区间连续。
+pub func add_col(id: i64, kind: i64, a: i64, b: i64) {
+    if id < 0 {
+        return
+    }
+    var n = get(g_col_n, id, 0)
+    if n > 0 {
+        var st = get(g_col_off, id, 0)
+        if st + n != len(g_pool_k) {
+            var tail = len(g_pool_k)
+            var i: i64 = 0
+            while i < n {
+                table_push(g_pool_k, g_pool_k[st + i])
+                table_push(g_pool_a, g_pool_a[st + i])
+                table_push(g_pool_b, g_pool_b[st + i])
+                i = i + 1
+            }
+            put(g_col_off, id, tail)
+        }
+    } else {
+        put(g_col_off, id, len(g_pool_k))
+    }
+    table_push(g_pool_k, kind)
+    table_push(g_pool_a, a)
+    table_push(g_pool_b, b)
+    put(g_col_n, id, n + 1)
+}
+
+// 等分 n 列（等价 `cols: n`：每列 1fr）
+pub func set_cols_equal(id: i64, n: i64) {
+    clear_cols(id)
+    var i: i64 = 0
+    while i < n {
+        add_col(id, 4, 100, 0)
+        i = i + 1
+    }
+}
+
+pub func col_count(id: i64) -> i64 { return get(g_col_n, id, 0) }
+
+// 第 i 列的 kind / a / b（越界 → 0）
+pub func col_kind(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= col_count(id) {
+        return 0
+    }
+    return g_pool_k[get(g_col_off, id, 0) + i]
+}
+
+pub func col_a(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= col_count(id) {
+        return 0
+    }
+    return g_pool_a[get(g_col_off, id, 0) + i]
+}
+
+pub func col_b(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= col_count(id) {
+        return 0
+    }
+    return g_pool_b[get(g_col_off, id, 0) + i]
+}
+
+// ---------- 词汇的文本形式（explain / 诊断共用）----------
+
+// 尺寸系数 → 文本（百分之一还原为小数）
+pub func num_text(a: i64) -> string {
+    var neg: bool = false
+    var v = a
+    if v < 0 {
+        neg = true
+        v = -v
+    }
+    var ip = v / 100
+    var fp = v % 100
+    var s = to_string(ip)
+    if fp != 0 {
+        if fp < 10 {
+            s = s + ".0" + to_string(fp)
+        } else {
+            s = s + "." + to_string(fp)
+        }
+    }
+    if neg {
+        return "-" + s
+    }
+    return s
+}
+
+// 尺寸意图 → 文本
+pub func size_text(kind: i64, a: i64, b: i64) -> string {
+    if kind == 0 {
+        return "hug"
+    }
+    if kind == 1 {
+        return "fill"
+    }
+    if kind == 2 {
+        return num_text(a) + "px"
+    }
+    if kind == 3 {
+        return num_text(a) + "%"
+    }
+    if kind == 4 {
+        return num_text(a) + "fr"
+    }
+    if kind == 5 {
+        return num_text(a) + "em"
+    }
+    if kind == 6 {
+        return num_text(a) + "pt"
+    }
+    if kind == 7 {
+        return num_text(a) + "vw"
+    }
+    if kind == 8 {
+        return num_text(a) + "vh"
+    }
+    return "ratio " + to_string(a) + ":" + to_string(b)
+}
+
+// 分布词 → 文本
+pub func dist_text(c: i64) -> string {
+    if c == 1 {
+        return "center"
+    }
+    if c == 2 {
+        return "end"
+    }
+    if c == 3 {
+        return "space-between"
+    }
+    if c == 4 {
+        return "space-around"
+    }
+    if c == 5 {
+        return "space-evenly"
+    }
+    if c == 6 {
+        return "stretch"
+    }
+    return "start"
+}
+
+// 溢出词 → 文本
+pub func overflow_text(c: i64) -> string {
+    if c == 1 {
+        return "scroll"
+    }
+    if c == 2 {
+        return "expand"
+    }
+    if c == 3 {
+        return "error"
+    }
+    return "clip"
+}
+
+// 锚点词 → 文本
+pub func anchor_text(c: i64) -> string {
+    if c == 1 {
+        return "top"
+    }
+    if c == 2 {
+        return "top-end"
+    }
+    if c == 3 {
+        return "start"
+    }
+    if c == 4 {
+        return "center"
+    }
+    if c == 5 {
+        return "end"
+    }
+    if c == 6 {
+        return "bottom-start"
+    }
+    if c == 7 {
+        return "bottom"
+    }
+    if c == 8 {
+        return "bottom-end"
+    }
+    if c == 9 {
+        return "fill"
+    }
+    return "top-start"
+}
+
+// ---------- 生命周期 ----------
+
+// 清空全部属性（树 reset 时必须同步调用，避免旧 id 的残留属性串到新树）
+pub func reset() {
+    g_wk = table_new_i64()
+    g_wa = table_new_i64()
+    g_wb = table_new_i64()
+    g_hk = table_new_i64()
+    g_ha = table_new_i64()
+    g_hb = table_new_i64()
+    g_minw_k = table_new_i64()
+    g_minw_a = table_new_i64()
+    g_maxw_k = table_new_i64()
+    g_maxw_a = table_new_i64()
+    g_minh_k = table_new_i64()
+    g_minh_a = table_new_i64()
+    g_maxh_k = table_new_i64()
+    g_maxh_a = table_new_i64()
+    g_distx = table_new_i64()
+    g_disty = table_new_i64()
+    g_ovf = table_new_i64()
+    g_anchor = table_new_i64()
+    g_padt = table_new_i64()
+    g_padr = table_new_i64()
+    g_padb = table_new_i64()
+    g_padl = table_new_i64()
+    g_gap = table_new_i64()
+    g_dx = table_new_i64()
+    g_dy = table_new_i64()
+    g_radius = table_new_i64()
+    g_font = table_new_i64()
+    g_style = table_new_string()
+    g_col_off = table_new_i64()
+    g_col_n = table_new_i64()
+    g_pool_k = table_new_i64()
+    g_pool_a = table_new_i64()
+    g_pool_b = table_new_i64()
+}
+}

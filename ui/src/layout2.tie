@@ -1,0 +1,1599 @@
+type tie<class>
+// layout2.tie —— 新布局求解器（四容器 + 尺寸代数 + 溢出 + 锚点）
+// EN: the new layout solver — three passes (hug measure / distribute / place) over
+// the SoA tree, 26.6 fixed point internally, integer pixels on commit.
+// ============================================================
+// 设计依据：_local_only/design/layout-syntax.md §3/§4/§5/§7（属性真源见 props.tie）。
+//
+// 求解顺序（一次 layout 五个阶段，全部同步完成，无迭代收敛）：
+//   0) 字号继承：前序 dfs，font-size 是唯一可继承属性（em 的基准；根默认 16）
+//   1) measure_hug：**后序**算每节点内容 hug（文本度量 / 主轴 Σ+gap / 交叉轴 max）
+//   2) 根：以「窗口内容盒」为父给盒解析根的两轴尺寸（含 ratio 耦合与 clamp）
+//   3) distribute + place：**前序**逐节点给子项分尺寸、落位、判溢出
+//   4) commit：把 26.6 定点四舍五入成整数像素写回树（set_rect）
+//
+// 取整规则：内部一律 26.6 定点（1 单位 = 1/64 像素，FP_ONE=64）；分配时用整数
+//   除法向下取整 + 最大余数法补齐（份额之和恰好等于可用量，不产生累计漂移）；
+//   只在最后一步 to_px() 四舍五入（0.5 远离零），因此 explain 里的定点值与
+//   落树的整数值可逐项对账。
+//
+// 四条不变式（稿 §4）：
+//   I1 clamp 到 min/max 后让出的空间**不回灌**主轴——留在主轴由分布词吸收，
+//      避免「分配→夹取→再分配」的迭代收敛（本实现一次分配即定稿）。
+//   I2 rest < 0 时不压缩 hug 子项，直接判溢出（溢出只记录，不改几何）。
+//   I3 文本折行依赖字形度量，尚未接入：文本 hug 高固定为一行（见 measure_text）。
+//   I4 每节点保留约束来源（父给盒 s_aw/s_ah、自身意图、min/max、结果）供 explain。
+//
+// 溢出（§5）：判定在 place 之后；clip / scroll 只记录裁剪位（s_ov），
+//   scroll 的滚动量是节点状态（tree.set_scroll），本模块不动它；
+//   expand 在尺寸解析期就把该轴改成 content 尺寸（牺牲父给尺寸）；
+//   error 追加一条诊断到字符串表，diag_count()/diag_at(i) 可读。
+//
+// 与旧路径的关系：layout.tie 是旧求解器，**本文件不引用、不修改它**；
+//   examples\counter.tie 仍走旧路径，两者并行存在直到控件工厂切换。
+//
+// 已知未实现（均在报告里列出）：grid 的 rows（稿允许，本次交付按任务书只做
+//   cols + 行高 hug）；文本折行；样式表合并（§8，属性表尚无样式展开）。
+
+import "./tree.tie"
+import "./props.tie"
+
+// ---- 26.6 定点 ----
+const FP_ONE: i64 = 64
+const FP_HALF: i64 = 32
+
+// 尺寸 kind（与 props.tie 词表同源）
+const K_HUG: i64 = 0
+const K_FILL: i64 = 1
+const K_PX: i64 = 2
+const K_PCT: i64 = 3
+const K_FR: i64 = 4
+const K_EM: i64 = 5
+const K_PT: i64 = 6
+const K_VW: i64 = 7
+const K_VH: i64 = 8
+const K_RATIO: i64 = 9
+
+// 溢出策略
+const O_CLIP: i64 = 0
+const O_SCROLL: i64 = 1
+const O_EXPAND: i64 = 2
+const O_ERROR: i64 = 3
+
+// 分布词
+const D_STRETCH: i64 = 6
+
+// ---- 求解状态（按节点 id 索引；每次 layout 重建）----
+var s_w: table<i64> = []      // 解析后宽（定点）
+var s_h: table<i64> = []
+var s_x: table<i64> = []      // 绝对位置（定点）
+var s_y: table<i64> = []
+var s_hw: table<i64> = []     // 内容 hug 宽（定点，含自身 pad）
+var s_hh: table<i64> = []
+var s_font: table<i64> = []   // 有效字号（px）
+var s_aw: table<i64> = []     // 父给内容盒宽（定点）
+var s_ah: table<i64> = []
+var s_ov: table<i64> = []     // 溢出位：1=x 2=y
+var s_nk: table<i64> = []     // 参与求解的子项数
+var s_nf: table<i64> = []     // 其中弹性（fill/fr）子项数
+var s_ind: table<i64> = []    // 不定轴位：1=w 2=h（hug/expand 派生）
+var s_ok: table<i64> = []     // 定尺寸位：1=w 2=h（子项 % 的分母是否可用）
+
+var g_win_w: i64 = 0          // 窗口内容盒（定点）
+var g_win_h: i64 = 0
+var g_diag: table<string> = []
+
+namespace tiu_layout2 {
+// ============================================================
+// 定点与单位换算
+// ============================================================
+
+// 整数像素 → 定点
+func fpx(v: i64) -> i64 {
+    return v * FP_ONE
+}
+
+// 定点 → 整数像素（四舍五入，0.5 远离零；§2「落树四舍五入到整数像素」）
+pub func to_px(v: i64) -> i64 {
+    if v >= 0 {
+        return (v + FP_HALF) / FP_ONE
+    }
+    return -((-v + FP_HALF) / FP_ONE)
+}
+
+// 定点 → 文本（保留两位小数；explain 与诊断共用，不做取整）
+pub func fp_text(v: i64) -> string {
+    var neg: bool = false
+    var a = v
+    if a < 0 {
+        neg = true
+        a = -a
+    }
+    var ip = a / FP_ONE
+    var r = a % FP_ONE
+    var f = (r * 100) / FP_ONE
+    var s = to_string(ip)
+    if f != 0 {
+        if f < 10 {
+            s = s + ".0" + to_string(f)
+        } else {
+            s = s + "." + to_string(f)
+        }
+    }
+    if neg {
+        return "-" + s
+    }
+    return s
+}
+
+// 尺寸系数（百分之一）→ 定点：px
+func c_px(a: i64) -> i64 {
+    return (a * FP_ONE) / 100
+}
+
+// em：a/100 × 有效字号
+func c_em(a: i64, fs: i64) -> i64 {
+    return (a * fs * FP_ONE) / 100
+}
+
+// pt：1pt = 4/3 逻辑像素（§2）
+func c_pt(a: i64) -> i64 {
+    return (a * 4 * FP_ONE) / 300
+}
+
+// vw：窗口内容区宽度的百分比（§2）
+func c_vw(a: i64) -> i64 {
+    return (a * g_win_w) / 10000
+}
+
+// vh：窗口内容区高度的百分比
+func c_vh(a: i64) -> i64 {
+    return (a * g_win_h) / 10000
+}
+
+// pct：父内容盒（已扣 pad）的百分比（§2 规则 2）
+func c_pct(a: i64, base: i64) -> i64 {
+    return (a * base) / 10000
+}
+
+// ============================================================
+// 表读写（按需增长；越界读 → 0）
+// ============================================================
+
+func twrite(t: ref table<i64>, id: i64, v: i64) {
+    if id < 0 {
+        return
+    }
+    while len(t) <= id {
+        table_push(t, 0)
+    }
+    t[id] = v
+}
+
+func tget(t: table<i64>, id: i64) -> i64 {
+    if id < 0 || id >= len(t) {
+        return 0
+    }
+    return t[id]
+}
+
+// 预增长一张状态表（避免求解期逐次增长）
+func grow_to(t: ref table<i64>, n: i64) {
+    while len(t) < n {
+        table_push(t, 0)
+    }
+}
+
+// 预增长全部状态表（按树的总节点数；之后直接下标读，不再判越界）
+func prep(tot: i64) {
+    grow_to(s_w, tot)
+    grow_to(s_h, tot)
+    grow_to(s_x, tot)
+    grow_to(s_y, tot)
+    grow_to(s_hw, tot)
+    grow_to(s_hh, tot)
+    grow_to(s_font, tot)
+    grow_to(s_aw, tot)
+    grow_to(s_ah, tot)
+    grow_to(s_ov, tot)
+    grow_to(s_nk, tot)
+    grow_to(s_nf, tot)
+    grow_to(s_ind, tot)
+    grow_to(s_ok, tot)
+}
+
+func set_size(n: i64, axis: i64, v: i64) {
+    if axis == 0 {
+        twrite(s_w, n, v)
+    } else {
+        twrite(s_h, n, v)
+    }
+}
+
+func size_of(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return tget(s_w, n)
+    }
+    return tget(s_h, n)
+}
+
+func hug_of(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return tget(s_hw, n)
+    }
+    return tget(s_hh, n)
+}
+
+func axis_bit(axis: i64) -> i64 {
+    if axis == 0 {
+        return 1
+    }
+    return 2
+}
+
+// 该轴是否是「定尺寸」（子项 % 的分母可用）
+func base_ok(n: i64, axis: i64) -> bool {
+    return (tget(s_ok, n) & axis_bit(axis)) != 0
+}
+
+// ============================================================
+// 属性读取小工具（props → 定点）
+// ============================================================
+
+func kind_of(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return tiu_props.w_kind(n)
+    }
+    return tiu_props.h_kind(n)
+}
+
+func a_of(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return tiu_props.w_a(n)
+    }
+    return tiu_props.h_a(n)
+}
+
+func b_of(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return tiu_props.w_b(n)
+    }
+    return tiu_props.h_b(n)
+}
+
+func pad_s(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return fpx(tiu_props.pad_l(n))
+    }
+    return fpx(tiu_props.pad_t(n))
+}
+
+func pad_e(n: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        return fpx(tiu_props.pad_r(n))
+    }
+    return fpx(tiu_props.pad_b(n))
+}
+
+// 内容盒（已扣 pad；负数按 0 处理）
+func content_box(n: i64, axis: i64) -> i64 {
+    var v = size_of(n, axis) - pad_s(n, axis) - pad_e(n, axis)
+    if v < 0 {
+        return 0
+    }
+    return v
+}
+
+func gap_fp(n: i64) -> i64 {
+    return fpx(tiu_props.gap(n))
+}
+
+func kid_count(n: i64) -> i64 {
+    var c: i64 = 0
+    var k = tiu_tree.first_child(n)
+    while k >= 0 {
+        c = c + 1
+        k = tiu_tree.next_sibling(k)
+    }
+    return c
+}
+
+func child_at(n: i64, idx: i64) -> i64 {
+    var i: i64 = 0
+    var k = tiu_tree.first_child(n)
+    while k >= 0 {
+        if i == idx {
+            return k
+        }
+        i = i + 1
+        k = tiu_tree.next_sibling(k)
+    }
+    return -1
+}
+
+// 主轴方向的分布词（row → dist_x，column → dist_y）
+func dist_main(n: i64, a_main: i64) -> i64 {
+    if a_main == 0 {
+        return tiu_props.dist_x(n)
+    }
+    return tiu_props.dist_y(n)
+}
+
+// 交叉轴方向的分布词
+func dist_cross(n: i64, a_cross: i64) -> i64 {
+    if a_cross == 0 {
+        return tiu_props.dist_x(n)
+    }
+    return tiu_props.dist_y(n)
+}
+
+// ============================================================
+// 文本度量钩子（唯一替换点）
+// ============================================================
+
+// ★ 文本度量：整个求解器里**唯一**读取字形 advance 的地方。
+//   等字体链接入后，只需替换本函数体（改为查字形表并按字对 kerning 求和），
+//   measure_hug / explain / 诊断全部自动跟随——不要在其他地方再写字宽推算。
+//   过渡约定（稿 §6，字形表就绪前）：advance = font_size × 3 / 5，
+//   即每字符 0.6 em；返回 26.6 定点总宽度。
+//   TODO(font-link): 与光栅共用同一份 advance（稿 §6 末条），接入后删除此估算。
+pub func measure_text(s: string, font_size: i64) -> i64 {
+    var fs = font_size
+    if fs <= 0 {
+        fs = 16
+    }
+    var n = str_len(s)
+    if n <= 0 {
+        return 0
+    }
+    // 总宽按整串一次算（不是逐字截断再相加），保证「宽度 = Σadvance」精确成立：
+    //   advance(fs) = fs × 3/5 px ⇒ 总宽 = fs × 3/5 × n，定点后一次除法。
+    return (fs * 3 * FP_ONE * n) / 5;
+}
+
+// 文本单行高度 = 字号（稿 §6：行高按字号；折行未接入，见文件头 I3）
+func text_line_h(font_size: i64) -> i64 {
+    var fs = font_size
+    if fs <= 0 {
+        fs = 16
+    }
+    return fs * FP_ONE
+}
+
+// ============================================================
+// 诊断（§5：error 策略 + 稿内自相矛盾处的布局期报错）
+// ============================================================
+
+func axis_name(axis: i64) -> string {
+    if axis == 0 {
+        return "x"
+    }
+    return "y"
+}
+
+func diag_add(kind: string, n: i64, axis: i64, detail: string) {
+    var ty = tiu_tree.ty_of(n)
+    var s = kind + ": node #" + to_string(n) + " (" + tiu_tree.type_name(ty) + ") path=" + tiu_tree.path_of(n)
+    if axis >= 0 {
+        s = s + " axis=" + axis_name(axis)
+    }
+    if str_len(detail) > 0 {
+        s = s + " " + detail
+    }
+    table_push(g_diag, s)
+}
+
+// 诊断条数
+pub func diag_count() -> i64 {
+    return len(g_diag)
+}
+
+// 第 i 条诊断（越界 → ""）
+pub func diag_at(i: i64) -> string {
+    if i < 0 || i >= len(g_diag) {
+        return ""
+    }
+    return g_diag[i]
+}
+
+// ============================================================
+// 第 1 趟：measure_hug（后序）
+// ============================================================
+
+// 子项在 hug 度量里的贡献：定尺寸取定值，其余取子项自己的 hug（含 pad），
+// ratio 由另一轴推（另一轴定值→按比例；否则按另一轴 hug）。
+func child_hug(c: i64, axis: i64) -> i64 {
+    var kd = kind_of(c, axis)
+    var a = a_of(c, axis)
+    if kd == K_PX {
+        return c_px(a)
+    }
+    if kd == K_EM {
+        return c_em(a, tget(s_font, c))
+    }
+    if kd == K_PT {
+        return c_pt(a)
+    }
+    if kd == K_VW {
+        return c_vw(a)
+    }
+    if kd == K_VH {
+        return c_vh(a)
+    }
+    if kd == K_RATIO {
+        var o = 1 - axis
+        var ok = kind_of(c, o)
+        var base: i64 = 0
+        if ok == K_RATIO {
+            return hug_of(c, axis)
+        }
+        if ok == K_PX || ok == K_EM || ok == K_PT || ok == K_VW || ok == K_VH {
+            base = child_hug(c, o)
+        } else {
+            base = hug_of(c, o)
+        }
+        return ratio_from(base, a_of(c, axis), b_of(c, axis), axis)
+    }
+    // hug / fill / fr / pct：内容 hug（pct 在 hug 度量里没有分母，按内容占位）
+    return hug_of(c, axis)
+}
+
+// 已知另一轴（或同一基准）求比例轴：axis=0 → 已知高求宽；axis=1 → 已知宽求高
+func ratio_from(base: i64, a: i64, b: i64, axis: i64) -> i64 {
+    if axis == 0 {
+        if b <= 0 {
+            return base
+        }
+        return (base * a) / b
+    }
+    if a <= 0 {
+        return base
+    }
+    return (base * b) / a
+}
+
+// 本节点内容 hug（不含 pad；pad 在 measure_hug 末尾统一加）
+func content_hug(n: i64, axis: i64) -> i64 {
+    var ty = tiu_tree.ty_of(n)
+    if ty == 2 || ty == 3 || ty == 6 {
+        // Text / Button / TextInput：字形度量（宽度 = Σadvance，高度 = 一行）
+        if axis == 0 {
+            return measure_text(tiu_tree.text_of(n), tget(s_font, n))
+        }
+        return text_line_h(tget(s_font, n))
+    }
+    if ty == 7 {
+        // Image：尚无固有尺寸通道（资源句柄只到绘制层），hug 记 0
+        return 0
+    }
+    if ty == 0 || ty == 1 || ty == 5 {
+        // Row / Column / Scroll：主轴 Σ子项 + gap·(n−1)；交叉轴 max(子项)
+        var a_main: i64 = 0
+        if ty == 1 || ty == 5 {
+            a_main = 1
+        }
+        var a_cross = 1 - a_main
+        var gap = gap_fp(n)
+        var k = tiu_tree.first_child(n)
+        if axis == a_main {
+            var acc: i64 = 0
+            var first: bool = true
+            while k >= 0 {
+                if !first {
+                    acc = acc + gap
+                }
+                acc = acc + child_hug(k, a_main)
+                first = false
+                k = tiu_tree.next_sibling(k)
+            }
+            return acc
+        }
+        var mx: i64 = 0
+        while k >= 0 {
+            var v = child_hug(k, a_cross)
+            if v > mx {
+                mx = v
+            }
+            k = tiu_tree.next_sibling(k)
+        }
+        return mx
+    }
+    if ty == 8 {
+        return grid_content_hug(n, axis)
+    }
+    // Overlay / Absolute：anchor=fill 的子项不参与（取父尺寸）；其余 max(子项+偏移)
+    var kap = tiu_tree.first_child(n)
+    var m: i64 = 0
+    while kap >= 0 {
+        if tiu_props.anchor(kap) != 9 {
+            var v2 = child_hug(kap, axis) + legacy_off(kap, axis)
+            if v2 < 0 {
+                v2 = -v2
+            }
+            if v2 > m {
+                m = v2
+            }
+        }
+        kap = tiu_tree.next_sibling(kap)
+    }
+    return m
+}
+
+// overlay 偏移：优先 props dx/dy；两者都为 0 时回退到树上的旧绝对偏移
+func legacy_off(c: i64, axis: i64) -> i64 {
+    var v: i64 = 0
+    if axis == 0 {
+        v = fpx(tiu_props.dx(c))
+    } else {
+        v = fpx(tiu_props.dy(c))
+    }
+    if v == 0 {
+        if axis == 0 {
+            v = fpx(tiu_tree.off_x(c))
+        } else {
+            v = fpx(tiu_tree.off_y(c))
+        }
+    }
+    return v
+}
+
+// grid 内容 hug：宽 = Σ列宽 + gap；高 = Σ行高 + gap（行高取行内最高子项）
+func grid_content_hug(n: i64, axis: i64) -> i64 {
+    var cnt = kid_count(n)
+    if cnt == 0 {
+        return 0
+    }
+    var cols = tiu_props.col_count(n)
+    if cols <= 0 {
+        cols = 1
+    }
+    var rows = (cnt + cols - 1) / cols
+    var gap = gap_fp(n)
+    var acc: i64 = 0
+    if axis == 0 {
+        var c: i64 = 0
+        while c < cols {
+            if c > 0 {
+                acc = acc + gap
+            }
+            var kd = tiu_props.col_kind(n, c)
+            var ca = tiu_props.col_a(n, c)
+            if kd == K_PX {
+                acc = acc + c_px(ca)
+            } else if kd == K_EM {
+                acc = acc + c_em(ca, tget(s_font, n))
+            } else if kd == K_PT {
+                acc = acc + c_pt(ca)
+            } else if kd == K_VW {
+                acc = acc + c_vw(ca)
+            } else if kd == K_VH {
+                acc = acc + c_vh(ca)
+            } else {
+                // hug / fill / fr / pct 列：列内子项最大 hug
+                var mx: i64 = 0
+                var r: i64 = 0
+                while r < rows {
+                    var k = child_at(n, r * cols + c)
+                    if k >= 0 {
+                        var hw = child_hug(k, 0)
+                        if hw > mx {
+                            mx = hw
+                        }
+                    }
+                    r = r + 1
+                }
+                acc = acc + mx
+            }
+            c = c + 1
+        }
+        return acc
+    }
+    var r2: i64 = 0
+    while r2 < rows {
+        if r2 > 0 {
+            acc = acc + gap
+        }
+        var mh: i64 = 0
+        var c2: i64 = 0
+        while c2 < cols {
+            var k2 = child_at(n, r2 * cols + c2)
+            if k2 >= 0 {
+                var hv = child_hug(k2, 1)
+                if hv > mh {
+                    mh = hv
+                }
+            }
+            c2 = c2 + 1
+        }
+        acc = acc + mh
+        r2 = r2 + 1
+    }
+    return acc
+}
+
+// 第 1 趟入口：算本节点 hug（内容 + 自身 pad），写 s_hw/s_hh
+func measure_hug(n: i64) {
+    var cw = content_hug(n, 0) + pad_s(n, 0) + pad_e(n, 0)
+    var ch = content_hug(n, 1) + pad_s(n, 1) + pad_e(n, 1)
+    twrite(s_hw, n, cw)
+    twrite(s_hh, n, ch)
+}
+
+// ============================================================
+// 第 2 趟：尺寸解析（意图 → expand → min/max clamp）
+// ============================================================
+
+// 单轴尺寸意图。base 为该轴的父内容盒（定尺寸时 % 可用）。
+// hug / pct-on-indefinite 会打「不定轴」标记（供子项 % 判定）。
+func axis_value(n: i64, axis: i64, avail: i64, ok: bool) -> i64 {
+    var kd = kind_of(n, axis)
+    var a = a_of(n, axis)
+    var b = axis_bit(axis)
+    if kd == K_HUG {
+        twrite(s_ind, n, tget(s_ind, n) | b)
+        return hug_of(n, axis)
+    }
+    if kd == K_FILL || kd == K_FR {
+        return avail
+    }
+    if kd == K_PX {
+        return c_px(a)
+    }
+    if kd == K_PCT {
+        if !ok {
+            // 稿 §2 规则 2：父该轴不定尺寸时 % 是错误（不是静默 0）
+            diag_add("pct-without-base", n, axis, "size=" + tiu_props.size_text(kd, a, 0) + " 父该轴不定尺寸")
+            twrite(s_ind, n, tget(s_ind, n) | b)
+            return hug_of(n, axis)
+        }
+        return c_pct(a, avail)
+    }
+    if kd == K_EM {
+        return c_em(a, tget(s_font, n))
+    }
+    if kd == K_PT {
+        return c_pt(a)
+    }
+    if kd == K_VW {
+        return c_vw(a)
+    }
+    if kd == K_VH {
+        return c_vh(a)
+    }
+    // ratio 由调用方先解另一轴（见 resolve_root / 容器分支）
+    twrite(s_ind, n, tget(s_ind, n) | b)
+    return hug_of(n, axis)
+}
+
+// min/max 取值（kind = -1 不设限）
+func minmax_value(n: i64, axis: i64, avail: i64, is_max: bool) -> i64 {
+    var kd: i64 = -1
+    var a: i64 = 0
+    if is_max {
+        if axis == 0 {
+            kd = tiu_props.max_w_kind(n)
+            a = tiu_props.max_w_a(n)
+        } else {
+            kd = tiu_props.max_h_kind(n)
+            a = tiu_props.max_h_a(n)
+        }
+    } else {
+        if axis == 0 {
+            kd = tiu_props.min_w_kind(n)
+            a = tiu_props.min_w_a(n)
+        } else {
+            kd = tiu_props.min_h_kind(n)
+            a = tiu_props.min_h_a(n)
+        }
+    }
+    if kd == K_PX {
+        return c_px(a)
+    }
+    if kd == K_PCT {
+        return c_pct(a, avail)
+    }
+    if kd == K_EM {
+        return c_em(a, tget(s_font, n))
+    }
+    if kd == K_PT {
+        return c_pt(a)
+    }
+    if kd == K_VW {
+        return c_vw(a)
+    }
+    if kd == K_VH {
+        return c_vh(a)
+    }
+    return -1
+}
+
+// clamp 到 [min, max]（稿 §4 不变式 I1：让出的空间不回灌）
+func clamp_axis(n: i64, axis: i64, v: i64, avail: i64) -> i64 {
+    var mn = minmax_value(n, axis, avail, false)
+    if mn >= 0 && v < mn {
+        v = mn
+    }
+    var mx = minmax_value(n, axis, avail, true)
+    if mx >= 0 && v > mx {
+        v = mx
+    }
+    return v
+}
+
+// expand 策略（§5）：内容超出给定尺寸时改为 content 尺寸（牺牲父给尺寸）+ clamp
+func axis_finish(n: i64, axis: i64, v: i64, avail: i64) -> i64 {
+    if tiu_props.overflow(n) == O_EXPAND {
+        var hg = hug_of(n, axis)
+        if hg > v {
+            v = hg
+            twrite(s_ind, n, tget(s_ind, n) | axis_bit(axis))
+        }
+    }
+    return clamp_axis(n, axis, v, avail)
+}
+
+// 解析并落地单轴（意图 + expand + clamp），并维护「定尺寸」位
+func resolve_axis(n: i64, axis: i64, avail: i64, ok: bool) -> i64 {
+    var v = axis_value(n, axis, avail, ok)
+    v = axis_finish(n, axis, v, avail)
+    set_size(n, axis, v)
+    if (tget(s_ind, n) & axis_bit(axis)) == 0 {
+        twrite(s_ok, n, tget(s_ok, n) | axis_bit(axis))
+    }
+    return v
+}
+
+// 根：父给盒 = 窗口内容盒（两轴都定尺寸）
+func resolve_root(n: i64) {
+    var kw = kind_of(n, 0)
+    var kh = kind_of(n, 1)
+    twrite(s_aw, n, g_win_w)
+    twrite(s_ah, n, g_win_h)
+    if kw == K_RATIO && kh == K_RATIO {
+        // 两轴都是比例：无基准，按稿 §2 的 ratio 前提（另一轴定尺寸）报错并退化为 hug
+        diag_add("ratio-both-axes", n, -1, "两轴都是 ratio，缺少定尺寸基准")
+        resolve_axis(n, 0, g_win_w, true)
+        resolve_axis(n, 1, g_win_h, true)
+    } else if kw == K_RATIO {
+        var hv = resolve_axis(n, 1, g_win_h, true)
+        var wv = ratio_from(hv, a_of(n, 0), b_of(n, 0), 0)
+        wv = clamp_axis(n, 0, wv, g_win_w)
+        set_size(n, 0, wv)
+        twrite(s_ok, n, tget(s_ok, n) | 1)
+    } else if kh == K_RATIO {
+        var wv2 = resolve_axis(n, 0, g_win_w, true)
+        var hv2 = ratio_from(wv2, a_of(n, 1), b_of(n, 1), 1)
+        hv2 = clamp_axis(n, 1, hv2, g_win_h)
+        set_size(n, 1, hv2)
+        twrite(s_ok, n, tget(s_ok, n) | 2)
+    } else {
+        resolve_axis(n, 0, g_win_w, true)
+        resolve_axis(n, 1, g_win_h, true)
+    }
+    twrite(s_x, n, 0)
+    twrite(s_y, n, 0)
+}
+
+// ============================================================
+// 第 3 趟：distribute（最大余数法）
+// ============================================================
+
+// 最大余数法：budget 按 weights 分配，返回各份额（和 == budget；预算不足 → 全 0）。
+// 余数相同按子序（稿 §2 末条）。weights 为 fr 权重（1fr = 100，仅比值有效）。
+func distribute(budget: i64, weights: table<i64>) -> table<i64> {
+    var n = len(weights)
+    var out = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(out, 0)
+        i = i + 1
+    }
+    if n <= 0 || budget <= 0 {
+        return out
+    }
+    var wtot: i64 = 0
+    i = 0
+    while i < n {
+        wtot = wtot + weights[i]
+        i = i + 1
+    }
+    if wtot <= 0 {
+        return out
+    }
+    // 整数商（分母为正 ⇒ 向下取整）+ 余数
+    var used: i64 = 0
+    var rems = table_new_i64()
+    i = 0
+    while i < n {
+        var share = (budget * weights[i]) / wtot
+        out[i] = share
+        used = used + share
+        table_push(rems, budget * weights[i] - share * wtot)
+        i = i + 1
+    }
+    // 余量按余数从大到小补齐（同余数按子序）
+    var left = budget - used
+    var guard: i64 = 0
+    while left > 0 && guard < n {
+        var best: i64 = -1
+        var besti: i64 = -1
+        i = 0
+        while i < n {
+            if rems[i] >= 0 && rems[i] > best {
+                best = rems[i]
+                besti = i
+            }
+            i = i + 1
+        }
+        if besti < 0 {
+            guard = n
+        } else {
+            out[besti] = out[besti] + 1
+            rems[besti] = -1
+            left = left - 1
+            guard = guard + 1
+        }
+    }
+    return out
+}
+
+// 主轴分布词 → 起始偏移（§3：space-* 吸收剩余，gap 作最小间距）
+func dist_off(c: i64, extra: i64, cnt: i64) -> i64 {
+    if extra <= 0 {
+        return 0
+    }
+    if c == 1 {
+        return extra / 2
+    }
+    if c == 2 {
+        return extra
+    }
+    if c == 4 {
+        if cnt <= 0 {
+            return 0
+        }
+        return (extra / cnt) / 2
+    }
+    if c == 5 {
+        return extra / (cnt + 1)
+    }
+    return 0
+}
+
+// 主轴分布词 → 每个间隙的额外量
+func dist_gap(c: i64, extra: i64, cnt: i64) -> i64 {
+    if extra <= 0 {
+        return 0
+    }
+    if c == 3 {
+        if cnt <= 1 {
+            return 0
+        }
+        return extra / (cnt - 1)
+    }
+    if c == 4 {
+        if cnt <= 0 {
+            return 0
+        }
+        return extra / cnt
+    }
+    if c == 5 {
+        return extra / (cnt + 1)
+    }
+    return 0
+}
+
+// ============================================================
+// 第 3 趟：place —— row / column（线性容器）
+// ============================================================
+
+// 交叉轴取值（不写表；ratio 交叉轴由调用方按主轴尺寸推）
+func cross_value(k: i64, a_cross: i64, avail_cross: i64, stretch: bool) -> i64 {
+    var kd = kind_of(k, a_cross)
+    if kd == K_FILL || kd == K_FR {
+        return avail_cross
+    }
+    if kd == K_HUG && stretch {
+        return avail_cross
+    }
+    var ok = true
+    return axis_value(k, a_cross, avail_cross, ok)
+}
+
+// 线性容器：a_main = 0 (row) / 1 (column)
+func solve_linear(n: i64, a_main: i64) {
+    var a_cross = 1 - a_main
+    var cnt = kid_count(n)
+    var avail_main = content_box(n, a_main)
+    var avail_cross = content_box(n, a_cross)
+    var gap = gap_fp(n)
+    var cross_code = dist_cross(n, a_cross)
+    var stretch: bool = cross_code == D_STRETCH
+    twrite(s_nk, n, cnt)
+    if cnt == 0 {
+        finish_overflow(n, 0, 0, 0, 0)
+        return
+    }
+    var sizes = table_new_i64()
+    var flex = table_new_i64()
+    var wts = table_new_i64()
+    var defsum: i64 = 0
+    var flexn: i64 = 0
+    var wtot: i64 = 0
+    var bm = axis_bit(a_main)
+    // --- 1) 主轴：非弹性子项先定尺寸；弹性子项记权重 ---
+    var k = tiu_tree.first_child(n)
+    while k >= 0 {
+        var kd = kind_of(k, a_main)
+        var v: i64 = 0
+        var isflex: i64 = 0
+        // 记录约束来源：父给内容盒（主/交叉轴各按自己的轴位落表，供 explain 读）
+        if a_main == 0 {
+            twrite(s_aw, k, avail_main)
+            twrite(s_ah, k, avail_cross)
+        } else {
+            twrite(s_aw, k, avail_cross)
+            twrite(s_ah, k, avail_main)
+        }
+        if kd == K_FILL || kd == K_FR {
+            isflex = 1
+            var wt: i64 = 100
+            if kd == K_FR {
+                wt = a_of(k, a_main)
+                if wt <= 0 {
+                    wt = 100
+                }
+            }
+            flexn = flexn + 1
+            wtot = wtot + wt
+            table_push(wts, wt)
+        } else if kd == K_RATIO {
+            // 主轴 ratio：交叉轴先定，主轴按比例（稿 §2 ratio 前提）
+            var cv = cross_value(k, a_cross, avail_cross, stretch)
+            cv = clamp_axis(k, a_cross, cv, avail_cross)
+            v = ratio_from(cv, a_of(k, a_main), b_of(k, a_main), a_main)
+            v = axis_finish(k, a_main, v, avail_main)
+            defsum = defsum + v
+            set_size(k, a_main, v)
+            twrite(s_ok, k, tget(s_ok, k) | bm)
+        } else {
+            v = resolve_axis(k, a_main, avail_main, base_ok(n, a_main))
+            defsum = defsum + v
+        }
+        table_push(sizes, v)
+        table_push(flex, isflex)
+        k = tiu_tree.next_sibling(k)
+    }
+    twrite(s_nf, n, flexn)
+    // --- 2) 剩余空间按权重分配（rest<0 不压缩 hug 子项，直接溢出 I2）---
+    var fixed = gap * (cnt - 1)
+    var rest = avail_main - fixed - defsum
+    var shares = table_new_i64()
+    if flexn > 0 && rest > 0 {
+        shares = distribute(rest, wts)
+    } else {
+        var z: i64 = 0
+        while z < flexn {
+            table_push(shares, 0)
+            z = z + 1
+        }
+    }
+    var fi: i64 = 0
+    var idx: i64 = 0
+    k = tiu_tree.first_child(n)
+    while k >= 0 {
+        if flex[idx] == 1 {
+            var v2 = shares[fi]
+            v2 = axis_finish(k, a_main, v2, avail_main)
+            sizes[idx] = v2
+            set_size(k, a_main, v2)
+            if (tget(s_ind, k) & bm) == 0 {
+                twrite(s_ok, k, tget(s_ok, k) | bm)
+            }
+            fi = fi + 1
+        }
+        idx = idx + 1
+        k = tiu_tree.next_sibling(k)
+    }
+    // --- 3) 主轴落位 + 交叉轴尺寸/对齐 ---
+    var total = fixed
+    idx = 0
+    while idx < cnt {
+        total = total + sizes[idx]
+        idx = idx + 1
+    }
+    var extra = avail_main - total
+    var code_main = dist_main(n, a_main)
+    var off = dist_off(code_main, extra, cnt)
+    var gex = dist_gap(code_main, extra, cnt)
+    var cursor = pad_s(n, a_main) + off
+    var maxcross: i64 = 0
+    idx = 0
+    k = tiu_tree.first_child(n)
+    while k >= 0 {
+        if a_main == 0 {
+            twrite(s_x, k, tget(s_x, n) + cursor)
+        } else {
+            twrite(s_y, k, tget(s_y, n) + cursor)
+        }
+        cursor = cursor + sizes[idx] + gap + gex
+        // 交叉轴尺寸
+        var kc = kind_of(k, a_cross)
+        var cv: i64 = 0
+        if kc == K_RATIO {
+            cv = ratio_from(sizes[idx], a_of(k, a_cross), b_of(k, a_cross), a_cross)
+            cv = axis_finish(k, a_cross, cv, avail_cross)
+        } else if kc == K_FILL || kc == K_FR {
+            cv = avail_cross
+            cv = clamp_axis(k, a_cross, cv, avail_cross)
+            twrite(s_ok, k, tget(s_ok, k) | axis_bit(a_cross))
+        } else if kc == K_HUG && stretch {
+            // 交叉轴 stretch：hug 子项撑满内容盒（§3），仍受 min/max 夹取（I1）
+            cv = clamp_axis(k, a_cross, avail_cross, avail_cross)
+            twrite(s_ok, k, tget(s_ok, k) | axis_bit(a_cross))
+        } else {
+            cv = axis_value(k, a_cross, avail_cross, base_ok(n, a_cross))
+            cv = axis_finish(k, a_cross, cv, avail_cross)
+            if (tget(s_ind, k) & axis_bit(a_cross)) == 0 {
+                twrite(s_ok, k, tget(s_ok, k) | axis_bit(a_cross))
+            }
+        }
+        set_size(k, a_cross, cv)
+        // 交叉轴对齐（§3：交叉轴只接受 start/center/end/stretch）
+        var align = cross_code
+        if align == 3 || align == 4 || align == 5 {
+            diag_add("cross-distribution", n, a_cross, "policy=" + tiu_props.dist_text(align) + " 交叉轴不接受 space-*，按 start 处理")
+            align = 0
+        }
+        var co: i64 = 0
+        if align == 1 {
+            co = (avail_cross - cv) / 2
+        } else if align == 2 {
+            co = avail_cross - cv
+        }
+        if co < 0 {
+            co = 0
+        }
+        if a_cross == 0 {
+            twrite(s_x, k, tget(s_x, n) + pad_s(n, a_cross) + co)
+        } else {
+            twrite(s_y, k, tget(s_y, n) + pad_s(n, a_cross) + co)
+        }
+        if cv > maxcross {
+            maxcross = cv
+        }
+        idx = idx + 1
+        k = tiu_tree.next_sibling(k)
+    }
+    // --- 4) 溢出判定（只记录，不改几何 I2）---
+    var ovm: i64 = 0
+    var ovc: i64 = 0
+    if total + pad_s(n, a_main) + pad_e(n, a_main) > size_of(n, a_main) {
+        ovm = 1
+    }
+    if maxcross + pad_s(n, a_cross) + pad_e(n, a_cross) > size_of(n, a_cross) {
+        ovc = 1
+    }
+    var nx = total + pad_s(n, 0) + pad_e(n, 0)
+    var ny = maxcross + pad_s(n, 1) + pad_e(n, 1)
+    if a_main == 0 {
+        finish_overflow(n, ovm, ovc, nx, ny)
+    } else {
+        finish_overflow(n, ovc, ovm, nx, ny)
+    }
+}
+
+// ============================================================
+// 第 3 趟：place —— grid
+// ============================================================
+
+func solve_grid(n: i64) {
+    var cnt = kid_count(n)
+    twrite(s_nk, n, cnt)
+    var cols = tiu_props.col_count(n)
+    if cols <= 0 {
+        cols = 1
+    }
+    var gap = gap_fp(n)
+    var aw = content_box(n, 0)
+    var ah = content_box(n, 1)
+    var rows: i64 = 0
+    if cnt > 0 {
+        rows = (cnt + cols - 1) / cols
+    }
+    if cnt == 0 {
+        finish_overflow(n, 0, 0, 0, 0)
+        return
+    }
+    // --- 1) 列宽：定值列先算，弹性列按权重分配余量，hug 列取列内最大 hug ---
+    var widths = table_new_i64()
+    var wts = table_new_i64()
+    var defsum: i64 = 0
+    var flexn: i64 = 0
+    var c: i64 = 0
+    while c < cols {
+        var kd = tiu_props.col_kind(n, c)
+        var ca = tiu_props.col_a(n, c)
+        var v: i64 = 0
+        if kd == K_FILL || kd == K_FR {
+            var wt: i64 = 100
+            if kd == K_FR {
+                wt = ca
+                if wt <= 0 {
+                    wt = 100
+                }
+            }
+            table_push(wts, wt)
+            flexn = flexn + 1
+        } else {
+            if kd == K_PX {
+                v = c_px(ca)
+            } else if kd == K_EM {
+                v = c_em(ca, tget(s_font, n))
+            } else if kd == K_PT {
+                v = c_pt(ca)
+            } else if kd == K_VW {
+                v = c_vw(ca)
+            } else if kd == K_VH {
+                v = c_vh(ca)
+            } else if kd == K_PCT {
+                v = c_pct(ca, aw)
+            } else {
+                var mx: i64 = 0
+                var r: i64 = 0
+                while r < rows {
+                    var k = child_at(n, r * cols + c)
+                    if k >= 0 {
+                        var hw = child_hug(k, 0)
+                        if hw > mx {
+                            mx = hw
+                        }
+                    }
+                    r = r + 1
+                }
+                v = mx
+            }
+            defsum = defsum + v
+        }
+        table_push(widths, v)
+        c = c + 1
+    }
+    var rest = aw - gap * (cols - 1) - defsum
+    var shares = table_new_i64()
+    if flexn > 0 && rest > 0 {
+        shares = distribute(rest, wts)
+    } else {
+        var z: i64 = 0
+        while z < flexn {
+            table_push(shares, 0)
+            z = z + 1
+        }
+    }
+    var fi: i64 = 0
+    c = 0
+    while c < cols {
+        var kd2 = tiu_props.col_kind(n, c)
+        if kd2 == K_FILL || kd2 == K_FR {
+            widths[c] = shares[fi]
+            fi = fi + 1
+        }
+        c = c + 1
+    }
+    // --- 2) 行高：hug（行内最高子项；fill/fr/pct 子项按自身 hug 参与）---
+    var heights = table_new_i64()
+    var r2: i64 = 0
+    while r2 < rows {
+        var mh: i64 = 0
+        var c2: i64 = 0
+        while c2 < cols {
+            var k2 = child_at(n, r2 * cols + c2)
+            if k2 >= 0 {
+                var hv = child_hug(k2, 1)
+                if hv > mh {
+                    mh = hv
+                }
+            }
+            c2 = c2 + 1
+        }
+        table_push(heights, mh)
+        r2 = r2 + 1
+    }
+    // --- 3) 轨道合计与剩余分布（dist_x 管列、dist_y 管行）---
+    var wsum: i64 = 0
+    c = 0
+    while c < cols {
+        if c > 0 {
+            wsum = wsum + gap
+        }
+        wsum = wsum + widths[c]
+        c = c + 1
+    }
+    var hsum: i64 = 0
+    r2 = 0
+    while r2 < rows {
+        if r2 > 0 {
+            hsum = hsum + gap
+        }
+        hsum = hsum + heights[r2]
+        r2 = r2 + 1
+    }
+    var ex_w = aw - wsum
+    var ex_h = ah - hsum
+    var offx = dist_off(tiu_props.dist_x(n), ex_w, cols)
+    var gxx = dist_gap(tiu_props.dist_x(n), ex_w, cols)
+    var offy = dist_off(tiu_props.dist_y(n), ex_h, rows)
+    var gyy = dist_gap(tiu_props.dist_y(n), ex_h, rows)
+    // --- 4) 落位：行优先，单元格左上角对齐 ---
+    var idx: i64 = 0
+    var ycur = pad_s(n, 1) + offy
+    r2 = 0
+    while r2 < rows {
+        var xcur = pad_s(n, 0) + offx
+        var c3: i64 = 0
+        while c3 < cols {
+            if idx < cnt {
+                var k = child_at(n, idx)
+                var cw = widths[c3]
+                var chh = heights[r2]
+                // 约束来源：grid 子项的父给盒就是单元格（% / min / max 的基数）
+                twrite(s_aw, k, cw)
+                twrite(s_ah, k, chh)
+                var kw = kind_of(k, 0)
+                var kh = kind_of(k, 1)
+                var sw: i64 = 0
+                if kw == K_FILL || kw == K_FR {
+                    sw = cw
+                    twrite(s_ok, k, tget(s_ok, k) | 1)
+                } else if kw == K_RATIO {
+                    sw = ratio_from(chh, a_of(k, 0), b_of(k, 0), 0)
+                    sw = axis_finish(k, 0, sw, cw)
+                } else {
+                    // 单元格是子项的父给盒：% / min / max 的基数取单元格
+                    sw = axis_value(k, 0, cw, true)
+                    sw = axis_finish(k, 0, sw, cw)
+                    if (tget(s_ind, k) & 1) == 0 {
+                        twrite(s_ok, k, tget(s_ok, k) | 1)
+                    }
+                }
+                var sh: i64 = 0
+                if kh == K_FILL || kh == K_FR {
+                    sh = chh
+                    twrite(s_ok, k, tget(s_ok, k) | 2)
+                } else if kh == K_RATIO {
+                    sh = ratio_from(sw, a_of(k, 1), b_of(k, 1), 1)
+                    sh = axis_finish(k, 1, sh, chh)
+                } else if tiu_props.dist_y(n) == D_STRETCH {
+                    // 行内 stretch：子项撑满行高（§3 交叉轴 stretch）
+                    sh = chh
+                } else {
+                    sh = axis_value(k, 1, chh, true)
+                    sh = axis_finish(k, 1, sh, chh)
+                    if (tget(s_ind, k) & 2) == 0 {
+                        twrite(s_ok, k, tget(s_ok, k) | 2)
+                    }
+                }
+                set_size(k, 0, sw)
+                set_size(k, 1, sh)
+                twrite(s_x, k, tget(s_x, n) + xcur)
+                twrite(s_y, k, tget(s_y, n) + ycur)
+                idx = idx + 1
+                xcur = xcur + cw + gap + gxx
+            }
+            c3 = c3 + 1
+        }
+        ycur = ycur + heights[r2] + gap + gyy
+        r2 = r2 + 1
+    }
+    var ovx: i64 = 0
+    var ovy: i64 = 0
+    if wsum + pad_s(n, 0) + pad_e(n, 0) > size_of(n, 0) {
+        ovx = 1
+    }
+    if hsum + pad_s(n, 1) + pad_e(n, 1) > size_of(n, 1) {
+        ovy = 1
+    }
+    finish_overflow(n, ovx, ovy, wsum + pad_s(n, 0) + pad_e(n, 0), hsum + pad_s(n, 1) + pad_e(n, 1))
+}
+
+// ============================================================
+// 第 3 趟：place —— overlay（anchor + dx/dy，§7）
+// ============================================================
+
+func solve_overlay(n: i64) {
+    var cnt = kid_count(n)
+    twrite(s_nk, n, cnt)
+    var aw = content_box(n, 0)
+    var ah = content_box(n, 1)
+    if cnt == 0 {
+        finish_overflow(n, 0, 0, 0, 0)
+        return
+    }
+    var idx: i64 = 0
+    var maxw: i64 = 0
+    var maxh: i64 = 0
+    var k = tiu_tree.first_child(n)
+    while k >= 0 {
+        var anc = tiu_props.anchor(k)
+        // 偏移：props dx/dy 优先；都为 0 时回退到树上的旧绝对偏移（legacy_off 内统一处理）
+        var dx = legacy_off(k, 0)
+        var dy = legacy_off(k, 1)
+        // 约束来源：overlay 子项的父给盒就是父内容盒
+        twrite(s_aw, k, aw)
+        twrite(s_ah, k, ah)
+        var sw: i64 = 0
+        var sh: i64 = 0
+        var ox: i64 = 0
+        var oy: i64 = 0
+        if anc == 9 {
+            // fill：撑满父内容盒（dx/dy 不参与）
+            sw = aw
+            sh = ah
+            twrite(s_ok, k, tget(s_ok, k) | 3)
+        } else {
+            var kw = kind_of(k, 0)
+            var kh = kind_of(k, 1)
+            if kw == K_RATIO && kh == K_RATIO {
+                diag_add("ratio-both-axes", k, -1, "两轴都是 ratio，缺少定尺寸基准")
+                sw = resolve_axis(k, 0, aw, base_ok(n, 0))
+                sh = resolve_axis(k, 1, ah, base_ok(n, 1))
+            } else if kw == K_RATIO {
+                sh = resolve_axis(k, 1, ah, base_ok(n, 1))
+                sw = ratio_from(sh, a_of(k, 0), b_of(k, 0), 0)
+                sw = clamp_axis(k, 0, sw, aw)
+                set_size(k, 0, sw)
+            } else if kh == K_RATIO {
+                sw = resolve_axis(k, 0, aw, base_ok(n, 0))
+                sh = ratio_from(sw, a_of(k, 1), b_of(k, 1), 1)
+                sh = clamp_axis(k, 1, sh, ah)
+                set_size(k, 1, sh)
+            } else {
+                sw = resolve_axis(k, 0, aw, base_ok(n, 0))
+                sh = resolve_axis(k, 1, ah, base_ok(n, 1))
+            }
+            // 九点锚点：横向 0/1/2，纵向 0/1/2（§7）
+            var hp = anc % 3
+            var vp = anc / 3
+            if hp == 1 {
+                ox = (aw - sw) / 2
+            } else if hp == 2 {
+                ox = aw - sw
+            }
+            if vp == 1 {
+                oy = (ah - sh) / 2
+            } else if vp == 2 {
+                oy = ah - sh
+            }
+        }
+        var px = pad_s(n, 0) + ox + dx
+        var py = pad_s(n, 1) + oy + dy
+        twrite(s_x, k, tget(s_x, n) + px)
+        twrite(s_y, k, tget(s_y, n) + py)
+        if px + sw > maxw {
+            maxw = px + sw
+        }
+        if py + sh > maxh {
+            maxh = py + sh
+        }
+        idx = idx + 1
+        k = tiu_tree.next_sibling(k)
+    }
+    var ovx: i64 = 0
+    var ovy: i64 = 0
+    if maxw > size_of(n, 0) {
+        ovx = 1
+    }
+    if maxh > size_of(n, 1) {
+        ovy = 1
+    }
+    finish_overflow(n, ovx, ovy, maxw, maxh)
+}
+
+// 叶子节点（无子项容器）：自身 hug 超出给定尺寸 → 记录溢出
+func leaf_check(n: i64) {
+    var ovx: i64 = 0
+    var ovy: i64 = 0
+    var nx = hug_of(n, 0)
+    var ny = hug_of(n, 1)
+    if nx > size_of(n, 0) {
+        ovx = 1
+    }
+    if ny > size_of(n, 1) {
+        ovy = 1
+    }
+    finish_overflow(n, ovx, ovy, nx, ny)
+}
+
+// 溢出收尾：置裁剪位（clip/scroll）+ error 策略写诊断（§5）
+func finish_overflow(n: i64, ovx: i64, ovy: i64, need_x: i64, need_y: i64) {
+    var ov: i64 = 0
+    if ovx != 0 {
+        ov = ov + 1
+    }
+    if ovy != 0 {
+        ov = ov + 2
+    }
+    twrite(s_ov, n, ov)
+    if ov == 0 {
+        return
+    }
+    var pol = tiu_props.overflow(n)
+    if pol == O_ERROR {
+        if ovx != 0 {
+            diag_add("overflow", n, 0, "need=" + fp_text(need_x) + "px have=" + fp_text(size_of(n, 0)) + "px policy=error")
+        }
+        if ovy != 0 {
+            diag_add("overflow", n, 1, "need=" + fp_text(need_y) + "px have=" + fp_text(size_of(n, 1)) + "px policy=error")
+        }
+    }
+}
+
+// 分派：按控件类型选容器语义
+func solve_children(n: i64) {
+    var ty = tiu_tree.ty_of(n)
+    if ty == 0 {
+        solve_linear(n, 0)
+    } else if ty == 1 {
+        solve_linear(n, 1)
+    } else if ty == 5 {
+        // Scroll：纵向堆叠容器；裁剪交给 s_ov + 滚动量（tree.set_scroll）
+        solve_linear(n, 1)
+    } else if ty == 8 {
+        solve_grid(n)
+    } else if ty == 9 {
+        solve_overlay(n)
+    } else if ty == 4 {
+        // Absolute 退化为 overlay（top-start + 偏移），兼容旧树
+        solve_overlay(n)
+    } else {
+        leaf_check(n)
+    }
+}
+
+// ============================================================
+// 公共入口
+// ============================================================
+
+// 求解整棵树并把结果落树。
+// win_w / win_h 是窗口内容区的整数像素尺寸；根节点两轴都收紧到该盒。
+pub func layout(root: i64, win_w: i64, win_h: i64) {
+    if root < 0 {
+        return
+    }
+    g_win_w = fpx(win_w)
+    g_win_h = fpx(win_h)
+    g_diag = table_new_string()
+    s_w = table_new_i64()
+    s_h = table_new_i64()
+    s_x = table_new_i64()
+    s_y = table_new_i64()
+    s_hw = table_new_i64()
+    s_hh = table_new_i64()
+    s_font = table_new_i64()
+    s_aw = table_new_i64()
+    s_ah = table_new_i64()
+    s_ov = table_new_i64()
+    s_nk = table_new_i64()
+    s_nf = table_new_i64()
+    s_ind = table_new_i64()
+    s_ok = table_new_i64()
+    var tot = tiu_tree.total()
+    prep(tot)
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    // 阶段 0：字号继承（前序；font-size 是唯一可继承属性，§2/§6）
+    while i < len(order) {
+        var n = order[i]
+        var own = tiu_props.font_size_own(n)
+        if own > 0 {
+            twrite(s_font, n, own)
+        } else {
+            var p = tiu_tree.parent_of(n)
+            if p < 0 {
+                twrite(s_font, n, 16)
+            } else {
+                twrite(s_font, n, tget(s_font, p))
+            }
+        }
+        i = i + 1
+    }
+    // 阶段 1：measure_hug（后序）
+    i = len(order) - 1
+    while i >= 0 {
+        measure_hug(order[i])
+        i = i - 1
+    }
+    // 阶段 2：根尺寸（窗口内容盒）
+    resolve_root(root)
+    // 阶段 3：前序 distribute + place + 溢出
+    i = 0
+    while i < len(order) {
+        solve_children(order[i])
+        i = i + 1
+    }
+    // 阶段 4：落树（定点 → 整数像素，四舍五入）
+    i = 0
+    while i < len(order) {
+        var n2 = order[i]
+        tiu_tree.set_rect(n2, to_px(tget(s_x, n2)), to_px(tget(s_y, n2)), to_px(tget(s_w, n2)), to_px(tget(s_h, n2)))
+        i = i + 1
+    }
+}
+
+// 内容 hug（定点）——探针与 explain 共用
+pub func hug_w(id: i64) -> i64 {
+    return hug_of(id, 0)
+}
+
+pub func hug_h(id: i64) -> i64 {
+    return hug_of(id, 1)
+}
+
+// 溢出位：0 无 / 1 x / 2 y / 3 两轴
+pub func ov_flags(id: i64) -> i64 {
+    return tget(s_ov, id)
+}
+
+// 最终矩形（26.6 定点，未取整）
+pub func fp_rect_x(id: i64) -> i64 { return tget(s_x, id) }
+pub func fp_rect_y(id: i64) -> i64 { return tget(s_y, id) }
+pub func fp_rect_w(id: i64) -> i64 { return tget(s_w, id) }
+pub func fp_rect_h(id: i64) -> i64 { return tget(s_h, id) }
+
+// 解释：约束来源链的可读形式（§4 I4）
+//   输入尺寸意图 / 父给内容盒 / min-max / hug / 最终矩形（整数 + 定点）/ 子项数
+pub func explain(id: i64) -> string {
+    var sb = string_builder()
+    if id < 0 || id >= tiu_tree.total() {
+        sb_append(sb, "explain: 节点不存在")
+        return sb_build(sb)
+    }
+    var ty = tiu_tree.ty_of(id)
+    sb_append(sb, "node #" + to_string(id) + " " + tiu_tree.type_name(ty) + " path=" + tiu_tree.path_of(id))
+    var p = tiu_tree.parent_of(id)
+    if p >= 0 {
+        sb_append(sb, "  from #" + to_string(p) + " " + tiu_tree.type_name(tiu_tree.ty_of(p)))
+    } else {
+        sb_append(sb, "  from window")
+    }
+    sb_append(sb, "\n  intent: w=" + tiu_props.size_text(tiu_props.w_kind(id), tiu_props.w_a(id), tiu_props.w_b(id)))
+    sb_append(sb, " h=" + tiu_props.size_text(tiu_props.h_kind(id), tiu_props.h_a(id), tiu_props.h_b(id)))
+    sb_append(sb, "\n  given box: w=" + fp_text(tget(s_aw, id)) + " h=" + fp_text(tget(s_ah, id)))
+    sb_append(sb, "\n  min/max: min-w=" + mm_text(id, 0, false) + " max-w=" + mm_text(id, 0, true))
+    sb_append(sb, " min-h=" + mm_text(id, 1, false) + " max-h=" + mm_text(id, 1, true))
+    sb_append(sb, "\n  hug: w=" + fp_text(hug_of(id, 0)) + " h=" + fp_text(hug_of(id, 1)))
+    sb_append(sb, "\n  rect: x=" + to_string(to_px(tget(s_x, id))) + " y=" + to_string(to_px(tget(s_y, id))))
+    sb_append(sb, " w=" + to_string(to_px(tget(s_w, id))) + " h=" + to_string(to_px(tget(s_h, id))))
+    sb_append(sb, " (fp: " + fp_text(tget(s_x, id)) + "," + fp_text(tget(s_y, id)) + "," + fp_text(tget(s_w, id)) + "," + fp_text(tget(s_h, id)) + ")")
+    sb_append(sb, "\n  children: n=" + to_string(tget(s_nk, id)) + " flex=" + to_string(tget(s_nf, id)))
+    sb_append(sb, " dist-x=" + tiu_props.dist_text(tiu_props.dist_x(id)) + " dist-y=" + tiu_props.dist_text(tiu_props.dist_y(id)))
+    sb_append(sb, " overflow=" + tiu_props.overflow_text(tiu_props.overflow(id)) + " ov=" + to_string(tget(s_ov, id)))
+    return sb_build(sb)
+}
+
+// min/max 的可读形式（未设 → none）
+func mm_text(id: i64, axis: i64, is_max: bool) -> string {
+    var kd: i64 = -1
+    var a: i64 = 0
+    if is_max {
+        if axis == 0 {
+            kd = tiu_props.max_w_kind(id)
+            a = tiu_props.max_w_a(id)
+        } else {
+            kd = tiu_props.max_h_kind(id)
+            a = tiu_props.max_h_a(id)
+        }
+    } else {
+        if axis == 0 {
+            kd = tiu_props.min_w_kind(id)
+            a = tiu_props.min_w_a(id)
+        } else {
+            kd = tiu_props.min_h_kind(id)
+            a = tiu_props.min_h_a(id)
+        }
+    }
+    if kd < 0 {
+        return "none"
+    }
+    return tiu_props.size_text(kd, a, 0)
+}
+}
