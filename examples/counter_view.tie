@@ -23,6 +23,7 @@ type tie<logic, unsafe:mem>
 // redraw is automatic on state change, no manual open/close pairing.
 
 import "../ui/src/view.tie"
+import "../ui/src/ui_bridge.tie"
 import "../ui/src/layout.tie"
 import "../ui/src/hit.tie"
 import "../ui/src/theme.tie"
@@ -93,12 +94,10 @@ var g_history: table<string> = []
 func main() -> i64 {
     println("=== tiu counter (declarative view DSL) ===")
 
-    tiu_build_reset()
     var node_count = vw.mount(app())
     println("[INFO] mounted " + to_string(node_count) + " nodes from app()")
 
-    var root = tiu_tree.root()
-    tiu_layout.layout(root, Constraints.tight(W, H))
+    var root = ui_bridge.build_at(W, H)
     dump_layout(root)
 
     var cv = cvs.new_window(W, H, 1.0)
@@ -297,10 +296,10 @@ func click(hwnd: i64, x: i64, y: i64) {
 
 func dump_layout(root: i64) {
     println("[layout] " + to_string(W) + "x" + to_string(H) + ", " + to_string(tiu_tree.total()) + " nodes")
-    walk(root, 0)
+    dump_walk(root, 0)
 }
 
-func walk(n: i64, d: i64) {
+func dump_walk(n: i64, d: i64) {
     var r = tiu_tree.rect(n)
     var ind = ""
     var i: i64 = 0
@@ -317,7 +316,7 @@ func walk(n: i64, d: i64) {
         + " (" + to_string(r.x) + "," + to_string(r.y) + "," + to_string(r.w) + "," + to_string(r.h) + ")" + extra)
     var k = tiu_tree.first_child(n)
     while k >= 0 {
-        walk(k, d + 1)
+        dump_walk(k, d + 1)
         k = tiu_tree.next_sibling(k)
     }
 }

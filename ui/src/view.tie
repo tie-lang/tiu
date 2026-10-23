@@ -5,18 +5,26 @@ type tie<class>
 // 目标：把写 tiu 界面变成写前端组件那样的体验——纯函数、声明式嵌套、
 // 组件可复用、条件/列表渲染内联、状态变化自动重渲染。
 //
-// ---- 设计依据（2026-09-26 全部实测，非推测）----
+// ---- 单一真源（架构裁定）----
+// 本层不再直接向 `tiu_build` 发指令流，而是把 `Elem` 树写进 **std/ui 的中立
+// 描述树**，随后交给 `ui_bridge` 做「控件类型 + 类型化属性 → 布局求解」。
+// 于是三条入口共用同一条下游管线：
+//   元素语法（编译器降解）→ std/ui ─┐
+//   本文件（vw 组合子）   → std/ui ─┼→ ui_bridge → tiu 骨架 → layout2 → paint
+//   应用代码（直接调 ui）→ std/ui ─┘
+// 换言之：`vw` 是同一棵中立树上的语法糖，不是第二条渲染路径。
+//
+// ---- 设计依据（2026-09-26 实测，非推测）----
 //   ✓ 表字面量 `[a, b]` 可嵌套表达子树
-//   ✓ enum payload：string / i64 / `table<Elem>` 递归 / 多字段——**均可用**
-//   ✓ 泛型函数 + `fn` 参数（`each<T>(items, f)`）——**可用**（组件与列表渲染的基石）
+//   ✓ enum payload：string / i64 / `table<Elem>` 递归 / 多字段——均可用
+//   ✓ 泛型函数 + `fn` 参数（`each<T>(items, f)`）——可用（组件与列表渲染的基石）
 //   ✓ `for it in table` 遍历——可用
-//   ✗ `if` / `for` 作表达式——**不可用**（"无法以 If/For 开始表达式"）
+//   ✗ `if` / `for` 作表达式——不可用（"无法以 If/For 开始表达式"）
 //        → 条件渲染由 `show_if` / `hide_if` / `choose` 补足
 //        → 列表渲染由 `each_str` / `each_i64` 补足
-//   ✗ 表字面量尾随逗号——**不支持**（"无法以 RBracket 开始表达式"）
-//        → 末元素后不加逗号（这是当前书写体验的主要妥协，见设计文档）
+//   ✗ 表字面量尾随逗号——不支持（"无法以 RBracket 开始表达式"）
 //   ✗ `{ }` 在表达式位置是 map 字面量——不能用作 UI 块
-//   ✗ `table<Elem>`（struct 行池）**不能作函数形参**（p.9.12.6 边界）
+//   ✗ `table<Elem>`（struct 行池）不能作函数形参（p.9.12.6 边界）
 //        → 故容器构造走 **enum 构造**（`Elem.Row([...])`），不走包装函数；
 //          叶构造器（Text/Button）形参仅标量/string，可用函数
 //   ✗ enum payload 不支持 struct / fn（E00365）
@@ -36,11 +44,16 @@ type tie<class>
 //       ])
 //   }
 //
+//   // 单帧：mount_at 会写 std/ui 树并立刻求解布局，返回 tiu 根节点。
+//   var root = mount_at(app(s), 360, 260)
+//
 // 组件 = 普通函数（可带参、可泛型、可组合）；状态由应用层持有；状态变化后
 // 重新调用 app(s) 得到新树，框架按 slot 复用骨架（差分 O(变化)，静态帧零重绘）。
 
 import "./tree.tie"
 import "./build.tie"
+import "./ui_bridge.tie"
+import "/std/ui.tie" as ui
 
 // ---- 声明式节点（enum 递归 payload 承载树）----
 // 变体语义：
@@ -70,6 +83,33 @@ enum Elem {
 }
 
 namespace vw {
+
+// ---- 动作码与事件处理器 ----
+// 动作码 `act` 是应用层自己定义的状态机编号；本层把它挂到 std/ui 节点上，
+// 并在点击时登记为「待取动作」，由应用层用 `take_action()` 取走。
+// 这样 vw 视图与元素语法共用同一条事件轴（捕获 → 目标 → 冒泡）。
+pub var g_vw_act: table<i64> = []   // std/ui 节点 id → 动作码
+pub var g_vw_pending: i64 = 0       // 最近一次点击对应的动作码（0 = 无）
+
+// 事件处理器：签名与 std/ui 的函数值事件表一致。
+pub func on_act(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if id < 0 || id >= len(g_vw_act) {
+        return 0
+    }
+    var a = g_vw_act[id]
+    if a == 0 {
+        return 0
+    }
+    g_vw_pending = a
+    return 1
+}
+
+// 取走并清空待处理动作（0 = 没有点击）。
+pub func take_action() -> i64 {
+    var a = g_vw_pending
+    g_vw_pending = 0
+    return a
+}
 
 // ---- 叶构造器（形参仅标量/string，故可用函数）----
 
@@ -193,107 +233,124 @@ pub func join(a: table<Elem>, b: table<Elem>) -> table<Elem> {
     return out
 }
 
-// ---- 树 → 骨架（挂到 tiu 骨架；按 slot 复用与差分）----
-// 返回挂载的节点数。
+// ---- 树 → std/ui 中立描述树（唯一真源）----
+// 返回写入的 ui 节点数。调用方随后用 `mount_at` 一并求解布局。
 
 pub func mount(root: Elem) -> i64 {
-    tiu_build.begin()
-    var n = emit(root, 0, 0)
-    tiu_build.finish()
+    ui.reset()
+    g_vw_act = table_new_i64()
+    g_vw_pending = 0
+    return emit(root, true)
+}
+
+// 写树 + 求解布局：返回 tiu 骨架根节点（-1 = 空树）。
+// 视口尺寸决定 `fill` 的基准，也决定根节点的铺满范围。
+pub func mount_at(root: Elem, w: i64, h: i64) -> i64 {
+    ui.reset()
+    g_vw_act = table_new_i64()
+    g_vw_pending = 0
+    emit(root, true)
+    return ui_bridge.build_at(w, h)
+}
+
+// 记录动作码：写进 g_vw_act（按 std/ui 节点 id 下标），供 on_act 查表。
+func mark_act(act: i64) {
+    if act == 0 {
+        return
+    }
+    var id = ui.current()
+    while len(g_vw_act) <= id {
+        table_push(g_vw_act, 0)
+    }
+    g_vw_act[id] = act
+}
+
+// 容器：默认横向铺满（块级语义），根容器再铺满高度。
+func emit_box(kind: string, kids: table<Elem>, root: bool) -> i64 {
+    ui.begin(kind, "")
+    ui.attr_str("w", "fill")
+    if root {
+        ui.attr_str("h", "fill")
+    }
+    var n: i64 = 1
+    var i: i64 = 0
+    while i < len(kids) {
+        n = n + emit(kids[i], false)
+        i = i + 1
+    }
+    ui.end()
     return n
 }
 
-// 内容指纹（差分键：内容不变 → 版本号不变 → 静态帧零重绘）。
-func fp(kind: i64, label: string, a: i64, b: i64, c: i64) -> i64 {
-    var f: i64 = kind * 1000003 + a * 101 + b * 7919 + c * 104729
-    var i: i64 = 0
-    var n = str_len(label)
-    while i < n {
-        f = (f * 31 + char_code(str_char(label, i))) % 1000000007
-        i = i + 1
-    }
-    if f < 0 {
-        f = -f
-    }
-    return f + 1
-}
-
-// 递归发射：depth 仅用于指纹去重（同层同内容不撞版本）。
-func emit(e: Elem, slot: i64, depth: i64) -> i64 {
+// 递归发射：把 Elem 树写进 std/ui（不再直接发 tiu_build 指令流）。
+func emit(e: Elem, root: bool) -> i64 {
     switch e {
         case Elem.Text(s):
-            tiu_build.open_t(WidgetType.Text, slot, fp(2, s, depth, 0, 0), s, 0, 0, 0, 0)
-            tiu_build.close()
+            ui.begin("label", "")
+            ui.content(s)
+            ui.end()
             return 1
         case Elem.Button(label, act):
-            emit_button(label, act, slot, depth, 0, 0)
+            ui.begin("button", "")
+            ui.attr_str("text", label)
+            ui.attr_str("act", to_string(act))
+            mark_act(act)
+            ui.on("click", on_act)
+            ui.end()
             return 1
         case Elem.ButtonSized(label, act, w, h):
-            emit_button(label, act, slot, depth, w, h)
+            ui.begin("button", "")
+            ui.attr_str("text", label)
+            ui.attr_str("w", to_string(w))
+            ui.attr_str("h", to_string(h))
+            ui.attr_str("act", to_string(act))
+            mark_act(act)
+            ui.on("click", on_act)
+            ui.end()
             return 1
         case Elem.Row(kids):
-            tiu_build.open(WidgetType.Row, slot, fp(0, "", depth, len(kids), 0), 0, 0, 0, 0, 0)
-            var n: i64 = 1
-            var i: i64 = 0
-            while i < len(kids) {
-                n = n + emit(kids[i], i, depth + 1)
-                i = i + 1
-            }
-            tiu_build.close()
-            return n
+            return emit_box("row", kids, root)
         case Elem.Column(kids):
-            tiu_build.open(WidgetType.Column, slot, fp(1, "", depth, len(kids), 0), 0, 0, 0, 0, 0)
-            var n: i64 = 1
-            var i: i64 = 0
-            while i < len(kids) {
-                n = n + emit(kids[i], i, depth + 1)
-                i = i + 1
-            }
-            tiu_build.close()
-            return n
+            return emit_box("column", kids, root)
         case Elem.Spacer(h):
             if h <= 0 {
                 return 0
             }
-            tiu_build.open(WidgetType.Absolute, slot, fp(4, "", h, depth, 0), 0, 0, 0, 0, h)
-            tiu_build.close()
+            ui.begin("row", "")
+            ui.attr_str("h", to_string(h))
+            ui.end()
             return 1
         case Elem.Empty:
             return 0
         case Elem.Scroll(kids, vh):
-            // 滚动容器：视口尺寸写 fw（固定宽由布局给），vh 作为 props 版本的一部分
-            // —— 视口变了才需重排，滚动偏移走set_scroll 不进版本（变换级变化）。
-            tiu_build.open(WidgetType.Scroll, slot, fp(5, "", depth, vh, len(kids)), 0, 0, 0, vh, 0)
+            ui.begin("scroll", "")
+            ui.attr_str("w", "fill")
+            ui.attr_str("h", to_string(vh))
             var n: i64 = 1
             var i: i64 = 0
             while i < len(kids) {
-                n = n + emit(kids[i], i, depth + 1)
+                n = n + emit(kids[i], false)
                 i = i + 1
             }
-            tiu_build.close()
+            ui.end()
             return n
         case Elem.TextInput(placeholder, act):
-            // 文本输入：open_t 写占位符；真实文本由应用层 set_text 覆盖。
-            // 焦点态进版本号 —— 聚焦/失焦是视觉变化，须触发重绘。
-            tiu_build.open_t(WidgetType.TextInput, slot, fp(6, placeholder, act, depth, 0), placeholder, 0, 0, 0, 0)
-            tiu_tree.set_act(tiu_build.cur_id(), act)
-            tiu_build.close()
+            ui.begin("input", "")
+            ui.attr_str("text", placeholder)
+            ui.attr_str("act", to_string(act))
+            mark_act(act)
+            ui.end()
             return 1
         case Elem.Image(res, w, h):
-            // 图像：句柄 0 走占位块（绘制桥据g_res 决定实图/占位）。
-            tiu_build.open(WidgetType.Image, slot, fp(7, "", res, depth, w * 31 + h), 0, 0, 0, w, h)
-            tiu_tree.set_res(tiu_build.cur_id(), res)
-            tiu_build.close()
+            ui.begin("image", "")
+            ui.attr_str("res", to_string(res))
+            ui.attr_str("w", to_string(w))
+            ui.attr_str("h", to_string(h))
+            ui.end()
             return 1
         default:
             return 0
     }
-}
-
-func emit_button(label: string, act: i64, slot: i64, depth: i64, w: i64, h: i64) {
-    tiu_build.open_t(WidgetType.Button, slot, fp(3, label, act, depth, w * 31 + h), label, 0, 0, w, h)
-    tiu_tree.set_act(tiu_build.cur_id(), act)
-    tiu_build.close()
 }
 
 }

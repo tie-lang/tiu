@@ -236,6 +236,16 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_style(node, s)
     }
+    // 动作码与图像资源：vw 等声明式层用它们挂「点击 → 状态机动作」与图片句柄。
+    // 与元素语法一致——元素只写属性，解释权在桥接这一层。
+    s = ui.attr_of(uid, "act")
+    if s != "" {
+        tiu_tree.set_act(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "res")
+    if s != "" {
+        tiu_tree.set_res(node, aparse.len_of(s))
+    }
 }
 
 // ---- (parent, slot) -> 节点 索引（上一帧的树形）----
