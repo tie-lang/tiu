@@ -1,0 +1,124 @@
+type tie<class>
+// ui/src/paint_state.tie —— 控件视觉状态 → 配色与圆角几何
+// EN: widget visual states → colours and corner geometry.
+// ============================================================
+// 职责：把「常态 / 悬停(hot) / 按下(active) / 键盘焦点(focus)」四个视觉
+// 状态与主题 token 收敛成**具体 ARGB**，并给出圆角半径的单一取值入口。
+// 本模块不产绘制记录、不读布局结果、不改控件状态——纯粹是「状态 → 颜色」
+// 的查表与叠加，供 paint_bridge 直接下发。
+//
+// 状态优先级固定（便于探针断言）：
+//   按钮底色：active > hot > 常态；
+//   输入框边框：focus → 焦点环色（uth.fg），否则常态边框色；
+//   焦点叠加：外圈 1px 焦点环 + 内层常态底色（不改底色，避免与 hot 撞色）。
+
+import "./theme.tie"
+import "./props.tie"
+
+// 圆角默认值（属性未设 radius 时生效；属性值优先）。
+pub const PS_R_PANEL: i64 = 6     // 容器面板
+pub const PS_R_BUTTON: i64 = 4    // 按钮
+pub const PS_R_INPUT: i64 = 4     // 输入框
+pub const PS_PAD_INPUT: i64 = 6   // 输入框文本左内边距
+
+namespace upstate {
+
+// 通道拆分（0xAARRGGBB）——只读，用于状态叠加。
+func ch_r(p: i64) -> i64 {
+    return (p >> 16) & 0xFF
+}
+
+func ch_g(p: i64) -> i64 {
+    return (p >> 8) & 0xFF
+}
+
+func ch_b(p: i64) -> i64 {
+    return p & 0xFF
+}
+
+func ch_a(p: i64) -> i64 {
+    return (p >> 24) & 0xFF
+}
+
+// 线性叠加：src 以 pct%（0..100）混到 dst 上。确定性整数运算。
+pub func mix(dst: i64, src: i64, pct: i64) -> i64 {
+    var r = ch_r(dst) + ((ch_r(src) - ch_r(dst)) * pct) / 100
+    var g = ch_g(dst) + ((ch_g(src) - ch_g(dst)) * pct) / 100
+    var b = ch_b(dst) + ((ch_b(src) - ch_b(dst)) * pct) / 100
+    var a = ch_a(dst)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// ---- 容器面板 ----
+
+pub func panel_bg(th: i64) -> i64 {
+    return uth.surface(th)
+}
+
+pub func panel_border(th: i64) -> i64 {
+    return uth.border(th)
+}
+
+// ---- 按钮 ----
+
+pub func button_bg(th: i64, hot: i64, act: i64) -> i64 {
+    if act == 1 {
+        return uth.accent_down(th)
+    }
+    if hot == 1 {
+        return uth.accent_hot(th)
+    }
+    return uth.accent(th)
+}
+
+// ---- 输入框 ----
+
+pub func input_bg(th: i64, focus: i64) -> i64 {
+    if focus == 1 {
+        // 焦点态：底色叠一层很淡的强调色，与常态可区分但仍是 surface 家族。
+        return mix(uth.surface(th), uth.accent(th), 8)
+    }
+    return uth.surface(th)
+}
+
+pub func input_border(th: i64, focus: i64) -> i64 {
+    if focus == 1 {
+        return focus_ring(th)
+    }
+    return uth.border(th)
+}
+
+// ---- 焦点环 / 文本光标 ----
+
+pub func focus_ring(th: i64) -> i64 {
+    return uth.fg(th)
+}
+
+pub func caret(th: i64) -> i64 {
+    return uth.accent(th)
+}
+
+// ---- 图像占位框（无像素数据时） ----
+
+pub func placeholder_bg(th: i64) -> i64 {
+    return uth.surface(th)
+}
+
+pub func placeholder_border(th: i64) -> i64 {
+    return uth.fg_dim(th)
+}
+
+// ---- 圆角半径：>0 用属性值；0 用控件/主题默认；<0 强制直角 ----
+// props 只存数值、不带「是否显式设置」标记，因此用负数表达「显式直角」。
+pub func radius_of(id: i64, base: i64) -> i64 {
+    var r = tiu_props.radius(id)
+    if r > 0 {
+        return r
+    }
+    if r < 0 {
+        return 0
+    }
+    return base
+}
+
+}

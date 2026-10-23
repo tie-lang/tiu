@@ -1,0 +1,115 @@
+type tie<class>
+// engine/src/eimg.tie —— 图像资源注册表（绘制层像素数据来源）
+// EN: image registry — pixel data source for the software raster.
+// ============================================================
+// 职责：维护「图像句柄 → (宽, 高, ARGB 像素)」。raster.tie 画 E_OP_IMAGE
+// 时按句柄取像素；未注册的句柄视为「无数据」，由绘制桥改画占位框。
+// 存储：单块扁平池 + 每图偏移（tie 表只承载内建元素，不能 table<table>）。
+// 像素格式：0xAARRGGBB，与帧缓冲一致；alpha = 0 的像素视为全透明。
+//
+// 生命周期：进程级注册表；重复句柄 = 覆盖（新块追加、旧块留空不回收，
+// 保证既有引用不失效）。绘制桥与光栅在同一进程内共享本表。
+
+var g_img_id: table<i64> = []
+var g_img_w: table<i64> = []
+var g_img_h: table<i64> = []
+var g_img_ofs: table<i64> = []
+var g_img_pool: table<i64> = []
+
+namespace eimg {
+
+// 清空注册表（测试/换帧时机；不释放已分配块）。
+pub func reset() {
+    g_img_id = table_new_i64()
+    g_img_w = table_new_i64()
+    g_img_h = table_new_i64()
+    g_img_ofs = table_new_i64()
+    g_img_pool = table_new_i64()
+}
+
+// 已注册图像数。
+pub func count() -> i64 {
+    return len(g_img_id)
+}
+
+// 注册/覆盖一张图像；返回注册表当前条目数。
+// px 少于 w*h 时按 0（全透明）补齐，避免越界读。
+pub func define(handle: i64, w: i64, h: i64, px: table<i64>) -> i64 {
+    var idx = find(handle)
+    var ofs = len(g_img_pool)
+    var n = w * h
+    var k: i64 = 0
+    while k < n {
+        var v: i64 = 0
+        if k < len(px) {
+            v = px[k]
+        }
+        table_push(g_img_pool, v)
+        k = k + 1
+    }
+    if idx < 0 {
+        table_push(g_img_id, handle)
+        table_push(g_img_w, w)
+        table_push(g_img_h, h)
+        table_push(g_img_ofs, ofs)
+    } else {
+        g_img_w[idx] = w
+        g_img_h[idx] = h
+        g_img_ofs[idx] = ofs
+    }
+    return len(g_img_id)
+}
+
+// 是否已注册（1 = 有像素数据，0 = 无数据）。
+pub func has(handle: i64) -> i64 {
+    if find(handle) < 0 {
+        return 0
+    }
+    return 1
+}
+
+pub func width(handle: i64) -> i64 {
+    var idx = find(handle)
+    if idx < 0 {
+        return 0
+    }
+    return g_img_w[idx]
+}
+
+pub func height(handle: i64) -> i64 {
+    var idx = find(handle)
+    if idx < 0 {
+        return 0
+    }
+    return g_img_h[idx]
+}
+
+// 取像素（ARGB）；越界或未注册返回 0（全透明）。
+pub func at(handle: i64, x: i64, y: i64) -> i64 {
+    var idx = find(handle)
+    if idx < 0 {
+        return 0
+    }
+    var w = g_img_w[idx]
+    var h = g_img_h[idx]
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return 0
+    }
+    var base = g_img_ofs[idx]
+    return g_img_pool[base + y * w + x]
+}
+
+// 句柄 → 条目下标（-1 = 未注册）。线性查找：图像数量级很小，
+// 且绘制热路径只在每帧每条 IMAGE 记录上查一次。
+func find(handle: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(g_img_id) {
+        if g_img_id[i] == handle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+}

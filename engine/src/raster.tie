@@ -1,15 +1,23 @@
 type tie<class>
-// engine/src/raster.tie —— tiu 渲染引擎：软件统一内核（模块一）
+// engine/src/raster.tie —— tiu 渲染引擎：软件统一内核
 // ============================================================
-// 软件图元光栅（渲染引擎实施计划 T1.2）：rect / 纯色 / 文本（位图
-// 字形）→ 软件帧缓冲。**唯一执行路径 = 渲染语义规范 v0**
-// （semantics.tie：sRGB 直通 + 非预乘 src-over + 覆盖率 0/1）。
-// v0 范围：纯色填充（fill=0）；视图级平移 + DPI 缩放；逐项变换
-// 与渐变/图像等 op 留待模块二/三（文档记录，非挂起）。
+// 软件图元光栅：rect / rrect（圆角抗锯齿）/ text（TTF 字形，字号取 op）/
+// image（最近邻缩放到目标矩形）/ 裁剪（save_layer 边界）→ 软件帧缓冲。
+// **唯一执行路径 = 渲染语义规范**（semantics.tie：sRGB 直通 + 非预乘
+// src-over + 覆盖率来自字形/圆角覆盖率或整像素）。
 //
-// EN: software raster core (module 1): rect / solid / text (bitmap
-// glyphs) → frame buffer; the only execution path is the render-
-// semantics spec v0.
+// 裁剪：E_OP_SAVE_LAYER 压入设备像素矩形（与当前裁剪求交），
+//       E_OP_RESTORE_LAYER 弹出；像素写入统一过裁剪判定，故填充、文本、
+//       图像三类图元受同一裁剪栈约束。
+//
+// 简化项（文档记录，非挂起）：
+//   * save_layer 只承担裁剪语义，不做离屏合成/图层 alpha——IR 里的图层
+//     语义字段不参与本内核（图层混合留待后续模块）；
+//   * 椭圆角（rrasc 只接受单一半径，取 min(rx, ry)）；
+//   * 渐变/描边/虚线/滤镜不在本内核范围（fill != 0 的记录跳过）。
+//
+// EN: software raster core — rect / rrect (AA) / TTF text at op font size /
+// image (nearest) / clip stack, all through the render-semantics spec.
 
 import "./semantics.tie"
 import "./glyph.tie"
@@ -17,6 +25,8 @@ import "./font.tie"
 import "./ir_load.tie"
 import "./gold.tie"
 import "./utfmin.tie"
+import "./rrasc.tie"
+import "./eimg.tie"
 
 struct FrameBuf {
     var w: i64 = 0
@@ -29,6 +39,13 @@ namespace erast {
 // TrueType 字体面：-2 = 未尝试加载，-1 = 加载失败（回退位图字形）。
 var g_tf_path: string = "C:/Windows/Fonts/consola.ttf"
 var g_tf_face: i64 = -2
+
+// 裁剪矩形（设备像素，左闭右开）+ 保存栈（每层 4 个 i64）。
+var g_clip_x0: i64 = 0
+var g_clip_y0: i64 = 0
+var g_clip_x1: i64 = 0
+var g_clip_y1: i64 = 0
+var g_clip_stk: table<i64> = []
 
 // 设置文本字体文件；下次文本绘制时惰性加载。
 pub func text_font(path: string) {
@@ -44,13 +61,25 @@ pub func text_face_id() -> i64 {
     return g_tf_face
 }
 
-// 渲染整帧（Parsed → FrameBuf）。op 集合：RECT/RRECT(rx=0)/TEXT
-// 纯色填充；其余 op v0 跳过（文档记录：模块二/三）。
+// 直接指定字体面（不触发文件加载）。绘制桥用它让「布局度量」与「光栅
+// 字形」用同一 face：文本推进完全由该 face 的 advance 决定。
+pub func set_face(face: i64) {
+    g_tf_face = face
+}
+
+// 当前 face 值（-2 = 尚未尝试加载；-1 = 加载失败）。
+pub func face() -> i64 {
+    return g_tf_face
+}
+
+// 渲染整帧（Parsed → FrameBuf）。
+// op 集合：RECT / RRECT / TEXT / IMAGE + SAVE_LAYER / RESTORE_LAYER（裁剪）。
 pub func render(p: Parsed) -> FrameBuf {
     var fb = FrameBuf()
     fb.w = p.sw
     fb.h = p.sh
     fb.px = egold.fb_new(p.sw, p.sh)
+    clip_reset(fb)
     var n = len(p.ops)
     var i: i64 = 0
     while i < n {
@@ -59,13 +88,25 @@ pub func render(p: Parsed) -> FrameBuf {
         var color = p.colors[i]
         var alpha = p.alphas[i]
         var eff_a = to_i64((to_f64(alpha) * to_f64(sem.ch_a(color)) / 255.0) + 0.5)
-        if op == E_OP_RECT || (op == E_OP_RRECT && p.rx[i] == 0.0) {
+        if op == E_OP_SAVE_LAYER {
+            clip_push(fb, p, i)
+        } else if op == E_OP_RESTORE_LAYER {
+            clip_pop()
+        } else if op == E_OP_RECT {
             if fill == 0 {
                 rect_px(fb, p, i, color, eff_a)
+            }
+        } else if op == E_OP_RRECT {
+            if fill == 0 {
+                rrect_px(fb, p, i, color, eff_a)
             }
         } else if op == E_OP_TEXT {
             if fill == 0 {
                 text_px(fb, p, i, color, eff_a)
+            }
+        } else if op == E_OP_IMAGE {
+            if fill == 0 {
+                image_px(fb, p, i, eff_a)
             }
         }
         i = i + 1
@@ -73,7 +114,66 @@ pub func render(p: Parsed) -> FrameBuf {
     return fb
 }
 
-// ---- rect 纯色填充 ----
+// ---- 裁剪栈 ----
+
+func clip_reset(fb: FrameBuf) {
+    g_clip_x0 = 0
+    g_clip_y0 = 0
+    g_clip_x1 = fb.w
+    g_clip_y1 = fb.h
+    g_clip_stk = table_new_i64()
+}
+
+func clip_push(fb: FrameBuf, p: Parsed, i: i64) {
+    table_push(g_clip_stk, g_clip_x0)
+    table_push(g_clip_stk, g_clip_y0)
+    table_push(g_clip_stk, g_clip_x1)
+    table_push(g_clip_stk, g_clip_y1)
+    var (dx0, dy0) = dev(p, p.x[i], p.y[i])
+    var (dx1, dy1) = dev(p, p.x[i] + p.w[i], p.y[i] + p.h[i])
+    var x0 = i64_round(dx0)
+    var y0 = i64_round(dy0)
+    var x1 = i64_round(dx1)
+    var y1 = i64_round(dy1)
+    if x0 > g_clip_x0 {
+        g_clip_x0 = x0
+    }
+    if y0 > g_clip_y0 {
+        g_clip_y0 = y0
+    }
+    if x1 < g_clip_x1 {
+        g_clip_x1 = x1
+    }
+    if y1 < g_clip_y1 {
+        g_clip_y1 = y1
+    }
+    if g_clip_x1 < g_clip_x0 {
+        g_clip_x1 = g_clip_x0
+    }
+    if g_clip_y1 < g_clip_y0 {
+        g_clip_y1 = g_clip_y0
+    }
+}
+
+func clip_pop() {
+    var n = len(g_clip_stk)
+    if n < 4 {
+        return
+    }
+    g_clip_x0 = g_clip_stk[n - 4]
+    g_clip_y0 = g_clip_stk[n - 3]
+    g_clip_x1 = g_clip_stk[n - 2]
+    g_clip_y1 = g_clip_stk[n - 1]
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n - 4 {
+        table_push(t, g_clip_stk[i])
+        i = i + 1
+    }
+    g_clip_stk = t
+}
+
+// ---- rect 纯色填充（硬边） ----
 
 func rect_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     var (dx0, dy0) = dev(p, p.x[i], p.y[i])
@@ -105,7 +205,58 @@ func rect_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     }
 }
 
+// ---- rrect 圆角填充（圆角带抗锯齿、直边硬边） ----
+
+func rrect_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
+    // 单半径：属性层只有一个 radius；两者都给时取小者。
+    var r = p.rx[i]
+    if p.ry[i] < r {
+        r = p.ry[i]
+    }
+    if r <= 0.0 {
+        rect_px(fb, p, i, color, alpha)
+        return
+    }
+    var (dx0, dy0) = dev(p, p.x[i], p.y[i])
+    var (dx1, dy1) = dev(p, p.x[i] + p.w[i], p.y[i] + p.h[i])
+    var rd = r * p.dpi                     // 圆角半径换算到设备像素
+    var ix0 = i64_round(dx0)
+    var iy0 = i64_round(dy0)
+    var ix1 = i64_round(dx1)
+    var iy1 = i64_round(dy1)
+    if ix0 < 0 {
+        ix0 = 0
+    }
+    if iy0 < 0 {
+        iy0 = 0
+    }
+    if ix1 > fb.w {
+        ix1 = fb.w
+    }
+    if iy1 > fb.h {
+        iy1 = fb.h
+    }
+    var y = iy0
+    while y < iy1 {
+        var x = ix0
+        while x < ix1 {
+            if rrasc.in_corner_band(x, y, dx0, dy0, dx1, dy1, rd) == 1 {
+                var cov = rrasc.cov_px(x, y, dx0, dy0, dx1, dy1, rd)
+                if cov > 0 {
+                    put_px(fb, x, y, color, (alpha * cov + 127) / 255)
+                }
+            } else {
+                put_px(fb, x, y, color, alpha)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // ---- 文本（TrueType 光栅字形；字号取 op 的 font-size） ----
+// 推进量一律用 efont.advance（26.6 定点），与布局层 measure_text 同源：
+// 同一 face、同一字号 ⇒ 字宽推进逐字相等。
 
 func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     var face = text_face_id()
@@ -118,7 +269,7 @@ func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     if size < 1.0 {
         size = 1.0
     }
-    // op 的 y = 行盒顶；字形基线 = 顶 + ascent。
+    // op 的 y = 行盒顶；字形基线 = 盒顶 + ascent。
     var baseline = dy + efont.ascent(face, size)
     var s = p.txt[i]
     var n = str_len(s)
@@ -147,10 +298,8 @@ func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
                 }
                 j = j + 1
             }
-            pen = pen + to_f64(efont.atlas_adv(e)) / 64.0
-        } else {
-            pen = pen + to_f64(efont.advance(face, cp, size)) / 64.0
         }
+        pen = pen + to_f64(efont.advance(face, cp, size)) / 64.0
         ci = ci + 1
     }
 }
@@ -183,10 +332,67 @@ func text_px_bitmap(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     }
 }
 
+// ---- 图像（最近邻缩放到目标矩形；未注册句柄不画，由绘制桥画占位框） ----
+// 选择最近邻：实现可推导、无采样权重，缩放后纯色位图的像素色严格保持；
+// 双线性会引入与源色不同的中间色，留待需要平滑缩放时扩展。
+
+func image_px(fb: FrameBuf, p: Parsed, i: i64, alpha: i64) {
+    var h = eload.image_of(p, i)
+    if eimg.has(h) == 0 {
+        return
+    }
+    var sw = eimg.width(h)
+    var sh = eimg.height(h)
+    if sw <= 0 || sh <= 0 {
+        return
+    }
+    var (dx0, dy0) = dev(p, p.x[i], p.y[i])
+    var (dx1, dy1) = dev(p, p.x[i] + p.w[i], p.y[i] + p.h[i])
+    var ix0 = i64_round(dx0)
+    var iy0 = i64_round(dy0)
+    var ix1 = i64_round(dx1)
+    var iy1 = i64_round(dy1)
+    if ix0 < 0 {
+        ix0 = 0
+    }
+    if iy0 < 0 {
+        iy0 = 0
+    }
+    if ix1 > fb.w {
+        ix1 = fb.w
+    }
+    if iy1 > fb.h {
+        iy1 = fb.h
+    }
+    var dw = ix1 - ix0
+    var dh = iy1 - iy0
+    if dw <= 0 || dh <= 0 {
+        return
+    }
+    var y = iy0
+    while y < iy1 {
+        var sy = (y - iy0) * sh / dh
+        var x = ix0
+        while x < ix1 {
+            var sx = (x - ix0) * sw / dw
+            var c = eimg.at(h, sx, sy)
+            var a2 = (alpha * sem.ch_a(c) + 127) / 255
+            if a2 > 0 {
+                put_px(fb, x, y, c, a2)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // ---- 帧缓冲 / 混合 ----
 
-// 像素写入（src-over 混合，渲染语义唯一执行路径）。
+// 像素写入（裁剪判定 + src-over 混合，渲染语义唯一执行路径）。
 func put_px(fb: FrameBuf, x: i64, y: i64, color: i64, alpha: i64) {
+    if x < g_clip_x0 || y < g_clip_y0 || x >= g_clip_x1 || y >= g_clip_y1 {
+        return
+    }
     if x < 0 || y < 0 || x >= fb.w || y >= fb.h {
         return
     }

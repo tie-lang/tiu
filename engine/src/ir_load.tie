@@ -209,7 +209,10 @@ func parse_record(b: table<i64>, ofs: i64,
     } else if op == E_OP_IMAGE {
         table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
         table_push(w, eirb.q16_f(eirb.rd_i64(b, g + 16))); table_push(h, eirb.q16_f(eirb.rd_i64(b, g + 24)))
-        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0); table_push(fs, 0.0)
+        table_push(rx, 0.0); table_push(ry, 0.0); table_push(a0, 0.0); table_push(a1, 0.0)
+        // 图像句柄：IMAGE 行没有字号语义，句柄写进 fs 列（对 IMAGE 行唯一）；
+        // 出口由 image_of 按名读取，避免为单一 op 再加一条 ref 通道。
+        table_push(fs, to_f64(eirb.rd_i64(b, g + 32)))
         table_push(txt, "")
     } else if op == E_OP_SAVE_LAYER {
         table_push(x, eirb.q16_f(eirb.rd_i64(b, g))); table_push(y, eirb.q16_f(eirb.rd_i64(b, g + 8)))
@@ -242,6 +245,14 @@ func parse_record(b: table<i64>, ofs: i64,
     table_push(colors, colorv)
     table_push(alphas, alpha)
     return next
+}
+
+// IMAGE 行的图像句柄（-1 = 该行不是 IMAGE 或句柄缺失）。
+pub func image_of(p: Parsed, i: i64) -> i64 {
+    if i < 0 || i >= len(p.fs) {
+        return -1
+    }
+    return to_i64(p.fs[i])
 }
 
 // 读 len 字节为字符串（UTF-8；可打印 ASCII 经 utfmin 映射）。

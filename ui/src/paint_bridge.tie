@@ -2,112 +2,479 @@ type tie<class>
 // ui/src/paint_bridge.tie —— tiu UI 层：绘制桥（UI 树 → API 绘制表）
 // EN: tiu UI layer, paint bridge — widget tree → API draw-list.
 // ============================================================
-// 依据 docs/designs/tiu-ui-widgets.md §1（依赖方向：UI → API 增量段编码）、
-// §3（骨架只读）、§13（模块清单）；docs/designs/tiu-drawing-api.md §6（跨层契约）。
+// 职责：按 DFS 序（父先于子、子覆盖父）把当前 UI 树的**布局结果矩形 +
+// 控件类型 + 文本**翻译为 API 的 DrawList 绘制记录。只读树与布局结果，
+// 不修改任何控件状态。
 //
-// 职责：按 DFS 序把当前 UI 树的**布局结果矩形 + 控件类型 + 文本**翻译为 API 的
-// DrawList 绘制记录。**只读**树与布局结果，不修改任何控件状态（§3「布局结果
-// 不回写 props」同款纪律）。
+// 控件绘制集：
+//   Row / Column / Absolute / Scroll / Grid / Overlay —— 面板：外圈 1px
+//       边框色 + 内缩 1px 底色 + 圆角（属性 radius 优先，否则默认半径）；
+//   Text   —— 按节点字号（属性 font_size，缺省 16）绘制 TTF；
+//   Button —— 圆角底色 + 居中标签 + hot/active/focus 三态；
+//   TextInput —— 边框 + 文本 + 焦点态 caret（位置由文本度量推出）；
+//   Image  —— 有像素数据则缩放到盒内（引擎最近邻），无数据画占位框。
 //
-// 绘制顺序 = DFS 前序（父先于子，子覆盖父）——与命中测试的「倒序查找、顶层优先」
-// （hit.tie）互为镜像，保证「看到的」与「点到的」一致。
+// 绘制表按值返回：tie 的 table 字段是值语义（结构体赋值与按值传参都会
+// 复制表），因此任何产记录的入口都必须**回收返回的 DrawList**：
+//     d = upaint.background(d, w, h, th)
+//     d = upaint.draw(d, th, hot, active)
+// 只在函数内本地改 d 而不回传，记录会随栈帧一起丢掉。
 //
-// v0 控件绘制集：
-//   Text   —— 文本（引擎位图字形路径）
-//   Button —— 底色矩形 + 居中标签 + 悬停/按下三态
-//   Row / Column / Absolute —— 透明容器（不产记录；容器背景留待主题模块扩展）
-// 注：v0 用 dl.rect 而非 dl.rrect —— 引擎软件内核 v0 只渲染 rx=0 的圆角矩形，
-// 非零圆角会整条跳过（raster.tie 的 op 过滤），此处不产生不可见记录。
+// 裁剪：Scroll 容器、以及 overflow != expand 的容器，包一层
+//   dl.save_layer/dl.restore_layer —— 引擎按图层边界作为裁剪区（软裁剪，
+//   不做离屏合成）。overflow = expand 的容器不裁，子树可溢出。
+//
+// 脏矩形：draw_keys/draw_keys_state 只重绘「与脏节点并集相交」的子树，
+//   并把整帧裁剪到该并集矩形；干净子树按子树包围盒整体跳过。
+//
+// 文本单一度量源：paint 与布局共用同一 face 与同一函数
+//   （upaint.set_text_face → layout2.set_face + raster.set_face；
+//    文本推进一律 tiu_layout2.measure_text / efont.advance）。
 
 import "./tree.tie"
 import "./theme.tie"
+import "./props.tie"
+import "./layout2.tie"
+import "./paint_state.tie"
 import "../../api/src/color.tie"
 import "../../api/src/paint.tie"
 import "../../api/src/drawlist.tie"
+import "../../engine/src/raster.tie"
+import "../../engine/src/eimg.tie"
 
-pub const CHAR_ADV: i64 = 8       // 位图字形步进（与引擎 glyph 一致）
-pub const LINE_H: i64 = 16        // 行高（布局层同值）
-pub const TEXT_SIZE: f64 = 16.0
+pub const CHAR_ADV: i64 = 8       // 位图字形步进（引擎无 TTF 时的回退路径）
+pub const LINE_H: i64 = 16        // 缺省字号下的行盒高
+pub const TEXT_SIZE: f64 = 16.0   // 缺省文本尺寸
 
-// 控件类型码缓存（避免逐节点走 switch）
+// 绘制上下文：主题 + 三个交互状态（值语义，只读）。
+struct PState {
+    var th: i64 = 0
+    var hot: i64 = -1
+    var active: i64 = -1
+    var focus: i64 = -1
+}
+
+// 控件类型码缓存（避免逐节点走 switch）。
+var g_ty_row: i64 = -1
+var g_ty_col: i64 = -1
 var g_ty_text: i64 = -1
 var g_ty_button: i64 = -1
+var g_ty_abs: i64 = -1
+var g_ty_scroll: i64 = -1
+var g_ty_input: i64 = -1
+var g_ty_image: i64 = -1
+var g_ty_grid: i64 = -1
+var g_ty_overlay: i64 = -1
 
 func ensure_types() {
-    if g_ty_text < 0 {
-        g_ty_text = tiu_tree.ty_code(WidgetType.Text)
-        g_ty_button = tiu_tree.ty_code(WidgetType.Button)
+    if g_ty_row >= 0 {
+        return
     }
+    g_ty_row = tiu_tree.ty_code(WidgetType.Row)
+    g_ty_col = tiu_tree.ty_code(WidgetType.Column)
+    g_ty_text = tiu_tree.ty_code(WidgetType.Text)
+    g_ty_button = tiu_tree.ty_code(WidgetType.Button)
+    g_ty_abs = tiu_tree.ty_code(WidgetType.Absolute)
+    g_ty_scroll = tiu_tree.ty_code(WidgetType.Scroll)
+    g_ty_input = tiu_tree.ty_code(WidgetType.TextInput)
+    g_ty_image = tiu_tree.ty_code(WidgetType.Image)
+    g_ty_grid = tiu_tree.ty_code(WidgetType.Grid)
+    g_ty_overlay = tiu_tree.ty_code(WidgetType.Overlay)
 }
 
 namespace upaint {
 
-// 绘制整棵树；返回产生的绘制记录数。
-// hot / active = 当前悬停 / 按下节点 id（-1 = 无）。
-pub func draw(d: DrawList, th: i64, hot: i64, active: i64) -> i64 {
+// ---- 文本度量的单一入口 ----
+
+// 指定文本 face（布局度量与光栅字形共用同一 face）。
+pub func set_text_face(face: i64) {
+    tiu_layout2.set_face(face)
+    erast.set_face(face)
+}
+
+pub func text_face() -> i64 {
+    return tiu_layout2.face()
+}
+
+// 文本宽度（26.6 定点）：与布局层同一个 measure_text。
+pub func text_width(s: string, font_size: i64) -> i64 {
+    return tiu_layout2.measure_text(s, font_size)
+}
+
+// 单行行盒高（26.6 定点）。
+pub func text_line_h(font_size: i64) -> i64 {
+    return tiu_layout2.text_line_h(font_size)
+}
+
+// 当前绘制表里的记录数（探针与宿主用）。
+pub func records(d: DrawList) -> i64 {
+    return dl.count(d)
+}
+
+// ---- 整树绘制 ----
+
+// 绘制整棵树（无焦点态；保留旧四参数入口）。
+pub func draw(d: DrawList, th: i64, hot: i64, active: i64) -> DrawList {
+    return draw_state(d, th, hot, active, -1)
+}
+
+// 绘制整棵树，显式焦点节点（-1 = 读树上的焦点标记）。
+pub func draw_state(d: DrawList, th: i64, hot: i64, active: i64, focus: i64) -> DrawList {
     ensure_types()
-    var n: i64 = 0
-    var order = tiu_tree.dfs_order()
-    var i: i64 = 0
-    while i < len(order) {
-        n = n + node(d, order[i], th, hot, active)
-        i = i + 1
-    }
-    return n
+    var st = PState()
+    st.th = th
+    st.hot = hot
+    st.active = active
+    st.focus = focus
+    return walk(d, tiu_tree.root(), st)
 }
 
 // 画布背景（整帧底色，先于树绘制）。
-pub func background(d: DrawList, w: i64, h: i64, th: i64) -> i64 {
-    d = dl.rect(d, 0.0, 0.0, to_f64(w), to_f64(h), solid(uth.bg(th)))
-    return 1
+pub func background(d: DrawList, w: i64, h: i64, th: i64) -> DrawList {
+    return dl.rect(d, 0.0, 0.0, to_f64(w), to_f64(h), solid(uth.bg(th)))
 }
 
-func node(d: DrawList, id: i64, th: i64, hot: i64, active: i64) -> i64 {
+// ---- 脏矩形入口 ----
+
+// 脏节点矩形并集 → [x0, y0, x1, y1]（空集返回空表）。
+pub func dirty_union(keys: table<i64>) -> table<i64> {
+    var u = table_new_i64()
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = 0
+    var y1: i64 = 0
+    var seen: i64 = 0
+    var i: i64 = 0
+    while i < len(keys) {
+        var id = keys[i]
+        if tiu_tree.is_live(id) {
+            var r = tiu_tree.rect(id)
+            if r.w > 0 && r.h > 0 {
+                if seen == 0 {
+                    x0 = r.x
+                    y0 = r.y
+                    x1 = r.x + r.w
+                    y1 = r.y + r.h
+                    seen = 1
+                } else {
+                    if r.x < x0 {
+                        x0 = r.x
+                    }
+                    if r.y < y0 {
+                        y0 = r.y
+                    }
+                    if r.x + r.w > x1 {
+                        x1 = r.x + r.w
+                    }
+                    if r.y + r.h > y1 {
+                        y1 = r.y + r.h
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if seen == 0 {
+        return u
+    }
+    table_push(u, x0)
+    table_push(u, y0)
+    table_push(u, x1)
+    table_push(u, y1)
+    return u
+}
+
+// 脏节点矩形并集 → Rect（空集返回 w=h=0 的空矩形）。
+pub func dirty_rect(keys: table<i64>) -> Rect {
+    var u = dirty_union(keys)
+    if len(u) < 4 {
+        return Rect(0, 0, 0, 0)
+    }
+    return Rect(u[0], u[1], u[2] - u[0], u[3] - u[1])
+}
+
+// 只重绘给定脏节点：整帧裁剪到并集矩形，干净子树整棵跳过。
+pub func draw_keys(d: DrawList, th: i64, keys: table<i64>) -> DrawList {
+    return draw_keys_state(d, th, -1, -1, -1, keys)
+}
+
+pub func draw_keys_state(d: DrawList, th: i64, hot: i64, active: i64, focus: i64, keys: table<i64>) -> DrawList {
+    ensure_types()
+    var u = dirty_union(keys)
+    if len(u) < 4 {
+        return d
+    }
+    var st = PState()
+    st.th = th
+    st.hot = hot
+    st.active = active
+    st.focus = focus
+    d = dl.save_layer(d, to_f64(u[0]), to_f64(u[1]), to_f64(u[2] - u[0]), to_f64(u[3] - u[1]), Paint())
+    d = walk_dirty(d, tiu_tree.root(), st, u)
+    return dl.restore_layer(d)
+}
+
+// ---- 遍历 ----
+
+func walk(d: DrawList, id: i64, st: PState) -> DrawList {
+    if id < 0 {
+        return d
+    }
     var ty = tiu_tree.ty_of(id)
     var r = tiu_tree.rect(id)
-    if r.w <= 0 || r.h <= 0 {
-        return 0
+    if r.w > 0 && r.h > 0 {
+        d = paint_node(d, id, ty, r, st)
     }
-    if ty == g_ty_text {
-        return text_node(d, id, r, th)
+    var c = tiu_tree.first_child(id)
+    if c < 0 {
+        return d
     }
-    if ty == g_ty_button {
-        return button_node(d, id, r, th, hot, active)
+    if r.w > 0 && r.h > 0 && clips(ty, id) == 1 {
+        d = dl.save_layer(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), Paint())
+        while c >= 0 {
+            d = walk(d, c, st)
+            c = tiu_tree.next_sibling(c)
+        }
+        return dl.restore_layer(d)
+    }
+    while c >= 0 {
+        d = walk(d, c, st)
+        c = tiu_tree.next_sibling(c)
+    }
+    return d
+}
+
+// 脏遍历：子树包围盒与脏并集不相交 → 整棵跳过。
+func walk_dirty(d: DrawList, id: i64, st: PState, u: table<i64>) -> DrawList {
+    if id < 0 {
+        return d
+    }
+    if hits(subtree_rect(id), u) == 0 {
+        return d
+    }
+    var ty = tiu_tree.ty_of(id)
+    var r = tiu_tree.rect(id)
+    if r.w > 0 && r.h > 0 && hits(r, u) == 1 {
+        d = paint_node(d, id, ty, r, st)
+    }
+    var c = tiu_tree.first_child(id)
+    while c >= 0 {
+        d = walk_dirty(d, c, st, u)
+        c = tiu_tree.next_sibling(c)
+    }
+    return d
+}
+
+// 容器是否裁剪子树：Scroll 恒裁；溢出策略 expand(2) 不裁，其余裁。
+func clips(ty: i64, id: i64) -> i64 {
+    if ty == g_ty_scroll {
+        return 1
+    }
+    if ty == g_ty_row || ty == g_ty_col || ty == g_ty_abs || ty == g_ty_grid || ty == g_ty_overlay {
+        if tiu_props.overflow(id) == 2 {
+            return 0
+        }
+        return 1
     }
     return 0
 }
 
-// Text：在布局矩形处绘制文本（左对齐、上对齐）。
-func text_node(d: DrawList, id: i64, r: Rect, th: i64) -> i64 {
+// ---- 单节点绘制 ----
+
+func paint_node(d: DrawList, id: i64, ty: i64, r: Rect, st: PState) -> DrawList {
+    if ty == g_ty_text {
+        return text_node(d, id, r, st)
+    }
+    if ty == g_ty_button {
+        return button_node(d, id, r, st)
+    }
+    if ty == g_ty_input {
+        return input_node(d, id, r, st)
+    }
+    if ty == g_ty_image {
+        return image_node(d, id, r, st)
+    }
+    if ty == g_ty_row || ty == g_ty_col || ty == g_ty_abs || ty == g_ty_scroll || ty == g_ty_grid || ty == g_ty_overlay {
+        return panel_node(d, id, r, st)
+    }
+    return d
+}
+
+// 容器面板：边框色外圈 + 底色内层 + 圆角。
+func panel_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
+    var rad = upstate.radius_of(id, PS_R_PANEL)
+    return box(d, r, rad, upstate.panel_bg(st.th), upstate.panel_border(st.th))
+}
+
+// Text：按节点字号在布局矩形左上角绘制单行（基线由引擎取 ascent）。
+func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     var s = tiu_tree.text_of(id)
     if str_len(s) == 0 {
+        return d
+    }
+    var fs = tiu_props.font_size(id)
+    return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(uth.fg(st.th)))
+}
+
+// Button：圆角底色 + 居中标签；hot/active 换底色，focus 加 1px 焦点环。
+func button_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
+    var rad = upstate.radius_of(id, PS_R_BUTTON)
+    var hot: i64 = 0
+    if id == st.hot {
+        hot = 1
+    }
+    var act: i64 = 0
+    if id == st.active {
+        act = 1
+    }
+    var bg = upstate.button_bg(st.th, hot, act)
+    if is_focus(id, st) == 1 {
+        d = box(d, r, rad, bg, upstate.focus_ring(st.th))
+    } else if rad > 0 {
+        d = dl.rrect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), to_f64(rad), to_f64(rad), solid(bg))
+    } else {
+        d = dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(bg))
+    }
+    var s = tiu_tree.text_of(id)
+    if str_len(s) > 0 {
+        var fs = tiu_props.font_size(id)
+        var tw = text_width(s, fs) / 64
+        var lh = text_line_h(fs) / 64
+        var tx = r.x + (r.w - tw) / 2
+        var ty = r.y + (r.h - lh) / 2
+        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(uth.on_accent()))
+    }
+    return d
+}
+
+// TextInput：边框 + 文本 + 焦点态 caret。
+// caret 位置 = 文本起点 + 已排字宽（measure_text 与光栅同一 face/同一定点）。
+func input_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
+    var foc = is_focus(id, st)
+    var rad = upstate.radius_of(id, PS_R_INPUT)
+    d = box(d, r, rad, upstate.input_bg(st.th, foc), upstate.input_border(st.th, foc))
+    var s = tiu_tree.text_of(id)
+    var fs = tiu_props.font_size(id)
+    var lh = text_line_h(fs) / 64
+    var tx = r.x + PS_PAD_INPUT
+    var ty = r.y + (r.h - lh) / 2
+    if str_len(s) > 0 {
+        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(uth.fg(st.th)))
+    }
+    if foc == 1 {
+        var cx = tx + (text_width(s, fs) + 32) / 64
+        var cy0 = r.y + 4
+        var cy1 = r.y + r.h - 4
+        if cy1 > cy0 {
+            d = dl.rect(d, to_f64(cx), to_f64(cy0), 1.0, to_f64(cy1 - cy0), solid(upstate.caret(st.th)))
+        }
+    }
+    return d
+}
+
+// Image：有像素数据 → 按句柄缩放到盒内；无数据 → 占位框。
+func image_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
+    var h = tiu_tree.res_of(id)
+    if h >= 0 && eimg.has(h) == 1 {
+        return dl.image(d, h, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(0xFFFFFFFF))
+    }
+    return box(d, r, 0, upstate.placeholder_bg(st.th), upstate.placeholder_border(st.th))
+}
+
+// 盒：外圈边框色 + 内缩 1px 底色。
+func box(d: DrawList, r: Rect, rad: i64, bg: i64, bd: i64) -> DrawList {
+    if rad > 0 {
+        d = dl.rrect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), to_f64(rad), to_f64(rad), solid(bd))
+        if r.w > 2 && r.h > 2 {
+            var ir = rad - 1
+            if ir < 0 {
+                ir = 0
+            }
+            return dl.rrect(d, to_f64(r.x + 1), to_f64(r.y + 1), to_f64(r.w - 2), to_f64(r.h - 2), to_f64(ir), to_f64(ir), solid(bg))
+        }
+        return d
+    }
+    d = dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(bd))
+    if r.w > 2 && r.h > 2 {
+        return dl.rect(d, to_f64(r.x + 1), to_f64(r.y + 1), to_f64(r.w - 2), to_f64(r.h - 2), solid(bg))
+    }
+    return d
+}
+
+// 焦点判定：显式 focus 参数优先；未给（< 0）时读树上的焦点标记。
+func is_focus(id: i64, st: PState) -> i64 {
+    if st.focus >= 0 {
+        if id == st.focus {
+            return 1
+        }
         return 0
     }
-    d = dl.text_p(d, s, to_f64(r.x), to_f64(r.y), TEXT_SIZE, solid(uth.fg(th)))
+    if tiu_tree.focus_of(id) != 0 {
+        return 1
+    }
+    return 0
+}
+
+// 矩形与脏并集是否相交（1 = 相交；空矩形恒 0）。
+func hits(a: Rect, u: table<i64>) -> i64 {
+    if a.w <= 0 || a.h <= 0 {
+        return 0
+    }
+    if a.x + a.w <= u[0] || a.x >= u[2] {
+        return 0
+    }
+    if a.y + a.h <= u[1] || a.y >= u[3] {
+        return 0
+    }
     return 1
 }
 
-// Button：底色矩形 + 居中标签；三态底色（常态 / 悬停 / 按下）。
-func button_node(d: DrawList, id: i64, r: Rect, th: i64, hot: i64, active: i64) -> i64 {
-    var base = uth.accent(th)
-    if id == hot {
-        base = uth.accent_hot(th)
+// 子树包围盒（只统计有效矩形；全空返回空矩形）。
+func subtree_rect(id: i64) -> Rect {
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = 0
+    var y1: i64 = 0
+    var seen: i64 = 0
+    var r = tiu_tree.rect(id)
+    if r.w > 0 && r.h > 0 {
+        x0 = r.x
+        y0 = r.y
+        x1 = r.x + r.w
+        y1 = r.y + r.h
+        seen = 1
     }
-    if id == active {
-        base = uth.accent_down(th)
+    var c = tiu_tree.first_child(id)
+    while c >= 0 {
+        var cr = subtree_rect(c)
+        if cr.w > 0 && cr.h > 0 {
+            if seen == 0 {
+                x0 = cr.x
+                y0 = cr.y
+                x1 = cr.x + cr.w
+                y1 = cr.y + cr.h
+                seen = 1
+            } else {
+                if cr.x < x0 {
+                    x0 = cr.x
+                }
+                if cr.y < y0 {
+                    y0 = cr.y
+                }
+                if cr.x + cr.w > x1 {
+                    x1 = cr.x + cr.w
+                }
+                if cr.y + cr.h > y1 {
+                    y1 = cr.y + cr.h
+                }
+            }
+        }
+        c = tiu_tree.next_sibling(c)
     }
-    d = dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(base))
-    var n: i64 = 1
-    var s = tiu_tree.text_of(id)
-    var sl = str_len(s)
-    if sl > 0 {
-        var tw = sl * CHAR_ADV
-        var tx = r.x + (r.w - tw) / 2
-        var ty = r.y + (r.h - LINE_H) / 2
-        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), TEXT_SIZE, solid(uth.on_accent()))
-        n = n + 1
+    if seen == 0 {
+        return Rect(0, 0, 0, 0)
     }
-    return n
+    return Rect(x0, y0, x1 - x0, y1 - y0)
 }
 
 // 打包色（0xAARRGGBB）→ 纯色 Paint。

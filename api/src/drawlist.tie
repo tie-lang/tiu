@@ -141,6 +141,12 @@ pub func text_p(d: DrawList, s: string, x: f64, y: f64, size: f64, p: Paint) -> 
     return push_row(d, PO_TEXT, x, y, size, 0.0, 0.0, 0.0, 0.0, 0.0, size, s, "", 0, p, DL_NO_PATH, tform.identity())
 }
 
+// 图像：图像句柄 h + 目标矩形。源像素由引擎按句柄查图像注册表；
+// 句柄未注册（无像素数据）时由绘制层改画占位框。
+pub func image(d: DrawList, h: i64, x: f64, y: f64, w: f64, hh: f64, p: Paint) -> DrawList {
+    return push_row(d, PO_IMAGE, x, y, w, hh, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", h, p, DL_NO_PATH, tform.identity())
+}
+
 pub func save_layer(d: DrawList, x: f64, y: f64, w: f64, h: f64, p: Paint) -> DrawList {
     return push_row(d, PO_SAVE_LAYER, x, y, w, h, 0.0, 0.0, 0.0, 0.0, 0.0, "", "", 0, p, DL_NO_PATH, tform.identity())
 }

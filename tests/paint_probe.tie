@@ -1,0 +1,650 @@
+type tie<logic>
+// tests/paint_probe.tie —— 软件绘制层验收探针
+// ============================================================
+// 全链路：UI 树（布局矩形已就位）→ 绘制桥产记录 → IR 字节 →
+// loader 解析 → 软件光栅 → 帧缓冲像素。所有判据都是像素值/记录数断言，
+// 不靠肉眼、不用随机对比（颜色与几何都能从主题 token 与布局盒推出）。
+//
+// 覆盖：
+//   1) 容器面板：Row/Column/Absolute/Scroll 底色 + 1px 边框 + 圆角；
+//   2) 圆角抗锯齿：圆弧带多级灰阶、角落混合亮度居中、直角硬边、
+//      圆角外侧保持背景；
+//   3) 裁剪：Scroll 与 overflow=clip 裁掉溢出子盒，overflow=expand 不裁；
+//   4) 文本：按节点字号绘制、墨迹落在盒内、16px 墨迹高 9..14px、
+//      宽度与布局 measure_text 同源、换面后同串更宽；
+//   5) Image 缩放（引擎最近邻）与无数据占位框、TextInput 边框/文本/焦点 caret；
+//   6) hot/active/focus 三态像素互不相同且都与常态不同；
+//   7) 脏矩形：单脏节点记录数远少于全量，并集等于该节点矩形。
+//
+// 编译（tie 仓根下）：
+//   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/paint_probe.tie \
+//     -l2 -t0 --no-warn --no-cache -o ../tiu/_local_only/bin/paint_probe.exe
+// EN: software paint layer probe — pixel-level assertions, no visual inspection.
+
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/theme.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/paint_state.tie"
+import "../ui/src/paint_bridge.tie"
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/drawlist.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/semantics.tie"
+import "../engine/src/font.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/eimg.tie"
+
+// 深色主题（th = 0）：所有期望色都从 theme tie 的 token 读出，不硬编码。
+const TH: i64 = 0
+const PW: i64 = 240
+const PH: i64 = 200
+const DPI: f64 = 1.0
+
+const FONT_CONSULA: string = "C:/Windows/Fonts/consola.ttf"
+const FONT_ARIAL: string = "C:/Windows/Fonts/arial.ttf"
+
+var g_fail: i64 = 0
+var g_pass: i64 = 0
+
+// 树构造游标（与 layout_golden 同一套 open/close 习惯）
+var g_stk: table<i64> = []
+var g_top: i64 = 0
+var g_slot: i64 = 0
+
+// ------------------------------------------------------------------
+// 断言与像素工具
+// ------------------------------------------------------------------
+
+func ck(name: string, ok: bool, detail: string) {
+    if ok {
+        g_pass = g_pass + 1
+        println("OK   " + name + " | " + detail)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " | " + detail)
+    }
+}
+
+func px_at(fb: FrameBuf, x: i64, y: i64) -> i64 {
+    if x < 0 || y < 0 || x >= fb.w || y >= fb.h {
+        return 0
+    }
+    return fb.px[y * fb.w + x]
+}
+
+func col_text(c: i64) -> string {
+    return "argb=" + to_string(c) + " r=" + to_string(sem.ch_r(c)) + " g=" + to_string(sem.ch_g(c)) + " b=" + to_string(sem.ch_b(c))
+}
+
+// 断言某点像素等于期望色（整色相等，含 alpha）。
+func ck_px(name: string, fb: FrameBuf, x: i64, y: i64, want: i64) {
+    var got = px_at(fb, x, y)
+    ck(name, got == want, "(" + to_string(x) + "," + to_string(y) + ") 期望[" + col_text(want) + "] 实得[" + col_text(got) + "]")
+}
+
+// 断言某点像素不等于给定色。
+func ck_px_ne(name: string, fb: FrameBuf, x: i64, y: i64, notw: i64) {
+    var got = px_at(fb, x, y)
+    ck(name, got != notw, "(" + to_string(x) + "," + to_string(y) + ") 不应为[" + col_text(notw) + "] 实得[" + col_text(got) + "]")
+}
+
+// 纯色 Paint（与绘制桥内部的 solid 同一语义）。
+func tint(argb: i64) -> Paint {
+    return paint.solid(color.from_argb(argb))
+}
+
+// ------------------------------------------------------------------
+// 树构造
+// ------------------------------------------------------------------
+
+func pb_begin() {
+    tiu_tree.reset()
+    tiu_props.reset()
+    g_stk = table_new_i64()
+    g_top = 0
+    g_slot = 0
+}
+
+func pb_open(ty: WidgetType) -> i64 {
+    var parent: i64 = -1
+    if g_top > 0 {
+        parent = g_stk[g_top - 1]
+    }
+    var id = tiu_tree.mount(parent, g_slot, ty)
+    g_slot = g_slot + 1
+    // 栈必须用「按槽位写」而不是追加：追加会让关闭一层后残留旧槽位，
+    // 后续节点的父指针会指向早已关闭的节点（曾导致所有文本挂到第一行）。
+    while len(g_stk) <= g_top {
+        table_push(g_stk, 0)
+    }
+    g_stk[g_top] = id
+    g_top = g_top + 1
+    return id
+}
+
+func pb_close() {
+    g_top = g_top - 1
+}
+
+// 直接给定布局矩形（本探针只验绘制，不重跑求解器；矩形等于求解产物）。
+func at(id: i64, x: i64, y: i64, w: i64, h: i64) {
+    tiu_tree.set_rect(id, x, y, w, h)
+}
+
+// ------------------------------------------------------------------
+// 整帧渲染：背景 + 树 → 绘制记录 → IR → 光栅
+// ------------------------------------------------------------------
+
+func shot(th: i64, hot: i64, active: i64, focus: i64) -> FrameBuf {
+    var cv = cvs.new_offscreen(PW, PH, DPI)
+    var d = cvs.record(cv)
+    d = upaint.background(d, PW, PH, th)
+    d = upaint.draw_state(d, th, hot, active, focus)
+    var ir = cvs.submit(cv, d)
+    var p = eload.parse_frame(ir)
+    return erast.render(p)
+}
+
+// 裸绘制表渲染（不经过 UI 树）：用于圆角抗锯齿这类单记录判据。
+func shot_raw(rr: f64) -> FrameBuf {
+    var cv = cvs.new_offscreen(PW, PH, DPI)
+    var d = cvs.record(cv)
+    d = dl.rect(d, 0.0, 0.0, to_f64(PW), to_f64(PH), tint(uth.bg(TH)))
+    d = dl.rrect(d, 20.0, 20.0, 100.0, 100.0, rr, rr, tint(0xFF3F3F46))
+    var ir = cvs.submit(cv, d)
+    var p = eload.parse_frame(ir)
+    return erast.render(p)
+}
+
+// ------------------------------------------------------------------
+// 墨迹与灰阶统计
+// ------------------------------------------------------------------
+
+struct Ink {
+    var count: i64 = 0
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = -1
+    var y1: i64 = -1
+}
+
+// 统计矩形内「不属于给定三色」的像素（文本墨迹：底/边框/面板之外的色）。
+func ink_not(fb: FrameBuf, c1: i64, c2: i64, c3: i64, x0: i64, y0: i64, x1: i64, y1: i64) -> Ink {
+    var r = Ink()
+    r.x0 = 1 << 30
+    r.y0 = 1 << 30
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            var c = px_at(fb, x, y)
+            if c != c1 && c != c2 && c != c3 {
+                r.count = r.count + 1
+                if x < r.x0 {
+                    r.x0 = x
+                }
+                if y < r.y0 {
+                    r.y0 = y
+                }
+                if x > r.x1 {
+                    r.x1 = x
+                }
+                if y > r.y1 {
+                    r.y1 = y
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if r.count == 0 {
+        r.x0 = 0
+        r.y0 = 0
+    }
+    return r
+}
+
+// 统计矩形内 r 通道严格居中的像素数（圆角覆盖度渐变的证据）。
+func mid_count(fb: FrameBuf, x0: i64, y0: i64, x1: i64, y1: i64, lo: i64, hi: i64) -> i64 {
+    var n: i64 = 0
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            var r = sem.ch_r(px_at(fb, x, y))
+            if r > lo && r < hi {
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+// 矩形内 r 通道居中的「不同灰阶个数」。
+func mid_levels(fb: FrameBuf, x0: i64, y0: i64, x1: i64, y1: i64, lo: i64, hi: i64) -> i64 {
+    var levels = table_new_i64()
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            var r = sem.ch_r(px_at(fb, x, y))
+            if r > lo && r < hi {
+                var seen: i64 = 0
+                var i: i64 = 0
+                while i < len(levels) {
+                    if levels[i] == r {
+                        seen = 1
+                    }
+                    i = i + 1
+                }
+                if seen == 0 {
+                    table_push(levels, r)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return len(levels)
+}
+
+// 矩形内第一个 r 通道居中的像素坐标（找不到返回 -1,-1）。
+func find_mid(fb: FrameBuf, x0: i64, y0: i64, x1: i64, y1: i64, lo: i64, hi: i64) -> (i64, i64) {
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            var r = sem.ch_r(px_at(fb, x, y))
+            if r > lo && r < hi {
+                return (x, y)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return (-1, -1)
+}
+
+// ------------------------------------------------------------------
+// 一、容器面板：底色 + 1px 边框 + 圆角
+// ------------------------------------------------------------------
+
+func panel_case(name: string, ty: WidgetType) {
+    pb_begin()
+    var id = pb_open(ty)
+    at(id, 10, 10, 120, 80)
+    tiu_props.set_radius(id, 12)
+    pb_close()
+    var fb = shot(TH, -1, -1, -1)
+    ck_px(name + " 盒中心=surface", fb, 70, 50, uth.surface(TH))
+    ck_px(name + " 左边框=border", fb, 10, 50, uth.border(TH))
+    ck_px(name + " 上边框=border", fb, 70, 10, uth.border(TH))
+    // 圆角内层：半径 12 时外圆角圆心 (22,22)；(18,18) 距 5.66，内外两层圆角都在内。
+    ck_px(name + " 内层=surface（圆角内）", fb, 18, 18, uth.surface(TH))
+    // 圆角外侧：(12,12) 距圆心 14.14 > 12，已在圆弧之外，应保持背景色。
+    ck_px(name + " 圆角外侧=背景", fb, 12, 12, uth.bg(TH))
+    ck_px(name + " 盒外=背景", fb, 5, 5, uth.bg(TH))
+    // 1px 边框：第二列必须是底色（不是 border），否则边框会变宽。
+    ck_px(name + " 边框宽 1px", fb, 11, 50, uth.surface(TH))
+}
+
+func case_panels() {
+    panel_case("面板 Row", WidgetType.Row)
+    panel_case("面板 Column", WidgetType.Column)
+    panel_case("面板 Absolute", WidgetType.Absolute)
+    panel_case("面板 Scroll", WidgetType.Scroll)
+}
+
+// ------------------------------------------------------------------
+// 二、圆角抗锯齿
+// ------------------------------------------------------------------
+
+func case_aa() {
+    var bg_r = sem.ch_r(uth.bg(TH))
+    var panel_r = sem.ch_r(0xFF3F3F46)
+    var fb = shot_raw(16.0)
+    // 直边保持硬边（整像素覆盖）
+    ck_px("AA 直边硬边", fb, 20, 70, 0xFF3F3F46)
+    ck_px("AA 盒内实色", fb, 70, 70, 0xFF3F3F46)
+    // 圆角外侧（弧外）仍是背景
+    ck_px("AA 圆角外=背景", fb, 20, 20, uth.bg(TH))
+    ck_px("AA 圆角外=背景(2)", fb, 22, 22, uth.bg(TH))
+    // 圆弧带内出现多级灰阶
+    var levels = mid_levels(fb, 20, 20, 40, 40, bg_r, panel_r)
+    ck("AA 圆弧多级灰阶", levels >= 2, "圆弧带内不同灰阶数=" + to_string(levels))
+    var mids = mid_count(fb, 20, 20, 40, 40, bg_r, panel_r)
+    ck("AA 圆弧存在覆盖度渐变像素", mids >= 2, "中间覆盖像素数=" + to_string(mids))
+    // 角落过渡像素：亮度严格介于背景与面板色之间
+    var xy = find_mid(fb, 20, 20, 40, 40, bg_r, panel_r)
+    var cx = xy.0
+    var cy = xy.1
+    var cr = sem.ch_r(px_at(fb, cx, cy))
+    ck("AA 角落混合亮度居中", cx >= 0 && cr > bg_r && cr < panel_r,
+        "像素(" + to_string(cx) + "," + to_string(cy) + ") r=" + to_string(cr) + " 背景r=" + to_string(bg_r) + " 面板r=" + to_string(panel_r))
+
+    // 直角：半径 0 时角点必须是整色，且角落带内没有中间灰。
+    var sq = shot_raw(0.0)
+    ck_px("直角角点=整色", sq, 20, 20, 0xFF3F3F46)
+    var sq_mid = mid_count(sq, 20, 20, 40, 40, bg_r, panel_r)
+    ck("直角处无过渡灰", sq_mid == 0, "中间覆盖像素数=" + to_string(sq_mid))
+}
+
+// ------------------------------------------------------------------
+// 三、裁剪
+// ------------------------------------------------------------------
+
+// ty 容器 10,10,60,40；子 Button 20,20,80,60（右下越界）。
+// want_out = uth.bg(TH) 表示越界部分被裁掉，= accent 表示未裁。
+func clip_case(name: string, ty: WidgetType, ov: i64, want_out: i64) {
+    pb_begin()
+    var root = pb_open(ty)
+    at(root, 10, 10, 60, 40)
+    tiu_props.set_radius(root, -1)
+    tiu_props.set_overflow(root, ov)
+    var btn = pb_open(WidgetType.Button)
+    at(btn, 20, 20, 80, 60)
+    tiu_props.set_radius(btn, -1)
+    pb_close()
+    pb_close()
+    var fb = shot(TH, -1, -1, -1)
+    // 父盒内：子盒可见（Button 底色 = accent）
+    ck_px(name + " 父内子可见", fb, 30, 30, uth.accent(TH))
+    // 父盒外下方（子盒范围内、父盒下方）
+    ck_px(name + " 父外下方", fb, 30, 55, want_out)
+    // 父盒外右侧（子盒范围内、父盒右侧）
+    ck_px(name + " 父外右侧", fb, 75, 30, want_out)
+}
+
+func case_clip() {
+    clip_case("裁剪 Column(clip)", WidgetType.Column, 0, uth.bg(TH))
+    clip_case("裁剪 Scroll", WidgetType.Scroll, 1, uth.bg(TH))
+    clip_case("裁剪 expand 对照", WidgetType.Column, 2, uth.accent(TH))
+}
+
+// ------------------------------------------------------------------
+// 四、文本
+// ------------------------------------------------------------------
+
+// 树：Column 0,0,200,120（无圆角）内 Text "Hello" 字号 16 于 10,10,120,20。
+func text_shot(font_size: i64) -> FrameBuf {
+    pb_begin()
+    var root = pb_open(WidgetType.Column)
+    at(root, 0, 0, 200, 120)
+    tiu_props.set_radius(root, -1)
+    var t = pb_open(WidgetType.Text)
+    tiu_tree.set_text(t, "Hello")
+    tiu_props.set_font_size(t, font_size)
+    at(t, 10, 10, 120, 20)
+    pb_close()
+    pb_close()
+    return shot(TH, -1, -1, -1)
+}
+
+func case_text(face: i64) {
+    ck("文本布局与光栅同一 face", upaint.text_face() >= 0 && erast.face() == upaint.text_face(),
+        "layout face=" + to_string(upaint.text_face()) + " raster face=" + to_string(erast.face()))
+    var same_src = upaint.text_width("Hello", 16) == tiu_layout2.measure_text("Hello", 16)
+    ck("文本宽度与布局同源", same_src, "paint=" + to_string(upaint.text_width("Hello", 16)) + " layout=" + to_string(tiu_layout2.measure_text("Hello", 16)))
+    ck("文本宽度=真实 advance 和", upaint.text_width("Hello", 16) == 2815, "w=" + upaint.text_width("Hello", 16))
+
+    var fb = text_shot(16)
+    var ink = ink_not(fb, uth.bg(TH), uth.border(TH), uth.surface(TH), 0, 0, PW, PH)
+    ck("文本有墨迹", ink.count > 50, "墨迹像素=" + to_string(ink.count))
+    var ih = ink.y1 - ink.y0 + 1
+    ck("16px 墨迹高 9..14", ih >= 9 && ih <= 14, "墨迹高=" + to_string(ih) + " y0=" + to_string(ink.y0) + " y1=" + to_string(ink.y1))
+    // 墨迹落在文字盒内（盒 = 10,10,120,20）
+    var inside = ink.x0 >= 10 && ink.y0 >= 10 && ink.x1 <= 129 && ink.y1 <= 29
+    ck("文本墨迹落在盒内", inside, "墨迹盒=(" + to_string(ink.x0) + "," + to_string(ink.y0) + ")-(" + to_string(ink.x1) + "," + to_string(ink.y1) + ")")
+
+    // 换面：Arial 更窄，再切回 Consolas —— 同一字符串宽度随 face 变化且能变大。
+    var wide0 = ink.x1 - ink.x0 + 1
+    var w_cons = upaint.text_width("Hello", 16)
+    var af = efont.load(FONT_ARIAL)
+    ck("备用字体面可装载", af >= 0, "arial face=" + to_string(af))
+    if af >= 0 {
+        upaint.set_text_face(af)
+        var w_arial = upaint.text_width("Hello", 16)
+        ck("换面后宽度随 face 变化", w_arial != w_cons, "consola=" + to_string(w_cons) + " arial=" + to_string(w_arial))
+        var fb2 = text_shot(16)
+        var ink2 = ink_not(fb2, uth.bg(TH), uth.border(TH), uth.surface(TH), 0, 0, PW, PH)
+        ck("换面后仍有墨迹", ink2.count > 50, "arial 墨迹像素=" + to_string(ink2.count))
+        upaint.set_text_face(face)
+        var w_back = upaint.text_width("Hello", 16)
+        ck("换面后同串宽度变大", w_back > w_arial, "arial=" + to_string(w_arial) + " consola=" + to_string(w_back))
+        var fb3 = text_shot(16)
+        var ink3 = ink_not(fb3, uth.bg(TH), uth.border(TH), uth.surface(TH), 0, 0, PW, PH)
+        var wide3 = ink3.x1 - ink3.x0 + 1
+        ck("换面后墨迹宽度变化", wide3 != (ink2.x1 - ink2.x0 + 1), "consola 墨迹宽=" + to_string(wide3) + " arial 墨迹宽=" + to_string(ink2.x1 - ink2.x0 + 1) + " 原 consola 宽=" + to_string(wide0))
+    }
+}
+
+// ------------------------------------------------------------------
+// 五、Image / TextInput
+// ------------------------------------------------------------------
+
+func case_image() {
+    eimg.reset()
+    var px = table_new_i64()
+    var i: i64 = 0
+    while i < 4 {
+        table_push(px, 0xFF00FF00)
+        i = i + 1
+    }
+    var h = eimg.define(7, 2, 2, px)
+    ck("图像已注册", h >= 0 && eimg.has(7) == 1, "handle=7 w=" + to_string(eimg.width(7)) + " h=" + to_string(eimg.height(7)))
+
+    pb_begin()
+    var root = pb_open(WidgetType.Column)
+    at(root, 0, 0, 200, 160)
+    tiu_props.set_radius(root, -1)
+    var img = pb_open(WidgetType.Image)
+    tiu_tree.set_res(img, 7)
+    at(img, 20, 20, 80, 80)
+    pb_close()
+    pb_close()
+    var fb = shot(TH, -1, -1, -1)
+    // 2×2 纯绿最近邻缩放到 80×80：盒内每点都应是纯绿
+    ck_px("Image 缩放中心", fb, 60, 60, 0xFF00FF00)
+    ck_px("Image 缩放左上", fb, 20, 20, 0xFF00FF00)
+    ck_px("Image 缩放右下", fb, 99, 99, 0xFF00FF00)
+    ck_px("Image 图像不越界（盒外=面板底色）", fb, 110, 110, uth.surface(TH))
+
+    // 无像素数据 → 占位框（外框 fg_dim，内层底色）
+    pb_begin()
+    var root2 = pb_open(WidgetType.Column)
+    at(root2, 0, 0, 200, 160)
+    tiu_props.set_radius(root2, -1)
+    var img2 = pb_open(WidgetType.Image)
+    tiu_tree.set_res(img2, -1)
+    at(img2, 20, 20, 80, 80)
+    pb_close()
+    pb_close()
+    var fb2 = shot(TH, -1, -1, -1)
+    ck_px("Image 占位框边缘", fb2, 20, 60, upstate.placeholder_border(TH))
+    ck_px("Image 占位框中心", fb2, 60, 60, upstate.placeholder_bg(TH))
+}
+
+var g_input_id: i64 = -1
+
+func input_shot(focus: i64) -> FrameBuf {
+    pb_begin()
+    var root = pb_open(WidgetType.Column)
+    at(root, 0, 0, 200, 120)
+    tiu_props.set_radius(root, -1)
+    var inp = pb_open(WidgetType.TextInput)
+    tiu_tree.set_text(inp, "Hello")
+    tiu_props.set_font_size(inp, 16)
+    at(inp, 10, 10, 160, 30)
+    g_input_id = inp
+    pb_close()
+    pb_close()
+    return shot(TH, -1, -1, focus)
+}
+
+func case_textinput() {
+    var fb0 = input_shot(-1)
+    ck_px("TextInput 常态边框", fb0, 10, 25, upstate.input_border(TH, 0))
+    ck_px_ne("TextInput 常态无 caret", fb0, 60, 20, upstate.caret(TH))
+    var ink0 = ink_not(fb0, uth.bg(TH), uth.border(TH), uth.surface(TH), 12, 12, 168, 38)
+    ck("TextInput 文本有墨迹", ink0.count > 50, "墨迹像素=" + to_string(ink0.count))
+
+    var fbf = input_shot(g_input_id)
+    ck_px("TextInput 焦点边框", fbf, 10, 25, upstate.input_border(TH, 1))
+    ck("TextInput 焦点边框走 focus token", upstate.input_border(TH, 1) == uth.fg(TH),
+        "focus_border=[" + col_text(upstate.input_border(TH, 1)) + "]")
+    // caret 位置 = 文本起点(10+6) + 已排字宽(2815/64=43 向上取整=44) = 60
+    var cx = 10 + PS_PAD_INPUT + (upaint.text_width("Hello", 16) + 32) / 64
+    ck_px("TextInput 焦点 caret", fbf, cx, 20, upstate.caret(TH))
+    ck("caret 由文本度量推出", cx == 60, "caret x=" + to_string(cx))
+    // 焦点底色与常态底色不同（状态叠加）
+    ck("TextInput 焦点底色叠加", upstate.input_bg(TH, 1) != upstate.input_bg(TH, 0),
+        "常态=[" + col_text(upstate.input_bg(TH, 0)) + "] 焦点=[" + col_text(upstate.input_bg(TH, 1)) + "]")
+}
+
+// ------------------------------------------------------------------
+// 六、视觉状态
+// ------------------------------------------------------------------
+
+// 树：Column 0,0,200,120 内 Button 10,10,100,30（无文字，纯底色便于取点）。
+func button_shot(hot: i64, active: i64, focus: i64) -> FrameBuf {
+    pb_begin()
+    var root = pb_open(WidgetType.Column)
+    at(root, 0, 0, 200, 120)
+    tiu_props.set_radius(root, -1)
+    var b = pb_open(WidgetType.Button)
+    at(b, 10, 10, 100, 30)
+    tiu_props.set_radius(b, 4)
+    pb_close()
+    pb_close()
+    return shot(TH, hot, active, focus)
+}
+
+func case_states() {
+    var b: i64 = 1
+    var fb_n = button_shot(-1, -1, -1)
+    var fb_h = button_shot(b, -1, -1)
+    var fb_a = button_shot(-1, b, -1)
+    var fb_f = button_shot(-1, -1, b)
+    ck_px("Button 常态=accent", fb_n, 10, 25, uth.accent(TH))
+    ck_px("Button hot=accent_hot", fb_h, 10, 25, uth.accent_hot(TH))
+    ck_px("Button active=accent_down", fb_a, 10, 25, uth.accent_down(TH))
+    ck_px("Button focus=焦点环", fb_f, 10, 25, uth.fg(TH))
+
+    var c_n = px_at(fb_n, 10, 25)
+    var c_h = px_at(fb_h, 10, 25)
+    var c_a = px_at(fb_a, 10, 25)
+    var c_f = px_at(fb_f, 10, 25)
+    ck("三态与常态两两不同",
+        c_h != c_n && c_a != c_n && c_f != c_n && c_h != c_a && c_h != c_f && c_a != c_f,
+        "常态=" + to_string(c_n) + " hot=" + to_string(c_h) + " active=" + to_string(c_a) + " focus=" + to_string(c_f))
+
+    // TextInput 的 hot/active 不改变底色（只 focus 叠加底色 + 边框），
+    // 这里断言输入框焦点态与常态在「边框 + 底色」两处都不同。
+    var fb_i0 = input_shot(-1)
+    var fb_i1 = input_shot(g_input_id)
+    ck("TextInput 焦点与常态边框不同", px_at(fb_i0, 10, 25) != px_at(fb_i1, 10, 25),
+        "常态=" + to_string(px_at(fb_i0, 10, 25)) + " 焦点=" + to_string(px_at(fb_i1, 10, 25)))
+    ck("TextInput 焦点与常态底色不同", px_at(fb_i0, 100, 25) != px_at(fb_i1, 100, 25),
+        "常态=" + to_string(px_at(fb_i0, 100, 25)) + " 焦点=" + to_string(px_at(fb_i1, 100, 25)))
+}
+
+// ------------------------------------------------------------------
+// 七、脏矩形
+// ------------------------------------------------------------------
+
+func case_dirty() {
+    pb_begin()
+    var root = pb_open(WidgetType.Column)
+    at(root, 0, 0, 200, 160)
+    tiu_props.set_radius(root, -1)
+    var rows = table_new_i64()
+    var r: i64 = 0
+    while r < 3 {
+        var row = pb_open(WidgetType.Column)
+        at(row, 10, 10 + r * 40, 180, 30)
+        tiu_props.set_radius(row, -1)
+        var k: i64 = 0
+        while k < 4 {
+            var t = pb_open(WidgetType.Text)
+            tiu_tree.set_text(t, "A")
+            tiu_props.set_font_size(t, 16)
+            at(t, 14 + k * 30, 14 + r * 40, 30, 16)
+            table_push(rows, t)
+            pb_close()
+            k = k + 1
+        }
+        pb_close()
+        r = r + 1
+    }
+    pb_close()
+
+    // 全量
+    var cv = cvs.new_offscreen(PW, PH, DPI)
+    var d = cvs.record(cv)
+    d = upaint.background(d, PW, PH, TH)
+    d = upaint.draw_state(d, TH, -1, -1, -1)
+    var full = upaint.records(d)
+
+    // 单脏节点
+    var keys = table_new_i64()
+    var last = rows[len(rows) - 1]
+    table_push(keys, last)
+    var cv2 = cvs.new_offscreen(PW, PH, DPI)
+    var d2 = cvs.record(cv2)
+    d2 = upaint.background(d2, PW, PH, TH)
+    d2 = upaint.draw_keys(d2, TH, keys)
+    var one = upaint.records(d2)
+    var ir_dirty = cvs.submit(cv2, d2)
+    ck("脏矩形 单脏记录数远少于全量", one * 2 < full,
+        "全量=" + to_string(full) + " 单脏=" + to_string(one) + " 节点数=" + to_string(tiu_tree.count()))
+
+    // 并集等于该节点矩形
+    var dr = upaint.dirty_rect(keys)
+    var lr = tiu_tree.rect(last)
+    ck("脏矩形 并集等于节点矩形",
+        dr.x == lr.x && dr.y == lr.y && dr.w == lr.w && dr.h == lr.h,
+        "并集=(" + to_string(dr.x) + "," + to_string(dr.y) + "," + to_string(dr.w) + "," + to_string(dr.h) + ") 节点=(" + to_string(lr.x) + "," + to_string(lr.y) + "," + to_string(lr.w) + "," + to_string(lr.h) + ")")
+
+    // 脏帧渲染：脏区外未被重绘（保持背景），脏区内确有绘制
+    var ir = ir_dirty
+    var fb = erast.render(eload.parse_frame(ir))
+    ck_px("脏帧 脏区外保持背景", fb, 200, 190, uth.bg(TH))
+    // 脏并集内的面板（根面板与脏行面板）在裁剪区内重绘，底色可见。
+    ck_px("脏帧 脏区内面板已绘", fb, 105, 95, uth.surface(TH))
+    var outside = ink_not(fb, uth.bg(TH), uth.border(TH), uth.surface(TH), 0, 0, PW, PH)
+    var inked = ink_not(fb, uth.bg(TH), uth.border(TH), uth.surface(TH), lr.x, lr.y, lr.x + lr.w, lr.y + lr.h)
+    ck("脏帧 墨迹只在脏矩形内",
+        inked.count > 0 && outside.x0 >= lr.x && outside.x1 <= lr.x + lr.w - 1 && outside.y0 >= lr.y && outside.y1 <= lr.y + lr.h - 1,
+        "脏区墨迹=" + to_string(inked.count) + " 全帧墨迹盒=(" + to_string(outside.x0) + "," + to_string(outside.y0) + ")-(" + to_string(outside.x1) + "," + to_string(outside.y1) + ") 脏矩形=(" + to_string(lr.x) + "," + to_string(lr.y) + "," + to_string(lr.w) + "," + to_string(lr.h) + ")")
+}
+
+// ------------------------------------------------------------------
+// main
+// ------------------------------------------------------------------
+
+func main() -> i64 {
+    var face = efont.load(FONT_CONSULA)
+    ck("正文字体面可装载", face >= 0, "consola face=" + to_string(face))
+    upaint.set_text_face(face)
+
+    case_panels()
+    case_aa()
+    case_clip()
+    case_text(face)
+    case_image()
+    case_textinput()
+    case_states()
+    case_dirty()
+
+    println("---- paint probe: PASS=" + to_string(g_pass) + " FAIL=" + to_string(g_fail))
+    if g_fail == 0 {
+        println("paint ok")
+        return 0
+    }
+    return 1
+}
