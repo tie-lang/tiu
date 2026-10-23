@@ -1,0 +1,424 @@
+type tie<class>
+// event.tie —— 事件轴（不可变事件记录 · 命中缓存 · 捕获/目标/冒泡路由 · 焦点 · 悬停 · 滚动）
+// EN: event axis — immutable event records, cached hit-testing, capture/target/bubble
+// routing, focus traversal, low-noise hover tracking and wheel scrolling.
+// ============================================================
+// 依据：docs/designs/tiu-event-system.md
+//   §3 事件是不可变记录：字段只在构造时给定，路由过程不修改事件本身（handled 是
+//      路由结果，单独记账，不写回记录）。
+//   §4 命中测试单趟只读、按布局矩形、布局不变时复用上次结果；本模块用
+//      「(x, y, 树规模, 失效代数)」做缓存键，布局或树变化后由 app 调
+//      layout_changed() 使缓存失效。
+//   §5 路由三阶段：捕获（根 → 目标父链）、目标、冒泡（目标 → 根）。阶段名通过
+//      处理器第五个参数 kind 传给处理器：处理器返回非 0 表示已处理，停止传播。
+//   §6 焦点：焦点是单值，Tab/Shift+Tab 在「可聚焦」节点上按 DFS 序循环。
+//   §7 悬停：只在命中的可交互节点发生变化时产生 hover_in/hover_out，移动噪声
+//      不入事件流。
+//   §8 滚动：滚轮命中后沿冒泡链找最近的 Scroll 容器，按行高整数倍滚动并产生
+//      scroll 事件；不重布局。
+// 本模块不 import 上层（ui_bridge / paint / app）：路由终点由调用方以 sink 传入，
+// 保证事件轴只依赖 树 + 命中，可在无 UI 树的情况下单测。
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\event.tie（探针见 tests/event_probe.tie）
+
+import "./tree.tie"
+import "./hit.tie"
+
+// 事件种类（UI 语义，与 host 的 EV_* 不是同一套编号）
+const E_MOVE: i64 = 0
+const E_DOWN: i64 = 1
+const E_UP: i64 = 2
+const E_CLICK: i64 = 3
+const E_WHEEL: i64 = 4
+const E_KEY_DOWN: i64 = 5
+const E_KEY_UP: i64 = 6
+const E_CHAR: i64 = 7
+const E_HOVER_IN: i64 = 8
+const E_HOVER_OUT: i64 = 9
+const E_FOCUS_IN: i64 = 10
+const E_FOCUS_OUT: i64 = 11
+const E_SCROLL: i64 = 12
+
+// 路由阶段（作为处理器 kind 参数回传）
+const PH_CAPTURE: string = "capture"
+const PH_TARGET: string = "target"
+const PH_BUBBLE: string = "bubble"
+
+// 事件记录：构造后不再修改。
+struct Event {
+    var kind: i64 = 0
+    var x: i64 = 0
+    var y: i64 = 0
+    var key: i64 = 0
+    var button: i64 = 0
+    var wheel: i64 = 0
+    var target: i64 = 0 - 1
+}
+
+var g_hover_id: i64 = 0 - 1
+var g_focus_id: i64 = 0 - 1
+var g_press: i64 = 0 - 1
+
+// 修饰键状态由 app 在按键处理时写入（Shift=16 由 host 的键码约定提供）。
+var g_shift: bool = false
+
+// 命中缓存：同一位置且布局未失效时直接复用。
+var g_hx: i64 = 0 - 12345
+var g_hy: i64 = 0 - 12345
+var g_hcount: i64 = 0 - 1
+var g_hepoch: i64 = 0
+var g_hid: i64 = 0 - 1
+
+// 记账（探针与调试用，不影响语义）
+var g_epoch: i64 = 0
+var g_events: i64 = 0
+var g_hits: i64 = 0
+var g_cache_hits: i64 = 0
+var g_dispatched: i64 = 0
+var g_handled: i64 = 0
+
+var g_click_node: i64 = 0 - 1
+var g_click_count: i64 = 0
+
+namespace tiu_event {
+// ---- 事件种类 ----
+pub func e_move() -> i64 { return E_MOVE }
+pub func e_down() -> i64 { return E_DOWN }
+pub func e_up() -> i64 { return E_UP }
+pub func e_click() -> i64 { return E_CLICK }
+pub func e_wheel() -> i64 { return E_WHEEL }
+pub func e_key_down() -> i64 { return E_KEY_DOWN }
+pub func e_key_up() -> i64 { return E_KEY_UP }
+pub func e_char() -> i64 { return E_CHAR }
+pub func e_hover_in() -> i64 { return E_HOVER_IN }
+pub func e_hover_out() -> i64 { return E_HOVER_OUT }
+pub func e_focus_in() -> i64 { return E_FOCUS_IN }
+pub func e_focus_out() -> i64 { return E_FOCUS_OUT }
+pub func e_scroll() -> i64 { return E_SCROLL }
+
+// 事件名：处理器按名字注册（与 std/ui 的 on(名, 函数值) 对接）。
+pub func name_of(kind: i64) -> string {
+    if kind == E_MOVE { return "move" }
+    if kind == E_DOWN { return "down" }
+    if kind == E_UP { return "up" }
+    if kind == E_CLICK { return "click" }
+    if kind == E_WHEEL { return "wheel" }
+    if kind == E_KEY_DOWN { return "key_down" }
+    if kind == E_KEY_UP { return "key_up" }
+    if kind == E_CHAR { return "char" }
+    if kind == E_HOVER_IN { return "hover_in" }
+    if kind == E_HOVER_OUT { return "hover_out" }
+    if kind == E_FOCUS_IN { return "focus_in" }
+    if kind == E_FOCUS_OUT { return "focus_out" }
+    if kind == E_SCROLL { return "scroll" }
+    return "unknown"
+}
+
+// ---- 不可变记录 ----
+pub func make(kind: i64, x: i64, y: i64, key: i64) -> Event {
+    var ev = Event(kind, x, y, key, 0, 0, 0 - 1)
+    return ev
+}
+
+pub func make_mouse(kind: i64, x: i64, y: i64, button: i64) -> Event {
+    var ev = Event(kind, x, y, 0, button, 0, 0 - 1)
+    return ev
+}
+
+pub func make_wheel(x: i64, y: i64, notches: i64) -> Event {
+    var ev = Event(E_WHEEL, x, y, 0, 0, notches, 0 - 1)
+    return ev
+}
+
+// ---- 缓存与失效 ----
+// 布局或树结构变化后调用：命中缓存与「树规模」键同时失效。
+pub func layout_changed() {
+    g_epoch = g_epoch + 1
+    g_hepoch = g_hepoch + 1
+    g_hcount = 0 - 1
+    g_hid = 0 - 1
+}
+
+// 只读命中：同一 (x, y) 且树规模与失效代数未变时复用。
+pub func hit(px: i64, py: i64) -> i64 {
+    var c = tiu_tree.count()
+    if px == g_hx && py == g_hy && c == g_hcount && g_hepoch == g_epoch {
+        g_cache_hits = g_cache_hits + 1
+        return g_hid
+    }
+    var id = tiu_hit.hit_test(px, py)
+    g_hx = px
+    g_hy = py
+    g_hcount = c
+    g_hepoch = g_epoch
+    g_hid = id
+    g_hits = g_hits + 1
+    return id
+}
+
+// ---- 可聚焦判定：按钮与输入框 ----
+func focusable(id: i64) -> bool {
+    if id < 0 || !tiu_tree.is_live(id) {
+        return false
+    }
+    var t = tiu_tree.ty_of(id)
+    if t == tiu_tree.ty_code(WidgetType.Button) {
+        return true
+    }
+    if t == tiu_tree.ty_code(WidgetType.TextInput) {
+        return true
+    }
+    return false
+}
+
+// 在 DFS 序上找下一个/上一个可聚焦节点；dir=+1 前进，dir=-1 后退。
+func find_focus(from: i64, dir: i64) -> i64 {
+    var order = tiu_tree.dfs_order()
+    var n = len(order)
+    if n == 0 {
+        return 0 - 1
+    }
+    var start: i64 = 0 - 1
+    var i: i64 = 0
+    while i < n {
+        if order[i] == from {
+            start = i
+        }
+        i = i + 1
+    }
+    var step: i64 = 1
+    var j: i64 = 0
+    while j < n {
+        var idx = start + dir * step
+        // 环形回卷：按模取余（旧实现只钳到边界，会在端点反复命中同一节点）。
+        idx = idx % n
+        if idx < 0 {
+            idx = idx + n
+        }
+        var cand = order[idx]
+        if focusable(cand) {
+            return cand
+        }
+        step = step + 1
+        j = j + 1
+    }
+    return 0 - 1
+}
+
+// ---- 路由 ----
+// 三阶段路由：捕获（根 → 父链）→ 目标 → 冒泡（目标 → 根）。
+// sink 返回非 0 视为已处理并停止传播；返回本次是否被处理。
+func route(ev: Event, sink: fn(i64, string, i64, i64, string) -> i64) -> bool {
+    if ev.target < 0 {
+        return false
+    }
+    var nm = name_of(ev.kind)
+    var chain = tiu_hit.bubble(ev.target)
+    var n = len(chain)
+    // 捕获：根 → 目标父链（chain 是 leaf→root，逆序跳过目标）
+    var i: i64 = n - 1
+    while i > 0 {
+        g_dispatched = g_dispatched + 1
+        var r = sink(chain[i], nm, ev.x, ev.y, PH_CAPTURE)
+        if r != 0 {
+            g_handled = g_handled + 1
+            return true
+        }
+        i = i - 1
+    }
+    // 目标
+    g_dispatched = g_dispatched + 1
+    var rt = sink(ev.target, nm, ev.x, ev.y, PH_TARGET)
+    if rt != 0 {
+        g_handled = g_handled + 1
+        return true
+    }
+    // 冒泡：目标父链 → 根
+    var k: i64 = 1
+    while k < n {
+        g_dispatched = g_dispatched + 1
+        var rb = sink(chain[k], nm, ev.x, ev.y, PH_BUBBLE)
+        if rb != 0 {
+            g_handled = g_handled + 1
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// 焦点迁移：把焦点设到 id（-1 表示清除）。产生 focus_out / focus_in 事件。
+func set_focus(id: i64, sink: fn(i64, string, i64, i64, string) -> i64) {
+    if id == g_focus_id {
+        return
+    }
+    if g_focus_id >= 0 && tiu_tree.is_live(g_focus_id) {
+        tiu_tree.set_focus(g_focus_id, 0)
+        var out = Event(E_FOCUS_OUT, 0, 0, 0, 0, 0, g_focus_id)
+        route(out, sink)
+    }
+    g_focus_id = id
+    if id >= 0 && tiu_tree.is_live(id) {
+        tiu_tree.set_focus(id, 1)
+        var inn = Event(E_FOCUS_IN, 0, 0, 0, 0, 0, id)
+        route(inn, sink)
+    }
+}
+
+pub func focus() -> i64 {
+    return g_focus_id
+}
+
+pub func hover() -> i64 {
+    return g_hover_id
+}
+
+pub func set_focus_at(id: i64, sink: fn(i64, string, i64, i64, string) -> i64) {
+    set_focus(id, sink)
+}
+
+pub func focus_next(sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    var nxt = find_focus(g_focus_id, 1)
+    set_focus(nxt, sink)
+    return nxt
+}
+
+pub func focus_prev(sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    var prv = find_focus(g_focus_id, 0 - 1)
+    set_focus(prv, sink)
+    return prv
+}
+
+// 鼠标移动到 (px, py)：更新悬停（低噪声）并路由 move。
+pub func mouse_move(px: i64, py: i64, sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    g_events = g_events + 1
+    var id = hit(px, py)
+    if id != g_hover_id {
+        if g_hover_id >= 0 && tiu_tree.is_live(g_hover_id) {
+            var out = Event(E_HOVER_OUT, px, py, 0, 0, 0, g_hover_id)
+            route(out, sink)
+        }
+        g_hover_id = id
+        if id >= 0 {
+            var inn = Event(E_HOVER_IN, px, py, 0, 0, 0, id)
+            route(inn, sink)
+        }
+    }
+    var ev = Event(E_MOVE, px, py, 0, 0, 0, id)
+    if id >= 0 {
+        route(ev, sink)
+    }
+    return id
+}
+
+// 按键按下：按钮获得焦点并路由 down；松开时同一目标产生 click。
+pub func mouse_down(px: i64, py: i64, button: i64, sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    g_events = g_events + 1
+    var id = hit(px, py)
+    g_press = id
+    if id >= 0 && focusable(id) {
+        set_focus(id, sink)
+    }
+    var ev = Event(E_DOWN, px, py, 0, button, 0, id)
+    if id >= 0 {
+        route(ev, sink)
+    }
+    return id
+}
+
+pub func mouse_up(px: i64, py: i64, button: i64, sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    g_events = g_events + 1
+    var id = hit(px, py)
+    var ev = Event(E_UP, px, py, 0, button, 0, id)
+    if id >= 0 {
+        route(ev, sink)
+    }
+    // 按下与松开在同一节点即合成点击（目标有效就记账，与处理器是否已处理无关）。
+    if id >= 0 && id == g_press {
+        var ck = Event(E_CLICK, px, py, 0, button, 0, id)
+        route(ck, sink)
+        g_click_node = id
+        g_click_count = g_click_count + 1
+    }
+    g_press = 0 - 1
+    return id
+}
+
+// 滚轮：命中后沿冒泡链找最近的 Scroll 容器，按步长滚动并产生 scroll 事件。
+pub func wheel(px: i64, py: i64, notches: i64, step: i64, sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    g_events = g_events + 1
+    var id = hit(px, py)
+    if id < 0 {
+        return 0 - 1
+    }
+    var chain = tiu_hit.bubble(id)
+    var i: i64 = 0
+    var n = len(chain)
+    while i < n {
+        var node = chain[i]
+        if tiu_tree.ty_of(node) == tiu_tree.ty_code(WidgetType.Scroll) {
+            var off = tiu_tree.scroll_of(node) + notches * step
+            if off < 0 {
+                off = 0
+            }
+            tiu_tree.set_scroll(node, off)
+            var sev = Event(E_SCROLL, px, py, 0, 0, notches, node)
+            route(sev, sink)
+            return node
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 键盘：焦点节点接收 key_down/key_up；Tab(9) 循环焦点。
+pub func key(kind: i64, kc: i64, sink: fn(i64, string, i64, i64, string) -> i64) -> i64 {
+    g_events = g_events + 1
+    if kc == 9 && kind == E_KEY_DOWN {
+        if g_shift {
+            return focus_prev(sink)
+        }
+        return focus_next(sink)
+    }
+    if g_focus_id < 0 || !tiu_tree.is_live(g_focus_id) {
+        return 0 - 1
+    }
+    var ev = Event(kind, 0, 0, kc, 0, 0, g_focus_id)
+    route(ev, sink)
+    return g_focus_id
+}
+
+pub func set_shift(b: bool) {
+    g_shift = b
+}
+
+pub func stat_events() -> i64 { return g_events }
+pub func stat_hits() -> i64 { return g_hits }
+pub func stat_cache_hits() -> i64 { return g_cache_hits }
+pub func stat_dispatched() -> i64 { return g_dispatched }
+pub func stat_handled() -> i64 { return g_handled }
+pub func click_node() -> i64 { return g_click_node }
+pub func click_count() -> i64 { return g_click_count }
+pub func reset_stats() {
+    g_events = 0
+    g_hits = 0
+    g_cache_hits = 0
+    g_dispatched = 0
+    g_handled = 0
+    g_click_node = 0 - 1
+    g_click_count = 0
+}
+
+// 清空事件轴状态（树重建时调用）。
+pub func reset() {
+    g_hover_id = 0 - 1
+    g_focus_id = 0 - 1
+    g_press = 0 - 1
+    g_hx = 0 - 12345
+    g_hy = 0 - 12345
+    g_hcount = 0 - 1
+    g_hid = 0 - 1
+    g_epoch = g_epoch + 1
+    g_hepoch = g_epoch
+    reset_stats()
+}
+}
