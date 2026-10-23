@@ -1,0 +1,110 @@
+type tie<logic, unsafe:mem>
+// attribute_effect_probe.tie —— 「属性真的生效」的元素路径探针：
+// 元素头里写的布局属性必须真的改变求解结果（不经直接调用求解器）。
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/ui_bridge.tie"
+
+var g_pass: i64 = 0
+var g_fail: i64 = 0
+
+func eq(name: string, got: i64, want: i64) {
+    if got == want {
+        g_pass = g_pass + 1
+        println("OK   " + name + " = " + to_string(got))
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " = " + to_string(got) + " 期望 " + to_string(want))
+    }
+}
+
+func node(name: string) -> i64 {
+    return ui_bridge.node_of_ui(ui.find(name))
+}
+
+func rect_of(name: string) -> Rect {
+    return tiu_tree.rect(node(name))
+}
+
+func build() -> i64 {
+    ui.reset()
+    @ window "属性" (size: 400x300) {
+        @ column "outer" (w: fill, h: fill, pad: 20, gap: 10) {
+            // 1. fill：横向铺满父容器内容宽
+            @ panel "fillrow" (w: fill, h: 40)
+            // 2. hug：宽度由内容决定（两个 30 宽子级 + gap 10）
+            @ row "hugrow" (w: hug, h: 30, gap: 10) {
+                @ panel "h1" (w: 30, h: 20)
+                @ panel "h2" (w: 30, h: 20)
+            }
+            // 3. 轴分布居中：子级在行内居中（蛇形别名写法）
+            @ row "centered" (w: fill, h: 30, dist_x: center, gap: 10) {
+                @ panel "c1" (w: 40, h: 20)
+                @ panel "c2" (w: 40, h: 20)
+            }
+            // 4. min/max 夹取：申请 200，上限 120（蛇形别名写法）
+            @ panel "clamped" (w: 200, max_w: 120, h: 20)
+            // 5. 锚点居中：叠层容器里的子项按父内容框居中（规范键写法）
+            @ overlay "lay" (w: fill, h: 40) {
+                @ panel "anchored" (w: 60, h: 20, anchor: center)
+            }
+            // 6. 规范键写法与蛇形等价：x: end + max-w
+            @ row "ended" (w: fill, h: 30, x: end, gap: 10) {
+                @ panel "e1" (w: 40, h: 20)
+            }
+            @ panel "clamped2" (w: 200, max-w: 120, h: 20)
+        }
+    }
+    return ui_bridge.build_at(400, 300)
+}
+
+func main() -> i64 {
+    var root = build()
+    var outer = rect_of("outer")
+    println("外列=" + to_string(outer.x) + "," + to_string(outer.y) + " " + to_string(outer.w) + "x" + to_string(outer.h))
+
+    // 1. fill：内容宽 = 400 - 2*20 = 360
+    var fr = rect_of("fillrow")
+    eq("fill 宽", fr.w, 360)
+    eq("fill 左边", fr.x, 20)
+
+    // 2. hug：30 + 10 + 30 = 70，不受 fill 影响
+    var hr = rect_of("hugrow")
+    eq("hug 宽", hr.w, 70)
+
+    // 3. dist_x center：(360 - (40+10+40)) / 2 = 135，相对内容左 20 → 155
+    var c1 = rect_of("c1")
+    var c2 = rect_of("c2")
+    eq("居中首子相对内容左", c1.x - 20, 135)
+    eq("居中两子间距", c2.x - (c1.x + c1.w), 10)
+
+    // 4. max_w 夹取
+    var cl = rect_of("clamped")
+    eq("max_w 夹取后宽", cl.w, 120)
+
+    // 5. anchor center：(360 - 60) / 2 = 150 → 相对内容左 150；竖向 (40-20)/2 = 10
+    var an = rect_of("anchored")
+    var lay = rect_of("lay")
+    eq("锚点居中左偏移", an.x - lay.x, 150)
+    eq("锚点居中上偏移", an.y - lay.y, 10)
+
+    // 6. 规范键与蛇形等价
+    var e1 = rect_of("e1")
+    eq("x: end 右对齐", (e1.x + e1.w) - 20, 360)
+    var cl2 = rect_of("clamped2")
+    eq("max-w 夹取后宽", cl2.w, 120)
+
+    // 6. 竖向：pad 20 起，依次 40/10/30/10/20/10/20
+    eq("首块顶", fr.y, 20)
+    eq("hug 行顶", hr.y, 70)
+    var ctr = rect_of("centered")
+    eq("居中行顶", ctr.y, 110)
+    eq("夹取块顶", cl.y, 150)
+
+    println("summary pass=" + to_string(g_pass) + " fail=" + to_string(g_fail))
+    if g_fail == 0 {
+        println("attribute effect ok")
+    }
+    return g_fail
+}
