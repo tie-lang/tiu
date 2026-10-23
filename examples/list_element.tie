@@ -1,9 +1,25 @@
 type tie<logic, unsafe:mem>
 // list_element.tie —— 元素语法列表示例：控制流在元素体内生成行，删除按钮用函数值事件。
-import "../ui/src/tree.tie"
-import "../ui/src/props.tie"
-import "../ui/src/layout2.tie"
-import "../ui/src/ui_bridge.tie"
+// ============================================================
+// 用法（tiu 仓根）：
+//   build\host\list_element.exe            一直运行到关窗
+//   build\host\list_element.exe --demo     跑 90 轮后自动退出
+//   build\host\list_element.exe --check    无窗口自检：帧循环 + 事件轴 + 像素断言
+//
+// EN: element-syntax list demo on the unified frame loop.
+import "../ui/src/window_host.tie"
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+import "/std/args.tie"
+
+const W: i64 = 360
+const H: i64 = 320
+const FONT: string = "C:/Windows/Fonts/consola.ttf"
 
 var g_rows: i64 = 5
 
@@ -14,7 +30,7 @@ func on_del(id: i64, x: i64, y: i64, kind: string) -> i64 {
     return 1
 }
 
-func view() -> i64 {
+pub func view() -> i64 {
     ui.reset()
     var i: i64 = 0
     @ window "tiu · list" (size: 360x320) {
@@ -34,20 +50,67 @@ func view() -> i64 {
     return ui.count()
 }
 
-func main() -> i64 {
-    var n = view()
-    var root = ui_bridge.build_at(360, 320)
-    var r = tiu_tree.rect(root)
-    println("节点数=" + to_string(n) + " 窗口=" + to_string(r.w) + "x" + to_string(r.h))
-    println("标题=" + ui.attr_of(ui.find("title"), "text"))
-    var first = ui.find("row")
-    var fr = tiu_tree.rect(ui_bridge.node_of_ui(first))
-    println("首行=" + to_string(fr.x) + "," + to_string(fr.y) + " " + to_string(fr.w) + "x" + to_string(fr.h))
-    ui.fire_at(ui.find("del"), "click", 4, 4, "click")
-    view()
-    println("删除后标题=" + ui.attr_of(ui.find("title"), "text"))
-    if g_rows == 4 {
+// 自检：同一帧循环，不建窗口。
+func check() -> i64 {
+    tiu_win.theme(0)
+    var face = tiu_win.load_font(FONT)
+    if face < 0 {
+        println("FAIL 字体装载")
+        return 1
+    }
+    var bad: i64 = 0
+    var segs = tiu_win.frame(W, H, view)
+    var fb = tiu_win.render(W, H)
+    var row = ui_bridge.node_of_ui(ui.find("row"))
+    var ink = tiu_win.node_ink(fb, row)
+    if segs <= 0 || ink <= 0 {
+        println("FAIL 首帧或行墨迹 segs=" + to_string(segs) + " ink=" + to_string(ink))
+        bad = bad + 1
+    } else {
+        println("OK 首帧 segs=" + to_string(segs) + " 首行墨迹=" + to_string(ink))
+    }
+    var t0 = ui.attr_of(ui.find("title"), "text")
+    if t0 != "列表（5 项）" {
+        println("FAIL 初始标题 " + t0)
+        bad = bad + 1
+    }
+    // 删除一行：点击第一行的删除按钮
+    tiu_win.click_node(ui_bridge.node_of_ui(ui.find("del")))
+    var segs2 = tiu_win.frame(W, H, view)
+    var t1 = ui.attr_of(ui.find("title"), "text")
+    if g_rows != 4 || t1 != "列表（4 项）" {
+        println("FAIL 删除后 rows=" + to_string(g_rows) + " 标题=" + t1)
+        bad = bad + 1
+    } else if segs2 <= 0 {
+        println("FAIL 删除后无重绘")
+        bad = bad + 1
+    } else {
+        println("OK 删除后重绘 segs=" + to_string(segs2) + " " + t1)
+    }
+    var segs3 = tiu_win.frame(W, H, view)
+    if segs3 != 0 {
+        println("FAIL 空闲帧仍有段 segs=" + to_string(segs3))
+        bad = bad + 1
+    }
+    if bad == 0 {
         println("list element ok")
     }
-    return 0
+    return bad
+}
+
+func main() -> i64 {
+    if args.has("--check") {
+        return check()
+    }
+    var rounds: i64 = 0
+    if args.has("--demo") {
+        rounds = 90
+    }
+    tiu_win.theme(0)
+    tiu_win.load_font(FONT)
+    var rc = tiu_win_host.run("tiu · list", W, H, rounds, view)
+    if rc == 0 {
+        println("list 关闭：rounds=" + to_string(tiu_win_host.rounds()) + " presented=" + to_string(tiu_win_host.presented()))
+    }
+    return rc
 }

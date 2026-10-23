@@ -1,0 +1,94 @@
+type tie<class, unsafe:mem>
+// window_host.tie —— 真实窗口壳：把 window.tie 的帧循环接到平台上（消息泵 / 上屏 / 事件路由）。
+// ============================================================
+// 分层与导入约定：本文件不导入 host 层，由最外层程序导入 `../host/src/win.tie`
+// （ui/src 下的模块一律只导入同层兄弟，避免嵌套相对路径解析问题）。
+//
+// 帧循环只有一条：`window.tie` 的 frame/render。这里只做三件事：
+//   1. 首帧渲染一次并上屏（窗口出现即有内容）；
+//   2. 每轮抽事件 → 路由进事件轴 → 跑一帧；只有计划出段时才编码光栅并上屏（空闲零绘制）；
+//   3. 关窗/到达轮数上限时销毁窗口。
+//
+// EN: real window shell — host pump, present and event routing on top of window.tie.
+import "./window.tie"
+
+var g_wh_presented: i64 = 0
+var g_wh_rounds: i64 = 0
+var g_wh_open: i64 = 0
+
+namespace tiu_win_host {
+
+pub func rounds() -> i64 {
+    return g_wh_rounds
+}
+
+pub func presented() -> i64 {
+    return g_wh_presented
+}
+
+// max_rounds = 0 表示一直跑到用户关窗（示例的默认行为）；自检传具体轮数。
+pub func run(title: string, w: i64, h: i64, max_rounds: i64, view: fn() -> i64) -> i64 {
+    var segs = tiu_win.frame(w, h, view)
+    var fb = tiu_win.render(w, h)
+    var hwnd = host.open(title, w, h)
+    if hwnd == 0 {
+        println("tiu: 打开窗口失败")
+        return 1
+    }
+    host.show(hwnd)
+    g_wh_open = 1
+    present(fb, hwnd, w, h)
+    while max_rounds == 0 || g_wh_rounds < max_rounds {
+        host.pump(hwnd)
+        if host.closed(hwnd) {
+            break
+        }
+        route(hwnd)
+        var n = tiu_win.frame(w, h, view)
+        if n > 0 {
+            var nf = tiu_win.render(w, h)
+            present(nf, hwnd, w, h)
+        }
+        g_wh_rounds = g_wh_rounds + 1
+        host.sleep(16)
+    }
+    host.destroy(hwnd)
+    g_wh_open = 0
+    return 0
+}
+
+// 上屏：像素 → BGRA 缓冲 → 平台壳。缓冲区用完即释放，不留跨帧状态。
+func present(fb: FrameBuf, hwnd: i64, w: i64, h: i64) {
+    unsafe {
+        var buf: ptr<u8> = epres.to_bgra(fb.px, w, h)
+        host.present_bytes(hwnd, buf, w, h)
+        free(buf)
+        g_wh_presented = g_wh_presented + 1
+    }
+}
+
+// 宿主事件批次 → 事件轴。鼠标只带坐标（左右键由事件类型区分），键盘带字符码与按下/抬起。
+func route(hwnd: i64) {
+    var evs = host.take_events(hwnd)
+    var n = host.ev_count(evs)
+    var i: i64 = 0
+    while i < n {
+        var t = host.ev_type(evs, i)
+        var x = host.ev_x(evs, i)
+        var y = host.ev_y(evs, i)
+        var k = host.ev_key(evs, i)
+        if t == host.ev_mouse_move() {
+            tiu_app.on_mouse_move(x, y)
+        } else if t == host.ev_lbutton_down() {
+            tiu_app.on_mouse_down(x, y)
+        } else if t == host.ev_lbutton_up() {
+            tiu_app.on_mouse_up(x, y)
+        } else if t == host.ev_key_down() {
+            tiu_app.on_key(tiu_event.e_key_down(), k)
+        } else if t == host.ev_key_up() {
+            tiu_app.on_key(tiu_event.e_key_up(), k)
+        }
+        i = i + 1
+    }
+}
+}

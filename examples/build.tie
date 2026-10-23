@@ -7,14 +7,19 @@ type tie<logic>
 //
 // 用法（tiu 仓根）：
 //   ..\tiec\compiler\tiec.exe examples\build.tie -o build\example_build.exe
-//   build\example_build.exe
+//   build\example_build.exe            构建三个示例并逐个跑无窗口自检（--check）
+//   build\example_build.exe --demo     构建后以 --demo 各跑 90 轮真实窗口
+//
+// 三个示例：counter_element / form_element / list_element（元素语法 + 统一帧循环）。
+// 每个示例都支持 --check（同一条帧循环 + 像素断言）与 --demo（定轮数真实窗口）。
 
 unsafe extern fn system(p0: string) -> i32
 
 var g_out: string = "build\\host"
-var g_tiec: string = "..\\tiec\\compiler\\tiec.exe"
+var g_tiec: string = "..\\tie\\_local_only\\bin\\tiec.exe"
 var g_host_cpp: string = "host\\win32\\tiu_host.cpp"
 var g_host_obj: string = "build\\host\\tiu_host.obj"
+var g_trm: string = "..\\tie\\lib\\rt\\trm_lite.a"
 
 func sh(cmd: string) -> i64 {
     println("  $ " + cmd)
@@ -29,42 +34,70 @@ func die(m: string) -> i64 {
     return 1
 }
 
+// 单个示例：IR → obj → 链接。失败即中止并给出阶段名。
+func build(name: string) -> i64 {
+    var ll = g_out + "\\" + name + ".ll"
+    var obj = g_out + "\\" + name + ".obj"
+    var exe = g_out + "\\" + name + ".exe"
+    var env = "set \"TIE_LIB_ROOT=%CD%\\..\\tie\"&& set \"TIE_TRM_LITE_LIB=%CD%\\..\\tie\\lib\\rt\\trm_lite.a\"&& "
+    if sh(env + g_tiec + " examples\\" + name + ".tie --emit-ir -o " + ll) != 0 {
+        return die(name + " IR failed (tiec)")
+    }
+    if sh("clang -O2 -c " + ll + " -o " + obj) != 0 {
+        return die(name + " obj failed (clang)")
+    }
+    var lcmd = "clang -fuse-ld=link " + obj + " " + g_host_obj + " " + g_trm +
+        " -o " + exe +
+        " -luser32 -lgdi32 -lshell32 -lole32 -ladvapi32 -rtlib=compiler-rt"
+    if sh(lcmd) != 0 {
+        return die(name + " link failed")
+    }
+    println("[example] " + name + ".exe linked")
+    return 0
+}
+
 func main() -> i64 {
+    var demo = false
+    if arg_count() > 0 {
+        if arg_string(0) == "--demo" {
+            demo = true
+        }
+    }
     if sh("if not exist " + g_out + " mkdir " + g_out) != 0 {
         return die("mkdir " + g_out + " failed")
     }
-
-    // 1) 平台壳（C）—— 已存在则跳过
+    // 1) 平台壳（C）—— 三个示例共用
     if sh("if not exist " + g_host_obj + " clang-cl /MT /O2 /c " + g_host_cpp + " /Fo:" + g_host_obj) != 0 {
         return die("tiu_host.cpp compile failed")
     }
     println("[example] tiu_host.obj ok")
 
-    // 2) 示例源码 → IR → obj → exe
-    var ll = g_out + "\\counter.ll"
-    var obj = g_out + "\\counter.obj"
-    var exe = g_out + "\\counter.exe"
+    // 2) 三个示例逐个构建
+    if build("counter_element") != 0 {
+        return 1
+    }
+    if build("form_element") != 0 {
+        return 1
+    }
+    if build("list_element") != 0 {
+        return 1
+    }
 
-    if sh(g_tiec + " examples\\counter.tie --emit-ir -o " + ll) != 0 {
-        return die("counter IR failed (tiec)")
+    // 3) 自检：--check 走同一条帧循环（无窗口）；--demo 开真实窗口跑 90 轮
+    var args = "--check"
+    if demo {
+        args = "--demo"
     }
-    if sh("clang -O2 -c " + ll + " -o " + obj) != 0 {
-        return die("counter obj failed (clang)")
+    var names = ["counter_element", "form_element", "list_element"]
+    var i: i64 = 0
+    while i < 3 {
+        var exe = g_out + "\\" + names[i] + ".exe " + args
+        var rc = sh(exe)
+        if rc != 0 {
+            return die(names[i] + " " + args + " failed rc=" + to_string(rc))
+        }
+        i = i + 1
     }
-    var lcmd = "clang -fuse-ld=link " + obj + " " + g_host_obj + " ..\\trm-lite\\trm_lite.a" +
-        " -o " + exe +
-        " -luser32 -lgdi32 -lshell32 -lole32 -ladvapi32 -rtlib=compiler-rt"
-    if sh(lcmd) != 0 {
-        return die("counter link failed")
-    }
-    println("[example] counter.exe linked")
-
-    // 3) 运行（真窗口；示例自带自演示，之后可手动交互）
-    println("[example] running counter.exe — a window will appear; ESC or close it to quit ...")
-    var rc = sh(exe)
-    if rc != 0 {
-        return die("counter run failed rc=" + to_string(rc))
-    }
-    println("[example] run ok (rc=0)")
+    println("[example] all three examples ok (" + args + ")")
     return 0
 }

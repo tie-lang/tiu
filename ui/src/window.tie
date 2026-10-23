@@ -1,0 +1,140 @@
+type tie<class>
+// window.tie —— 帧循环核心：视图 → 提交 → 布局 → 差分 → 绘制 → 光栅，产出像素。
+// ============================================================
+// 这一层不碰平台壳（不导入 host），因此可以在纯 tiec 编译链里直接自检；
+// 真实窗口由 ui/src/window_host.tie 接上（它包住本层的 frame/render）。
+//
+// 设计约束：
+//   * 视图每帧重新写一遍元素树（声明式），重建即重算，不需要增量协议；
+//   * 只有 `tiu_app.commit()` 判定需要重绘时才走「编码 + 光栅」，空闲帧零绘制；
+//   * 文本度量与光栅共用同一字体面（`load_font` 同时设置两侧）。
+//
+// EN: frame-loop core — view to pixels, without the platform shell. The window host
+// (ui/src/window_host.tie) wraps frame/render; keeping them apart is what makes the
+// loop testable in the plain tiec toolchain.
+import "./tree.tie"
+import "./props.tie"
+import "./layout2.tie"
+import "./diff.tie"
+import "./event.tie"
+import "./ui_bridge.tie"
+import "./app.tie"
+import "./paint_state.tie"
+import "./paint_bridge.tie"
+
+var g_wr_th: i64 = 0
+var g_wr_face: i64 = 0 - 1
+var g_wr_w: i64 = 0
+var g_wr_h: i64 = 0
+
+namespace tiu_win {
+
+// ---- 配置 ----
+
+// 主题 token 取 `ui/src/theme.tie` 的编号（暗色 0 / 亮色 1）。
+pub func theme(th: i64) {
+    g_wr_th = th
+}
+
+pub func th() -> i64 {
+    return g_wr_th
+}
+
+// 装载字体：一次调用同时设置度量侧（布局）与光栅侧，确保两侧同源。
+pub func load_font(path: string) -> i64 {
+    erast.text_font(path)
+    g_wr_face = erast.text_face_id()
+    upaint.set_text_face(g_wr_face)
+    tiu_layout2.set_face(g_wr_face)
+    return g_wr_face
+}
+
+pub func face() -> i64 {
+    return g_wr_face
+}
+
+// 无字体时返回 -1；示例与探针据此决定是否直接跑（不依赖外部字体文件）。
+pub func font_ready() -> bool {
+    return g_wr_face >= 0
+}
+
+// ---- 一帧 ----
+
+// 跑一帧：写视图 → 重建 → 布局 → 差分提交。返回计划重绘的段数（0 = 空闲帧）。
+// 视口变化时才重置描述树，避免每帧重复设宽高。
+pub func frame(w: i64, h: i64, view: fn() -> i64) -> i64 {
+    if g_wr_w != w || g_wr_h != h {
+        g_wr_w = w
+        g_wr_h = h
+        tiu_app.reset(w, h)
+    }
+    tiu_app.begin()
+    view()
+    var segs = tiu_app.commit()
+    tiu_app.mark_painted(segs)
+    return segs
+}
+
+// 当前树的整帧像素（离屏）。只在需要重绘的帧调用，空闲帧不产生任何绘制。
+pub func render(w: i64, h: i64) -> FrameBuf {
+    unsafe {
+        var cv = cvs.new_offscreen(w, h, 1.0)
+        var d = cvs.record(cv)
+        d = upaint.background(d, w, h, g_wr_th)
+        d = upaint.draw_state(d, g_wr_th, tiu_event.hover(), 0 - 1, tiu_event.focus())
+        var ir = cvs.submit(cv, d)
+        var p = eload.parse_frame(ir)
+        return erast.render(p)
+    }
+}
+
+// ---- 像素检查帮手（自检用）----
+
+pub func px(fb: FrameBuf, x: i64, y: i64) -> i64 {
+    if x < 0 || y < 0 || x >= fb.w || y >= fb.h {
+        return 0 - 1
+    }
+    return fb.px[y * fb.w + x]
+}
+
+// 矩形区域内与 `bg` 不同的像素个数（有墨迹 = 该区域真的画出了东西）。
+pub func ink(fb: FrameBuf, x: i64, y: i64, w: i64, h: i64, bg: i64) -> i64 {
+    var n: i64 = 0
+    var yy = y
+    while yy < y + h {
+        var xx = x
+        while xx < x + w {
+            if px(fb, xx, yy) != bg {
+                n = n + 1
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    return n
+}
+
+// 点一下某节点中心：走事件轴（移动 → 按下 → 抬起），与真实鼠标同一路径。
+pub func click_node(id: i64) {
+    var r = tiu_tree.rect(id)
+    var cx = r.x + r.w / 2
+    var cy = r.y + r.h / 2
+    tiu_app.on_mouse_move(cx, cy)
+    tiu_app.on_mouse_down(cx, cy)
+    tiu_app.on_mouse_up(cx, cy)
+}
+
+// 某节点矩形内的墨迹像素数（背景取窗口左上角像素）。
+pub func node_ink(fb: FrameBuf, id: i64) -> i64 {
+    var bg = px(fb, 1, 1)
+    var r = tiu_tree.rect(id)
+    return ink(fb, r.x + 4, r.y + 4, r.w - 8, r.h - 8, bg)
+}
+
+pub func report() -> string {
+    var s = "frames=" + to_string(tiu_app.frames())
+    s = s + " painted=" + to_string(tiu_app.painted_frames())
+    s = s + " idle=" + to_string(tiu_app.idle_frames())
+    return s
+}
+}

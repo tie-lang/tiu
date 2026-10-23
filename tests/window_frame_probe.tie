@@ -1,0 +1,115 @@
+type tie<logic, unsafe:mem>
+// tests/window_frame_probe.tie —— 帧循环验收：视图 → 布局 → 差分 → 绘制 → 像素，且空闲零重绘
+// ============================================================
+// 本探针只走 ui/src/window.tie 这一条运行路径（示例在窗口里跑的也是它）：
+//   1. 首帧：视图有内容 ⇒ commit 计划出段 ⇒ 渲染 ⇒ 像素上能看到按钮墨迹；
+//   2. 空闲帧：状态没变 ⇒ commit 返回 0 ⇒ 不产生任何绘制（空闲计数 +1）；
+//   3. 事件帧：鼠标按下抬起 ⇒ 事件轴派发处理器 ⇒ 状态变 ⇒ 下一帧重新出段并重绘；
+//   4. 账目：painted + idle == frames（每帧恰好确认一次）。
+//
+// 编译（tie 仓根下）：
+//   TIE_LIB_ROOT=<tie 仓根> ./_local_only/bin/tiec.exe ../tiu/tests/window_frame_probe.tie \
+//     -l2 -t0 --no-warn --no-cache -o ../tiu/_local_only/bin/window_frame_probe.exe
+// EN: frame-loop probe — view, layout, diff, paint, pixels; idle frames draw nothing.
+
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/drawlist.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/semantics.tie"
+import "../engine/src/font.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/present.tie"
+import "../engine/src/eimg.tie"
+import "../ui/src/tree.tie"
+import "../ui/src/props.tie"
+import "../ui/src/theme.tie"
+import "../ui/src/layout2.tie"
+import "../ui/src/paint_state.tie"
+import "../ui/src/paint_bridge.tie"
+import "../ui/src/event.tie"
+import "../ui/src/ui_bridge.tie"
+import "../ui/src/app.tie"
+import "../ui/src/window.tie"
+
+const W: i64 = 300
+const H: i64 = 200
+const TH: i64 = 0
+const FONT_CONSULA: string = "C:/Windows/Fonts/consola.ttf"
+
+var g_fail: i64 = 0
+var g_hit_count: i64 = 0
+
+func ck(name: string, ok: bool, detail: string) {
+    if ok {
+        println("OK   " + name + " | " + detail)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " | " + detail)
+    }
+}
+
+func on_bump(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_hit_count = g_hit_count + 1
+    return 1
+}
+
+// 视图：元素语法；文本随 g_hit_count 变化，用来验证「状态 → 视图 → 布局 → 像素」整链。
+pub func view() -> i64 {
+    ui.reset()
+    @ window "tiu · window probe" (size: 300x200) {
+        @ column "root" (w: fill, h: fill, pad: 12, gap: 8) {
+            @ heading "title" (text: "Window probe")
+            @ label "hits" (text: "命中 " + to_string(g_hit_count))
+            @ button "bump" (w: 120, h: 32, text: "把次数加一", on_click: on_bump) { }
+        }
+    }
+    return ui.count()
+}
+
+func main() -> i64 {
+    tiu_win.theme(TH)
+    var face = tiu_win.load_font(FONT_CONSULA)
+    ck("字体装载", face >= 0, "face=" + to_string(face))
+
+    // 1) 首帧
+    var segs1 = tiu_win.frame(W, H, view)
+    ck("首帧计划重绘", segs1 > 0, "segs=" + to_string(segs1))
+    var fb1 = tiu_win.render(W, H)
+    var bg = uth.bg(TH)
+    var b = ui.find("bump")
+    var r = tiu_tree.rect(b)
+    var ink1 = tiu_win.ink(fb1, r.x, r.y, r.w, r.h, bg)
+    ck("按钮有墨迹", ink1 > 0, "ink=" + to_string(ink1) + " rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
+
+    // 2) 空闲帧：视图重写但状态不变 ⇒ 计划零段 ⇒ 不绘制
+    var segs2 = tiu_win.frame(W, H, view)
+    ck("空闲帧零段", segs2 == 0, "segs=" + to_string(segs2))
+    ck("空闲帧计数", tiu_app.idle_frames() == 1, "idle=" + to_string(tiu_app.idle_frames()))
+
+    // 3) 事件帧：在按钮中心按下抬起 ⇒ 处理器执行 ⇒ 状态变 ⇒ 重新出段
+    var cx = r.x + r.w / 2
+    var cy = r.y + r.h / 2
+    var down = tiu_app.on_mouse_down(cx, cy)
+    var up = tiu_app.on_mouse_up(cx, cy)
+    ck("按钮被命中", down > 0 && up > 0, "down=" + to_string(down) + " up=" + to_string(up))
+    ck("处理器执行", g_hit_count == 1, "hits=" + to_string(g_hit_count))
+    var segs3 = tiu_win.frame(W, H, view)
+    ck("事件帧重新出段", segs3 > 0, "segs=" + to_string(segs3))
+    var fb2 = tiu_win.render(W, H)
+    var ink2 = tiu_win.ink(fb2, r.x, r.y, r.w, r.h, bg)
+    ck("重绘后仍有墨迹", ink2 > 0, "ink=" + to_string(ink2))
+    var lbl = ui.attr_of(ui.find("hits"), "text")
+    ck("文本随状态更新", lbl == "命中 1", "text=" + lbl)
+
+    // 4) 账目：每帧都确认过一次
+    ck("帧账目守恒", tiu_app.painted_frames() + tiu_app.idle_frames() == tiu_app.frames(), tiu_win.report())
+
+    if g_fail == 0 {
+        println("summary PASS")
+    } else {
+        println("summary FAIL=" + to_string(g_fail))
+    }
+    return g_fail
+}
