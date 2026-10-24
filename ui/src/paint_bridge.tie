@@ -479,6 +479,9 @@ func button_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
         var lh = text_line_h(fs) / 64
         var tx = r.x + (r.w - tw) / 2
         var ty = r.y + (r.h - lh) / 2
+        if act == 1 {
+            ty = ty + 1
+        }
         var lc = upstate.color_of(st.th, tiu_props.fg(id))
         if lc < 0 {
             lc = uth.on_accent()
