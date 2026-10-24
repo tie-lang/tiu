@@ -1,5 +1,5 @@
 type tie<logic>
-// examples/build.tie —— tiu 示例应用构建驱动（tie 写；在 tiu 仓根运行）
+// examples/build.tie —— tiu 示例应用构建驱动（tie 写；在 tiu 仓根运行（产物一律落 `_local_only\`，源码目录不留构建产物））
 // EN: tiu sample-app build driver (tie-written; run from the tiu repo root).
 // ============================================================
 // 链路与 host/build.tie 相同（clang-cl 编平台壳 → tiec --emit-ir → clang 链接），
@@ -15,10 +15,10 @@ type tie<logic>
 
 unsafe extern fn system(p0: string) -> i32
 
-var g_out: string = "build\\host"
+var g_out: string = "_local_only\\build\\host"
 var g_tiec: string = "..\\tie\\_local_only\\bin\\tiec.exe"
 var g_host_cpp: string = "host\\win32\\tiu_host.cpp"
-var g_host_obj: string = "build\\host\\tiu_host.obj"
+var g_host_obj: string = "_local_only\\build\\host\\tiu_host.obj"
 var g_trm: string = "..\\tie\\lib\\rt\\trm_lite.a"
 
 func sh(cmd: string) -> i64 {

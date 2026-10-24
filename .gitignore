@@ -28,3 +28,6 @@ Thumbs.db
 # tpkg 规范
 target/
 _local_only/
+
+# 构建产物一律落 _local_only（源码目录不留构建结果）
+/build/

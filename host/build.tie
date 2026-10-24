@@ -1,5 +1,5 @@
 type tie<logic>
-// host/build.tie —— tiu host 层构建驱动（tie 写；在 tiu 仓根运行）
+// host/build.tie —— tiu host 层构建驱动（tie 写；在 tiu 仓根运行（产物一律落 `_local_only\`，源码目录不留构建产物））
 // EN: tiu host-layer build driver (tie-written; run from the tiu repo root).
 // ============================================================
 // 链路（沿用 ext/gfx p.6.8.9-6.8.12 已验证的构建范式）：
@@ -14,14 +14,14 @@ type tie<logic>
 //       · clang / clang-cl（PATH，本机 D:\LLVM\bin）
 //       · ../trm-lite/trm_lite.a（tie 表运行时：table<T> 容器符号）
 //
-// 用法：tiec host\build.tie -o build\host_build.exe && build\host_build.exe
+// 用法：tiec host\build.tie -o _local_only\build\host_build.exe && _local_only\build\host_build.exe
 
 unsafe extern fn system(p0: string) -> i32
 
-var g_out: string = "build\\host"
+var g_out: string = "_local_only\\build\\host"
 var g_tiec: string = "..\\tiec\\compiler\\tiec.exe"
 var g_host_cpp: string = "host\\win32\\tiu_host.cpp"
-var g_host_obj: string = "build\\host\\tiu_host.obj"
+var g_host_obj: string = "_local_only\\build\\host\\tiu_host.obj"
 
 func sh(cmd: string) -> i64 {
     println("  $ " + cmd)
@@ -65,7 +65,7 @@ func main() -> i64 {
 
 // 单探针链路：tiec --emit-ir → clang -c → clang 链接 → 运行
 func build_run(name: string) -> i64 {
-    var src = "tests\\" + name + ".tie"
+    var src = "_local_only\probes\\" + name + ".tie"
     var ll = g_out + "\\" + name + ".ll"
     var obj = g_out + "\\" + name + ".obj"
     var exe = g_out + "\\" + name + ".exe"
