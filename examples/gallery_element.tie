@@ -121,7 +121,7 @@ pub func view() -> i64 {
                 // 卡片二：列表选择
                 @ panel "card2" (w: 1fr, bg: "surface", stroke: "border", radius: 12, pad: 18, gap: 10, y: start) {
                     @ label "s2" (text: "列表 · 点击选择", font-size: 13, fg: "fg-dim")
-                    @ column "items" (w: fill, gap: 6) {
+                    @ scroll "items" (w: fill, h: 132, gap: 6, pad-right: 10, overflow: scroll) {
                         if g_pick == "选项 A" {
                             @ row "ra" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_a) {
                                 @ row "ra_bar" (w: 3, h: fill, radius: 2, bg: "accent")
@@ -154,6 +154,15 @@ pub func view() -> i64 {
                                 @ row "rc_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
                                 @ label "rc_txt" (text: "选项 C", font-size: 14, fg: "fg")
                             }
+                        }
+                        @ row "rd" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                            @ label "rd_txt" (text: "选项 D · 只在滚动区里", font-size: 14, fg: "fg-dim")
+                        }
+                        @ row "re" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                            @ label "re_txt" (text: "选项 E · 滚轮试试", font-size: 14, fg: "fg-dim")
+                        }
+                        @ row "rf" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                            @ label "rf_txt" (text: "选项 F · 最近一条", font-size: 14, fg: "fg-dim")
                         }
                     }
                     @ label "picked" (text: "当前选中：" + g_pick, font-size: 13, fg: "fg-dim")
@@ -270,6 +279,25 @@ func check() -> i64 {
         bad = bad + 1
     } else {
         println("OK 空闲帧零段 " + tiu_win.report())
+    }
+
+    // 6) 滚轮：悬停在滚动列表上滚一格，滚动量与画面都要变
+    var items = ui_bridge.node_of_ui(ui.find("items"))
+    var rb3 = tiu_tree.rect(items)
+    var fb3 = tiu_win.render(W, H)
+    var bpx = tiu_win.px(fb3, rb3.x + 6, rb3.y + 6)
+    tiu_app.on_wheel(rb3.x + rb3.w / 2, rb3.y + 20, 3)
+    var off3 = tiu_tree.scroll_of(items)
+    var fb4 = tiu_win.render(W, H)
+    var apx = tiu_win.px(fb4, rb3.x + 6, rb3.y + 6)
+    if off3 <= 0 {
+        println("FAIL 滚轮未改变滚动量 off=" + to_string(off3))
+        bad = bad + 1
+    } else if bpx == apx {
+        println("FAIL 滚动后画面未变化 px=" + to_string(bpx))
+        bad = bad + 1
+    } else {
+        println("OK 滚轮滚动 off=" + to_string(off3) + " 画面已变")
     }
 
     if bad == 0 {

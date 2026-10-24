@@ -49,6 +49,7 @@ const EV_RBUTTON_UP: i64 = 5
 const EV_KEY_DOWN: i64 = 6
 const EV_KEY_UP: i64 = 7
 const EV_TIMER: i64 = 8
+const EV_WHEEL: i64 = 9
 
 namespace host {
 
@@ -61,6 +62,7 @@ pub func ev_rbutton_up() -> i64 { return EV_RBUTTON_UP }
 pub func ev_key_down() -> i64 { return EV_KEY_DOWN }
 pub func ev_key_up() -> i64 { return EV_KEY_UP }
 pub func ev_timer() -> i64 { return EV_TIMER }
+pub func ev_wheel() -> i64 { return EV_WHEEL }
 pub func ev_slot() -> i64 { return EV_SLOT }
 
 // ---- 标题宽字符桥（UTF-16LE，含代理对拆分）----

@@ -126,7 +126,7 @@ pub func draw_state(d: DrawList, th: i64, hot: i64, active: i64, focus: i64) -> 
     st.hot = hot
     st.active = active
     st.focus = focus
-    return walk(d, tiu_tree.root(), st)
+    return walk(d, tiu_tree.root(), st, 0)
 }
 
 // 画布背景（整帧底色，先于树绘制）。
@@ -210,18 +210,19 @@ pub func draw_keys_state(d: DrawList, th: i64, hot: i64, active: i64, focus: i64
     st.active = active
     st.focus = focus
     d = dl.save_layer(d, to_f64(u[0]), to_f64(u[1]), to_f64(u[2] - u[0]), to_f64(u[3] - u[1]), Paint())
-    d = walk_dirty(d, tiu_tree.root(), st, u)
+    d = walk_dirty(d, tiu_tree.root(), st, u, 0)
     return dl.restore_layer(d)
 }
 
 // ---- 遍历 ----
 
-func walk(d: DrawList, id: i64, st: PState) -> DrawList {
+func walk(d: DrawList, id: i64, st: PState, sdy: i64) -> DrawList {
     if id < 0 {
         return d
     }
     var ty = tiu_tree.ty_of(id)
-    var r = tiu_tree.rect(id)
+    var base = tiu_tree.rect(id)
+    var r = offset_rect(base, sdy)
     if r.w > 0 && r.h > 0 {
         d = paint_node(d, id, ty, r, st)
     }
@@ -229,23 +230,34 @@ func walk(d: DrawList, id: i64, st: PState) -> DrawList {
     if c < 0 {
         return d
     }
+    var inner: i64 = sdy
+    if ty == g_ty_scroll {
+        inner = sdy - tiu_tree.scroll_of(id)
+    }
     if r.w > 0 && r.h > 0 && clips(ty, id) == 1 {
         d = dl.save_layer(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), Paint())
         while c >= 0 {
-            d = walk(d, c, st)
+            d = walk(d, c, st, inner)
             c = tiu_tree.next_sibling(c)
         }
-        return dl.restore_layer(d)
+        d = dl.restore_layer(d)
+        if ty == g_ty_scroll {
+            d = scrollbar(d, base, content_h(id), tiu_tree.scroll_of(id), st.th)
+        }
+        return d
     }
     while c >= 0 {
-        d = walk(d, c, st)
+        d = walk(d, c, st, inner)
         c = tiu_tree.next_sibling(c)
+    }
+    if ty == g_ty_scroll {
+        d = scrollbar(d, base, content_h(id), tiu_tree.scroll_of(id), st.th)
     }
     return d
 }
 
 // 脏遍历：子树包围盒与脏并集不相交 → 整棵跳过。
-func walk_dirty(d: DrawList, id: i64, st: PState, u: table<i64>) -> DrawList {
+func walk_dirty(d: DrawList, id: i64, st: PState, u: table<i64>, sdy: i64) -> DrawList {
     if id < 0 {
         return d
     }
@@ -253,16 +265,76 @@ func walk_dirty(d: DrawList, id: i64, st: PState, u: table<i64>) -> DrawList {
         return d
     }
     var ty = tiu_tree.ty_of(id)
-    var r = tiu_tree.rect(id)
-    if r.w > 0 && r.h > 0 && hits(r, u) == 1 {
+    var base = tiu_tree.rect(id)
+    var r = offset_rect(base, sdy)
+    if r.w > 0 && r.h > 0 && hits(base, u) == 1 {
         d = paint_node(d, id, ty, r, st)
+    }
+    var inner: i64 = sdy
+    if ty == g_ty_scroll {
+        inner = sdy - tiu_tree.scroll_of(id)
     }
     var c = tiu_tree.first_child(id)
     while c >= 0 {
-        d = walk_dirty(d, c, st, u)
+        d = walk_dirty(d, c, st, u, inner)
         c = tiu_tree.next_sibling(c)
     }
+    if ty == g_ty_scroll {
+        d = scrollbar(d, base, content_h(id), tiu_tree.scroll_of(id), st.th)
+    }
     return d
+}
+
+// 矩形纵向偏移（滚动量为负 = 内容上移）。
+func offset_rect(r: Rect, dy: i64) -> Rect {
+    var o = Rect()
+    o.x = r.x
+    o.y = r.y + dy
+    o.w = r.w
+    o.h = r.h
+    return o
+}
+
+// 内容总高：直接子节点包围盒底减自身顶（节点矩形为绝对坐标）。
+func content_h(id: i64) -> i64 {
+    var base = tiu_tree.rect(id)
+    var bottom: i64 = base.y
+    var c = tiu_tree.first_child(id)
+    while c >= 0 {
+        var cr = tiu_tree.rect(c)
+        if cr.y + cr.h > bottom {
+            bottom = cr.y + cr.h
+        }
+        c = tiu_tree.next_sibling(c)
+    }
+    return bottom - base.y
+}
+
+// 滚动条：内容高于视口才画；右侧 3px 圆角轨道 + 最小 24px 滑杆。
+func scrollbar(d: DrawList, r: Rect, ch: i64, off: i64, th: i64) -> DrawList {
+    if ch <= r.h || r.h <= 0 {
+        return d
+    }
+    var view = r.h
+    var thumb = view * view / ch
+    if thumb < 24 {
+        thumb = 24
+    }
+    if thumb > view {
+        thumb = view
+    }
+    var span = ch - view
+    var maxy = view - thumb
+    var ty: i64 = to_i64(to_f64(off) * to_f64(maxy) / to_f64(span))
+    if ty < 0 {
+        ty = 0
+    }
+    if ty > maxy {
+        ty = maxy
+    }
+    var x = to_f64(r.x + r.w - 5)
+    d = dl.rrect(d, x, to_f64(r.y), 3.0, to_f64(view), 1.5, 1.5, solid(uth.surface_alt(th)))
+    return dl.rrect(d, x, to_f64(r.y + ty), 3.0, to_f64(thumb), 1.5, 1.5, solid(uth.border_strong(th)))
 }
 
 // 容器是否裁剪子树：Scroll 恒裁；溢出策略 expand(2) 不裁，其余裁。

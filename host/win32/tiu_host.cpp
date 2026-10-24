@@ -33,6 +33,7 @@
 #define EVENT_KEY_DOWN     6
 #define EVENT_KEY_UP       7
 #define EVENT_TIMER        8
+#define EVENT_WHEEL        9
 #define TIMER_ID           1   // win_set_timer 配对 SetTimer 的定时器 id
 
 typedef struct {
@@ -168,6 +169,17 @@ static LRESULT CALLBACK win_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         // ---- p.6.8.10 事件捕获（追加分支，不动 6.8.9 既有语义）----
         // 鼠标：lParam 低字=客户区 x，高字=客户区 y（LOWORD/HIWORD 拆分）。
+        case WM_MOUSEWHEEL: {
+            // 滚轮：Delta > 0 表示向远离用户方向拨动（内容下移）。
+            // 事件槽沿用四元组：x/y 为客户端坐标，key 存「格数」（正 = 向下滚动内容）。
+            if (s) {
+                POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+                ScreenToClient(h, &pt);
+                int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+                ev_push(s, EVENT_WHEEL, pt.x, pt.y, -notches);
+            }
+            return 0;
+        }
         case WM_MOUSEMOVE:
             if (s) ev_push(s, EVENT_MOUSE_MOVE, (int)(lp & 0xFFFF), (int)((lp >> 16) & 0xFFFF), 0);
             break;

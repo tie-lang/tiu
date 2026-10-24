@@ -87,6 +87,9 @@ func route(hwnd: i64) {
             tiu_app.on_key(tiu_event.e_key_down(), k)
         } else if t == host.ev_key_up() {
             tiu_app.on_key(tiu_event.e_key_up(), k)
+        } else if t == host.ev_wheel() {
+            // 滚轮：k 为该事件的格数（正 = 内容上移，与事件轴语义一致）
+            tiu_app.on_wheel(x, y, k)
         }
         i = i + 1
     }
