@@ -286,4 +286,71 @@ namespace aparse {
         }
         return v
     }
+
+    // ---- 颜色 ----
+    // token 名 → 码（0..15）；`#RRGGBB` / `#AARRGGBB` → 直接 ARGB；未设置 / 未知 → -1。
+    // 属性表里存码而非色值：换肤时不需要重建树。
+    pub func color_code(s: string) -> i64 {
+        var n = str_len(s)
+        if n == 0 {
+            return -1
+        }
+        if str_char(s, 0) == "#" {
+            return hex_color(s)
+        }
+        if s == "transparent" { return 0 }
+        if s == "bg" { return 1 }
+        if s == "surface" { return 2 }
+        if s == "surface-alt" { return 3 }
+        if s == "border" { return 4 }
+        if s == "border-strong" { return 5 }
+        if s == "separator" { return 6 }
+        if s == "accent" { return 7 }
+        if s == "accent-hot" { return 8 }
+        if s == "accent-down" { return 9 }
+        if s == "accent-soft" { return 10 }
+        if s == "fg" { return 11 }
+        if s == "fg-dim" { return 12 }
+        if s == "on-accent" { return 13 }
+        if s == "shadow" { return 14 }
+        if s == "hover" { return 15 }
+        return -1
+    }
+
+    func hex_val(c: string) -> i64 {
+        var k = char_code(c)
+        if k >= 48 && k <= 57 {
+            return k - 48
+        }
+        if k >= 97 && k <= 102 {
+            return k - 87
+        }
+        if k >= 65 && k <= 70 {
+            return k - 55
+        }
+        return -1
+    }
+
+    func hex_color(s: string) -> i64 {
+        var n = str_len(s)
+        var i = 1
+        var v = 0
+        var digits = 0
+        while i < n {
+            var d = hex_val(str_char(s, i))
+            if d < 0 {
+                return -1
+            }
+            v = v * 16 + d
+            digits = digits + 1
+            i = i + 1
+        }
+        if digits == 6 {
+            return 0xFF000000 | v
+        }
+        if digits == 8 {
+            return v
+        }
+        return -1
+    }
 }

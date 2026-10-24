@@ -1,16 +1,20 @@
 type tie<class>
-// ui/src/theme.tie —— tiu UI 层：主题 token（最小集）
-// EN: tiu UI theme tokens (minimal).
+// ui/src/theme.tie —— tiu UI 层：主题 token
+// EN: tiu UI theme tokens.
 // ============================================================
 // 依据 docs/designs/tiu-ui-widgets.md §6（token 单例 / 三层覆写 / 默认主题内置）。
 //
-// v0 落地形态：token 以「主题 id + 取值函数」表达（无状态、无全局单例），
+// 落地形态：token 以「主题 id + 取值函数」表达（无状态、无全局单例），
 // 满足 §6「默认主题内置：无主题配置可直接运行」的最低门槛；换肤 = 应用层
 // 切换主题 id（§6「换肤 = 替换主题单例 + 全局版本号 +1」，版本号由应用层
 // 驱动，本模块只提供 token 取值）。
 //
 // 颜色一律 0xAARRGGBB（与引擎 sem.pack 打包一致，无需再做通道重排）。
 // 组合空间约束（§6）：token 全部为固定枚举取值，不对应用暴露自由调色入口。
+//
+// 色板取向：低彩度中性底 + 单一强调色。层级用「三层表面」表达
+// （bg < surface < surface_alt），分隔线用 separator（比 border 更弱），
+// 阴影是带 alpha 的黑，由光栅的 alpha 混合叠出深度。
 
 const TH_DARK: i64 = 0
 const TH_LIGHT: i64 = 1
@@ -36,69 +40,123 @@ pub func name(t: i64) -> string {
     return "light"
 }
 
-// ---- 背景 / 面板 ----
+// ---- 三层表面：窗口底 / 卡片 / 卡片内凹槽（输入框、悬停行）----
 pub func bg(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF1E1E1E
+        return 0xFF12141A
     }
-    return 0xFFF5F5F5
+    return 0xFFF2F4F8
 }
 
 pub func surface(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF2D2D30
+        return 0xFF191C23
     }
     return 0xFFFFFFFF
 }
 
+pub func surface_alt(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF22262F
+    }
+    return 0xFFF5F7FA
+}
+
+// ---- 描边：控件边框（border）/ 强调边框（border_strong）/ 分隔线（separator）----
 pub func border(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF3F3F46
+        return 0xFF2A2F39
     }
-    return 0xFFD0D0D0
+    return 0xFFE1E5EC
+}
+
+pub func border_strong(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF3A4150
+    }
+    return 0xFFC9D1DE
+}
+
+pub func separator(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF262B34
+    }
+    return 0xFFEDF0F5
 }
 
 // ---- 强调色三态（常态 / 悬停 / 按下）----
 pub func accent(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF4A9EFF
+        return 0xFF4C8DFF
     }
-    return 0xFF0A66C2
+    return 0xFF2563EB
 }
 
 pub func accent_hot(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF6FB6FF
+        return 0xFF6BA1FF
     }
-    return 0xFF2F86D8
+    return 0xFF3B78F2
 }
 
 pub func accent_down(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF2E7BD6
+        return 0xFF3374E6
     }
-    return 0xFF084E96
+    return 0xFF1D4FD8
+}
+
+// 强调色的极淡底（选中行、选中块）。
+pub func accent_soft(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0xFF1B2A45
+    }
+    return 0xFFE3EDFF
 }
 
 // ---- 前景（文本色）----
 // 注：token 名不用 `text`（tie 保留类型名，实测 error[E00485]），故取 `fg`。
 pub func fg(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFFE8E8E8
+        return 0xFFE7EAF0
     }
-    return 0xFF1A1A1A
+    return 0xFF151A22
 }
 
 pub func fg_dim(t: i64) -> i64 {
     if t == TH_DARK {
-        return 0xFF9A9A9A
+        return 0xFF98A1B0
     }
-    return 0xFF6A6A6A
+    return 0xFF63707F
 }
 
 // 强调底色之上的文本色（按钮标签）。
 pub func on_accent() -> i64 {
     return 0xFFFFFFFF
+}
+
+// ---- 阴影 / 悬停遮罩 ----
+// 阴影 = 两层带 alpha 的黑圆角矩形，由光栅的 alpha 混合叠出深度。
+pub func shadow(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0x66000000
+    }
+    return 0x22000000
+}
+
+pub func shadow_soft(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0x33000000
+    }
+    return 0x11000000
+}
+
+// 悬停遮罩：半透明白（深色主题）/ 半透明黑（浅色主题），叠在任意底色上都能读出「亮了一层」。
+pub func hover_overlay(t: i64) -> i64 {
+    if t == TH_DARK {
+        return 0x14FFFFFF
+    }
+    return 0x0A000000
 }
 
 }

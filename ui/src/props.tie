@@ -80,6 +80,11 @@ var g_font: table<i64> = []      // 0 = 未显式设置（继承；见 font_size
 // ---- 样式名（静态引用，§8）----
 var g_style: table<string> = []
 
+// ---- 颜色（-1 = 未设置；0..12 = 主题 token 码；>= 0xFF000000 = 直接 ARGB）----
+var g_bg: table<i64> = []
+var g_fg: table<i64> = []
+var g_bd: table<i64> = []
+
 // ---- 网格列宽表：共享池 + 每节点区间（列规格按节点连续存放）----
 var g_col_off: table<i64> = []   // 该节点列区间在池中的起点
 var g_col_n: table<i64> = []     // 该节点列数
@@ -226,6 +231,19 @@ pub func dy(id: i64) -> i64 { return get(g_dy, id, 0) }
 
 pub func set_radius(id: i64, v: i64) { put(g_radius, id, v) }
 pub func radius(id: i64) -> i64 { return get(g_radius, id, 0) }
+
+// ---------- 颜色 ----------
+// 存「token 码」而不是 ARGB：换肤时同一棵树无需重建即可换色，解析在绘制层。
+// 显式 ARGB（>= 0xFF000000）原样存，便于示例做一次性定制。
+
+pub func set_bg(id: i64, v: i64) { put(g_bg, id, v) }
+pub func bg(id: i64) -> i64 { return get(g_bg, id, -1) }
+
+pub func set_fg(id: i64, v: i64) { put(g_fg, id, v) }
+pub func fg(id: i64) -> i64 { return get(g_fg, id, -1) }
+
+pub func set_border(id: i64, v: i64) { put(g_bd, id, v) }
+pub func border(id: i64) -> i64 { return get(g_bd, id, -1) }
 
 // 字号：显式设置值（px）。0 = 未设置（em 基准沿祖先链继承，见 layout2）。
 pub func set_font_size(id: i64, v: i64) { put(g_font, id, v) }
@@ -497,6 +515,9 @@ pub func reset() {
     g_radius = table_new_i64()
     g_font = table_new_i64()
     g_style = table_new_string()
+    g_bg = table_new_i64()
+    g_fg = table_new_i64()
+    g_bd = table_new_i64()
     g_col_off = table_new_i64()
     g_col_n = table_new_i64()
     g_pool_k = table_new_i64()

@@ -2,24 +2,34 @@ type tie<class>
 // ui/src/paint_state.tie —— 控件视觉状态 → 配色与圆角几何
 // EN: widget visual states → colours and corner geometry.
 // ============================================================
-// 职责：把「常态 / 悬停(hot) / 按下(active) / 键盘焦点(focus)」四个视觉
-// 状态与主题 token 收敛成**具体 ARGB**，并给出圆角半径的单一取值入口。
-// 本模块不产绘制记录、不读布局结果、不改控件状态——纯粹是「状态 → 颜色」
-// 的查表与叠加，供 paint_bridge 直接下发。
+// 职责：
+//   1. 「常态 / 悬停(hot) / 按下(active) / 键盘焦点(focus)」四态 → 具体 ARGB；
+//   2. 属性表里的「颜色码」→ 当前主题下的具体 ARGB（换肤不改树）；
+//   3. 圆角半径的单一取值入口。
+// 本模块不产绘制记录、不读布局结果、不改控件状态——纯粹是「状态 → 颜色」的
+// 查表与叠加，供 paint_bridge 直接下发。
 //
 // 状态优先级固定（便于探针断言）：
 //   按钮底色：active > hot > 常态；
-//   输入框边框：focus → 焦点环色（uth.fg），否则常态边框色；
-//   焦点叠加：外圈 1px 焦点环 + 内层常态底色（不改底色，避免与 hot 撞色）。
+//   输入框边框：focus → 强调色，否则常态边框色；
+//   焦点环：2px 强调色（内圈底色不变，避免与 hot 撞色）。
+//
+// 颜色码表（与 `attr_parse.color_code` 一致）：
+//   0 transparent / 1 bg / 2 surface / 3 surface-alt / 4 border / 5 border-strong /
+//   6 separator / 7 accent / 8 accent-hot / 9 accent-down / 10 accent-soft /
+//   11 fg / 12 fg-dim / 13 on-accent / 14 shadow / 15 hover
+//   -1 = 未设置；>= 0xFF000000 = 直接 ARGB（原样返回）。
 
 import "./theme.tie"
 import "./props.tie"
 
 // 圆角默认值（属性未设 radius 时生效；属性值优先）。
-pub const PS_R_PANEL: i64 = 6     // 容器面板
-pub const PS_R_BUTTON: i64 = 4    // 按钮
-pub const PS_R_INPUT: i64 = 4     // 输入框
-pub const PS_PAD_INPUT: i64 = 6   // 输入框文本左内边距
+pub const PS_R_PANEL: i64 = 10    // 容器面板
+pub const PS_R_CARD: i64 = 12     // 卡片
+pub const PS_R_BUTTON: i64 = 8    // 按钮
+pub const PS_R_INPUT: i64 = 8     // 输入框
+pub const PS_R_ROW: i64 = 8       // 列表行
+pub const PS_PAD_INPUT: i64 = 10  // 输入框文本左内边距
 
 namespace upstate {
 
@@ -49,13 +59,81 @@ pub func mix(dst: i64, src: i64, pct: i64) -> i64 {
     return (a << 24) | (r << 16) | (g << 8) | b
 }
 
-// ---- 容器面板 ----
+// ---- 颜色码 → 具体 ARGB ----
+// 返回 -1 表示「不要画」（未设置）。注：形参名不能用 `code`（tie 保留类型名，实测 error[E00449]）。
+pub func color_of(th: i64, cc: i64) -> i64 {
+    if cc < 0 {
+        return -1
+    }
+    if cc >= 0xFF000000 {
+        return cc
+    }
+    if cc == 0 {
+        return 0x00000000
+    }
+    if cc == 1 {
+        return uth.bg(th)
+    }
+    if cc == 2 {
+        return uth.surface(th)
+    }
+    if cc == 3 {
+        return uth.surface_alt(th)
+    }
+    if cc == 4 {
+        return uth.border(th)
+    }
+    if cc == 5 {
+        return uth.border_strong(th)
+    }
+    if cc == 6 {
+        return uth.separator(th)
+    }
+    if cc == 7 {
+        return uth.accent(th)
+    }
+    if cc == 8 {
+        return uth.accent_hot(th)
+    }
+    if cc == 9 {
+        return uth.accent_down(th)
+    }
+    if cc == 10 {
+        return uth.accent_soft(th)
+    }
+    if cc == 11 {
+        return uth.fg(th)
+    }
+    if cc == 12 {
+        return uth.fg_dim(th)
+    }
+    if cc == 13 {
+        return uth.on_accent()
+    }
+    if cc == 14 {
+        return uth.shadow(th)
+    }
+    if cc == 15 {
+        return uth.hover_overlay(th)
+    }
+    return -1
+}
+
+// ---- 容器面板 / 卡片 ----
 
 pub func panel_bg(th: i64) -> i64 {
     return uth.surface(th)
 }
 
 pub func panel_border(th: i64) -> i64 {
+    return uth.border(th)
+}
+
+pub func card_bg(th: i64) -> i64 {
+    return uth.surface(th)
+}
+
+pub func card_border(th: i64) -> i64 {
     return uth.border(th)
 }
 
@@ -71,21 +149,41 @@ pub func button_bg(th: i64, hot: i64, act: i64) -> i64 {
     return uth.accent(th)
 }
 
+// ---- 列表行 / 分隔线 ----
+
+// 行底色：选中 > 悬停 > 无（返回 -1 表示不铺底）。
+pub func row_bg(th: i64, hot: i64, sel: i64) -> i64 {
+    if sel == 1 {
+        return uth.accent_soft(th)
+    }
+    if hot == 1 {
+        return uth.surface_alt(th)
+    }
+    return -1
+}
+
+pub func row_bar(th: i64) -> i64 {
+    return uth.accent(th)
+}
+
+pub func sep(th: i64) -> i64 {
+    return uth.separator(th)
+}
+
 // ---- 输入框 ----
 
 pub func input_bg(th: i64, focus: i64) -> i64 {
     if focus == 1 {
-        // 焦点态：底色叠一层很淡的强调色，与常态可区分但仍是 surface 家族。
-        return mix(uth.surface(th), uth.accent(th), 8)
+        return mix(uth.surface_alt(th), uth.accent(th), 10)
     }
-    return uth.surface(th)
+    return uth.surface_alt(th)
 }
 
 pub func input_border(th: i64, focus: i64) -> i64 {
     if focus == 1 {
-        return focus_ring(th)
+        return uth.accent(th)
     }
-    return uth.border(th)
+    return uth.border_strong(th)
 }
 
 // ---- 焦点环 / 文本光标 ----
@@ -101,7 +199,7 @@ pub func caret(th: i64) -> i64 {
 // ---- 图像占位框（无像素数据时） ----
 
 pub func placeholder_bg(th: i64) -> i64 {
-    return uth.surface(th)
+    return uth.surface_alt(th)
 }
 
 pub func placeholder_border(th: i64) -> i64 {

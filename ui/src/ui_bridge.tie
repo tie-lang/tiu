@@ -236,6 +236,20 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_style(node, s)
     }
+    // 颜色：bg / fg / stroke 存「颜色码」（主题 token 名或 #RRGGBB），换肤不需重建树。
+    // 注：`border` 在编译侧是长度键（描边宽度，像素），因此描边颜色走 `stroke`。
+    s = ui.attr_of(uid, "bg")
+    if s != "" {
+        tiu_props.set_bg(node, aparse.color_code(s))
+    }
+    s = ui.attr_of(uid, "fg")
+    if s != "" {
+        tiu_props.set_fg(node, aparse.color_code(s))
+    }
+    s = ui.attr_of(uid, "stroke")
+    if s != "" {
+        tiu_props.set_border(node, aparse.color_code(s))
+    }
     // 动作码与图像资源：vw 等声明式层用它们挂「点击 → 状态机动作」与图片句柄。
     // 与元素语法一致——元素只写属性，解释权在桥接这一层。
     s = ui.attr_of(uid, "act")
@@ -357,6 +371,9 @@ func reset_props(node: i64) {
     tiu_props.set_radius(node, 0)
     tiu_props.set_font_size(node, 0)
     tiu_props.set_style(node, "")
+    tiu_props.set_bg(node, 0 - 1)
+    tiu_props.set_fg(node, 0 - 1)
+    tiu_props.set_border(node, 0 - 1)
     tiu_props.clear_cols(node)
 }
 

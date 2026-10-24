@@ -300,10 +300,68 @@ func paint_node(d: DrawList, id: i64, ty: i64, r: Rect, st: PState) -> DrawList 
     return d
 }
 
-// 容器面板：边框色外圈 + 底色内层 + 圆角。
+// 容器：默认透明（不铺底、不描边），这样嵌套容器不会每层都画框。
+// 铺底/描边由属性 bg / border 决定；根节点缺省铺窗口底色。
+// radius > 0 且铺了底色 → 视为卡片，加两层带 alpha 的阴影。
 func panel_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
-    var rad = upstate.radius_of(id, PS_R_PANEL)
-    return box(d, r, rad, upstate.panel_bg(st.th), upstate.panel_border(st.th))
+    var bgc = upstate.color_of(st.th, tiu_props.bg(id))
+    var bdc = upstate.color_of(st.th, tiu_props.border(id))
+    var rad = upstate.radius_of(id, 0)
+    var is_root: i64 = 0
+    if id == tiu_tree.root() {
+        is_root = 1
+    }
+    if is_root == 1 && bgc < 0 {
+        bgc = uth.bg(st.th)
+    }
+    // 行悬停：没显式底色的 Row 在 hot 时铺一层悬停底（列表行的通用反馈）。
+    if bgc < 0 && bdc < 0 && id == st.hot && tiu_tree.ty_of(id) == g_ty_row {
+        bgc = uth.surface_alt(st.th)
+        if rad <= 0 {
+            rad = PS_R_ROW
+        }
+    }
+    if bgc < 0 && bdc < 0 {
+        return d
+    }
+    if bgc >= 0 && bdc >= 0 {
+        if rad > 0 && is_root == 0 {
+            d = shadow(d, r, rad, st.th)
+        }
+        return box(d, r, rad, bgc, bdc)
+    }
+    if bdc >= 0 {
+        return edge_ring(d, r, bdc)
+    }
+    if rad > 0 && is_root == 0 {
+        d = shadow(d, r, rad, st.th)
+    }
+    return fill(d, r, rad, bgc)
+}
+
+// 阴影：两层偏移圆角矩形（近处实、远处淡），叠出轻微悬浮感。
+func shadow(d: DrawList, r: Rect, rad: i64, th: i64) -> DrawList {
+    d = dl.rrect(d, to_f64(r.x - 1), to_f64(r.y - 1), to_f64(r.w + 2), to_f64(r.h + 4), to_f64(rad + 2), to_f64(rad + 2), solid(uth.shadow_soft(th)))
+    return dl.rrect(d, to_f64(r.x), to_f64(r.y + 1), to_f64(r.w), to_f64(r.h + 2), to_f64(rad), to_f64(rad), solid(uth.shadow(th)))
+}
+
+// 只铺底色。
+func fill(d: DrawList, r: Rect, rad: i64, c: i64) -> DrawList {
+    if rad > 0 {
+        return dl.rrect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), to_f64(rad), to_f64(rad), solid(c))
+    }
+    return dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), to_f64(r.h), solid(c))
+}
+
+// 只描边：四条 1px 矩形（引擎暂不支持任意路径描边）。
+func edge_ring(d: DrawList, r: Rect, c: i64) -> DrawList {
+    if r.w <= 0 || r.h <= 0 {
+        return d
+    }
+    d = dl.rect(d, to_f64(r.x), to_f64(r.y), to_f64(r.w), 1.0, solid(c))
+    d = dl.rect(d, to_f64(r.x), to_f64(r.y + r.h - 1), to_f64(r.w), 1.0, solid(c))
+    d = dl.rect(d, to_f64(r.x), to_f64(r.y), 1.0, to_f64(r.h), solid(c))
+    return dl.rect(d, to_f64(r.x + r.w - 1), to_f64(r.y), 1.0, to_f64(r.h), solid(c))
 }
 
 // Text：按节点字号在布局矩形左上角绘制单行（基线由引擎取 ascent）。
@@ -313,7 +371,11 @@ func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
         return d
     }
     var fs = tiu_props.font_size(id)
-    return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(uth.fg(st.th)))
+    var fg = upstate.color_of(st.th, tiu_props.fg(id))
+    if fg < 0 {
+        fg = uth.fg(st.th)
+    }
+    return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(fg))
 }
 
 // Button：圆角底色 + 居中标签；hot/active 换底色，focus 加 1px 焦点环。
@@ -327,7 +389,10 @@ func button_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     if id == st.active {
         act = 1
     }
-    var bg = upstate.button_bg(st.th, hot, act)
+    var bg = upstate.color_of(st.th, tiu_props.bg(id))
+    if bg < 0 {
+        bg = upstate.button_bg(st.th, hot, act)
+    }
     if is_focus(id, st) == 1 {
         d = box(d, r, rad, bg, upstate.focus_ring(st.th))
     } else if rad > 0 {
@@ -342,7 +407,11 @@ func button_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
         var lh = text_line_h(fs) / 64
         var tx = r.x + (r.w - tw) / 2
         var ty = r.y + (r.h - lh) / 2
-        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(uth.on_accent()))
+        var lc = upstate.color_of(st.th, tiu_props.fg(id))
+        if lc < 0 {
+            lc = uth.on_accent()
+        }
+        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(lc))
     }
     return d
 }
@@ -359,7 +428,11 @@ func input_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     var tx = r.x + PS_PAD_INPUT
     var ty = r.y + (r.h - lh) / 2
     if str_len(s) > 0 {
-        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(uth.fg(st.th)))
+        var fg = upstate.color_of(st.th, tiu_props.fg(id))
+        if fg < 0 {
+            fg = uth.fg(st.th)
+        }
+        d = dl.text_p(d, s, to_f64(tx), to_f64(ty), to_f64(fs), solid(fg))
     }
     if foc == 1 {
         var cx = tx + (text_width(s, fs) + 32) / 64

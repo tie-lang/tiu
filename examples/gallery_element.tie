@@ -4,27 +4,25 @@ type tie<logic, unsafe:mem>
 // EN: tiu sample — a small widget gallery written in element syntax on the
 // unified frame loop.
 //
-// 这个示例是给「读代码」用的：一屏之内把 tiu 的分层、元素语法、布局属性、
-// 事件派发与状态驱动重绘都走一遍，且不依赖任何手算坐标。
+// 一屏之内把 tiu 的分层走一遍，且不手算任何坐标：
+//   元素语法  @ window / @ column / @ row / @ panel / @ text / @ button
+//             tiec 降解成 std/ui 中立描述树（ui.begin / attr_* / on / end）
+//   std/ui    只描述「有什么控件、什么属性、什么事件」，不认识像素
+//   ui_bridge 中立树 → tiu 骨架 + 类型化属性，并驱动布局求解
+//   layout2   fill / hug / 百分比 / 间距 / 内边距 / 轴分布
+//   paint     卡片、圆角、描边、文本（TTF + 回退链）、裁剪
+//   raster    软件光栅 → 帧缓冲 → 宿主上屏
 //
-// 分层（自上而下）：
-//   元素语法  @ window / @ column / @ row / @ label / @ heading / @ button
-//             由 tiec 降解成 std/ui 的中立描述树（ui.begin/attr_str/on/...）
-//   std/ui   只描述「有什么控件、什么属性、什么事件」，不认识像素
-//   ui_bridge 把中立树翻成 tiu 骨架 + 类型化属性，并跑布局求解
-//   layout2  fill / hug / 百分比 / 间距 / 内边距 / 轴分布
-//   paint    面板、圆角、文本（TTF）、裁剪
-//   raster   软件光栅 → 帧缓冲 → 宿主上屏
+// 颜色属性（bg / fg / border）取主题 token 名，不写字面色值：
+//   bg / surface / surface-alt / border / border-strong / separator /
+//   accent / accent-hot / accent-down / accent-soft / fg / fg-dim /
+//   on-accent / shadow / hover / transparent，也可写 #RRGGBB。
 //
-// 运行（tiu 仓根）：
-//   build\host\gallery.exe           打开窗口，一直运行到关窗
-//   build\host\gallery.exe --demo    跑 120 轮后自动退出（冒烟/录屏）
-//   build\host\gallery.exe --check   无窗口自检：同一条帧循环 + 像素断言
-//
-// 构建（与其它示例相同；需要 clang 与已编好的平台壳）：
-//   见 examples/build.tie 的链路：tiec --emit-ir → clang -c → clang 链接
-//
-// EN: frame loop is shared; --check runs the same loop headlessly and asserts pixels.
+// 运行（tiu 仓根，先跑 examples/build.tie 构建）：
+//   gallery_element.exe           打开窗口，关窗退出
+//   gallery_element.exe --demo    跑 120 轮自动退出
+//   gallery_element.exe --check   无窗口自检：同一条帧循环 + 像素断言
+//   gallery_element.exe --shot p  无窗口渲染一帧写 PNG
 
 import "../ui/src/window_host.tie"
 import "../ui/src/tree.tie"
@@ -39,16 +37,16 @@ import "../engine/src/present.tie"
 import "../host/src/win.tie"
 import "/std/args.tie"
 
-const W: i64 = 460
-const H: i64 = 340
+const W: i64 = 560
+const H: i64 = 420
 const FONT: string = "C:/Windows/Fonts/consola.ttf"
-// 中文靠回退链补字：主面是等宽英文字体，不含 CJK 字形。
+// 主面是等宽英文字体，不含 CJK 字形；中文由回退链补字。
 const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
 
-// ---- 应用状态（应用层持有；框架不托管状态）----
-var g_count: i64 = 0          // 计数器
-var g_pick: string = "无"      // 列表选中项
-var g_frames: i64 = 0         // 视图被调用的帧数（自检用）
+// ---- 应用状态（应用层持有，框架不托管状态）----
+var g_count: i64 = 0
+var g_pick: string = "选项 A"
+var g_frames: i64 = 0
 
 // ---- 事件处理器：签名由 std/ui 约定 (节点, x, y, 事件名) -> i64 ----
 func on_inc(id: i64, x: i64, y: i64, kind: string) -> i64 {
@@ -68,7 +66,6 @@ func on_reset(id: i64, x: i64, y: i64, kind: string) -> i64 {
     return 1
 }
 
-// 列表项：用同一个处理器、按节点名区分选中项——事件里拿到的就是节点 id。
 func on_pick_a(id: i64, x: i64, y: i64, kind: string) -> i64 {
     g_pick = "选项 A"
     return 1
@@ -84,48 +81,89 @@ func on_pick_c(id: i64, x: i64, y: i64, kind: string) -> i64 {
     return 1
 }
 
-// ---- 视图：整棵树用元素语法写，没有任何手算坐标 ----
-// 布局属性含义：
-//   size: 460x340   窗口逻辑尺寸（也是 fill 的基准）
-//   w: fill         横向铺满父容器；h 不写 = hug（贴合内容高度）
-//   pad: 16         内边距；gap: 10 子项间距
-//   x: space-between / center / end   主轴分布（行内水平、列内垂直）
-//   font-size: 20   文本字号（TTF 度量与绘制同源，所以布局盒就是真实字宽）
+// 列表行的配色不靠运行时拼接：选不选中渲染两棵不同的子树。
+// （`bg` 是字面量属性键，值在编译期捕获；要随状态变化就换渲染分支。）
+
+// ---- 视图：整棵树用元素语法写 ----
 pub func view() -> i64 {
     g_frames = g_frames + 1
     ui.reset()
-    @ window "tiu · 组件画廊" (size: 460x340) {
-        @ column "root" (w: fill, h: fill, pad: 16, gap: 10) {
-            // 标题行：标题靠左、计数徽标靠右
-            @ row "head" (w: fill, x: space-between) {
-                @ heading "title" (text: "tiu · 组件画廊", font-size: 20) { }
-                @ label "badge" (text: "软件光栅 · 实时", font-size: 12) { }
-            }
-
-            @ label "hint" (text: "元素语法写视图，布局与绘制都在框架内；点按钮试事件。") { }
-
-            // 计数器：三个按钮 + 一个读数
-            @ row "counter" (w: fill, gap: 8) {
-                @ button "inc" (text: "+1", w: 72, h: 30, on_click: on_inc) { }
-                @ button "dec" (text: "-1", w: 72, h: 30, on_click: on_dec) { }
-                @ button "reset" (text: "归零", w: 72, h: 30, on_click: on_reset) { }
-                @ label "count" (text: "计数 " + to_string(g_count), font-size: 16) { }
-            }
-
-            // 列表：滚动容器里放三个可选项，点谁谁高亮选中
-            @ scroll "list" (w: fill, h: 96) {
-                @ column "items" (w: fill, gap: 6) {
-                    @ button "pa" (text: "选项 A", w: fill, h: 30, on_click: on_pick_a) { }
-                    @ button "pb" (text: "选项 B", w: fill, h: 30, on_click: on_pick_b) { }
-                    @ button "pc" (text: "选项 C", w: fill, h: 30, on_click: on_pick_c) { }
+    @ window "tiu · 组件画廊" (size: 560x420, bg: "bg") {
+        @ column "root" (w: fill, h: fill, pad: 24, gap: 18) {
+            // 页头：标题 / 副标题 / 右侧状态徽标
+            @ row "head" (w: fill, x: space-between, y: center, gap: 16) {
+                @ column "titles" (gap: 6) {
+                    @ label "title" (text: "tiu · 组件画廊", font-size: 22, fg: "fg")
+                    @ label "sub" (text: "元素语法 · 布局求解 · 绘制桥 · 事件轴", font-size: 13, fg: "fg-dim")
+                }
+                @ row "chip" (bg: "accent-soft", radius: 8, pad-x: 10, pad-y: 5, gap: 6, y: center) {
+                    @ label "chipdot" (text: "●", font-size: 11, fg: "accent")
+                    @ label "chiptxt" (text: "软件光栅", font-size: 12, fg: "accent")
                 }
             }
 
-            @ label "picked" (text: "当前选中：" + g_pick, font-size: 14) { }
+            // 分隔线：1px 高的行，颜色取 separator
+            @ row "line" (w: fill, h: 1, bg: "separator")
 
-            // 页脚：靠右的说明文字（x: end 就是主轴末端对齐）
-            @ row "foot" (w: fill, x: end) {
-                @ label "ver" (text: "tiu ui · software raster", font-size: 12) { }
+            // 主体：两张卡片
+            @ row "body" (w: fill, h: fill, gap: 18, y: start) {
+                // 卡片一：计数器
+                @ panel "card1" (w: 1fr, bg: "surface", stroke: "border", radius: 12, pad: 18, gap: 12, y: start) {
+                    @ label "s1" (text: "计数器", font-size: 13, fg: "fg-dim")
+                    @ label "count" (text: "计数 " + to_string(g_count), font-size: 28, fg: "fg")
+                    @ row "btns" (w: fill, gap: 8, y: end) {
+                        @ button "inc" (text: "+1", w: 84, h: 34, on_click: on_inc)
+                        @ button "dec" (text: "-1", w: 84, h: 34, bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_dec)
+                        @ button "reset" (text: "归零", w: 84, h: 34, bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_reset)
+                    }
+                }
+
+                // 卡片二：列表选择
+                @ panel "card2" (w: 1fr, bg: "surface", stroke: "border", radius: 12, pad: 18, gap: 10, y: start) {
+                    @ label "s2" (text: "列表 · 点击选择", font-size: 13, fg: "fg-dim")
+                    @ column "items" (w: fill, gap: 6) {
+                        if g_pick == "选项 A" {
+                            @ row "ra" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_a) {
+                                @ row "ra_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "ra_txt" (text: "选项 A", font-size: 14, fg: "accent")
+                            }
+                        } else {
+                            @ row "ra" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_a) {
+                                @ row "ra_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "ra_txt" (text: "选项 A", font-size: 14, fg: "fg")
+                            }
+                        }
+                        if g_pick == "选项 B" {
+                            @ row "rb" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_b) {
+                                @ row "rb_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "rb_txt" (text: "选项 B", font-size: 14, fg: "accent")
+                            }
+                        } else {
+                            @ row "rb" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_b) {
+                                @ row "rb_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "rb_txt" (text: "选项 B", font-size: 14, fg: "fg")
+                            }
+                        }
+                        if g_pick == "选项 C" {
+                            @ row "rc" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_c) {
+                                @ row "rc_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "rc_txt" (text: "选项 C", font-size: 14, fg: "accent")
+                            }
+                        } else {
+                            @ row "rc" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_c) {
+                                @ row "rc_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "rc_txt" (text: "选项 C", font-size: 14, fg: "fg")
+                            }
+                        }
+                    }
+                    @ label "picked" (text: "当前选中：" + g_pick, font-size: 13, fg: "fg-dim")
+                }
+            }
+
+            // 页脚
+            @ row "foot" (w: fill, x: space-between, y: end) {
+                @ label "ver" (text: "tiu ui · software raster · TTF 文本", font-size: 12, fg: "fg-dim")
+                @ label "hint2" (text: "点击「+1」或列表项试试", font-size: 12, fg: "fg-dim")
             }
         }
     }
@@ -150,8 +188,14 @@ func check() -> i64 {
     }
     var fb = tiu_win.render(W, H)
     var bg = tiu_win.px(fb, 1, 1)
+    if bg != 0xFF12141A {
+        println("FAIL 窗口底色不是 bg token px=" + to_string(bg))
+        bad = bad + 1
+    } else {
+        println("OK 窗口底色 bg token")
+    }
 
-    // 1) 按钮真的画出墨迹（文本 + 面板），且用的是布局求出来的矩形
+    // 1) 按钮真的画出墨迹，且矩形来自布局求解
     var inc = ui_bridge.node_of_ui(ui.find("inc"))
     var r = tiu_tree.rect(inc)
     var ink = tiu_win.ink(fb, r.x + 3, r.y + 3, r.w - 6, r.h - 6, bg)
@@ -162,7 +206,18 @@ func check() -> i64 {
         println("OK 按钮有墨迹 ink=" + to_string(ink) + " rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
     }
 
-    // 2) 点击走事件轴 → 状态变化 → 下一帧文本更新
+    // 2) 卡片铺的是 surface 底色（取卡片右下角内侧，避开文字）
+    var card = ui_bridge.node_of_ui(ui.find("card1"))
+    var rc = tiu_tree.rect(card)
+    var cpx = tiu_win.px(fb, rc.x + rc.w - 6, rc.y + rc.h - 6)
+    if cpx != 0xFF191C23 {
+        println("FAIL 卡片底色不是 surface px=" + to_string(cpx))
+        bad = bad + 1
+    } else {
+        println("OK 卡片底色 surface rect=" + to_string(rc.x) + "," + to_string(rc.y) + " " + to_string(rc.w) + "x" + to_string(rc.h))
+    }
+
+    // 3) 点击走事件轴 → 状态变化 → 下一帧文本更新
     var cx = r.x + r.w / 2
     var cy = r.y + r.h / 2
     tiu_app.on_mouse_move(cx, cy)
@@ -183,22 +238,32 @@ func check() -> i64 {
         println("OK 点击后重绘 segs=" + to_string(segs2) + " text=" + txt)
     }
 
-    // 3) 列表项点击：选中项进状态
-    var pb = ui_bridge.node_of_ui(ui.find("pb"))
+    // 4) 列表项点击：选中进状态，且选中行铺 accent-soft
+    var pb = ui_bridge.node_of_ui(ui.find("rb"))
     var rb = tiu_tree.rect(pb)
-    tiu_app.on_mouse_move(rb.x + rb.w / 2, rb.y + rb.h / 2)
-    tiu_app.on_mouse_down(rb.x + rb.w / 2, rb.y + rb.h / 2)
-    tiu_app.on_mouse_up(rb.x + rb.w / 2, rb.y + rb.h / 2)
+    var mx = rb.x + rb.w / 2
+    var my = rb.y + rb.h / 2
+    tiu_app.on_mouse_move(mx, my)
+    tiu_app.on_mouse_down(mx, my)
+    tiu_app.on_mouse_up(mx, my)
+    // 采样前把指针移开：行处于 hover 时会叠加高亮，届时像素不等于基准色。
+    tiu_app.on_mouse_move(2, 2)
     tiu_win.frame(W, H, view)
+    var fb2 = tiu_win.render(W, H)
     var picked = ui.attr_of(ui.find("picked"), "text")
+    var rb2 = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("rb")))
+    var spx = tiu_win.px(fb2, rb2.x + rb2.w - 6, rb2.y + rb2.h / 2)
     if g_pick != "选项 B" {
         println("FAIL 列表选择未生效 pick=" + g_pick)
+        bad = bad + 1
+    } else if spx != 0xFF1B2A45 {
+        println("FAIL 选中行底色不是 accent-soft px=" + to_string(spx))
         bad = bad + 1
     } else {
         println("OK 列表选择 picked=" + picked)
     }
 
-    // 4) 空闲帧零重绘：没有事件、没有状态变化就不产生绘制段
+    // 5) 空闲帧零重绘：无事件、无状态变化就不产生绘制段
     var segs3 = tiu_win.frame(W, H, view)
     if segs3 != 0 {
         println("FAIL 空闲帧仍有绘制段 segs=" + to_string(segs3))
