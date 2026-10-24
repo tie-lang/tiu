@@ -34,6 +34,7 @@ import "../api/src/paint.tie"
 import "../api/src/canvas.tie"
 import "../engine/src/ir_load.tie"
 import "../engine/src/raster.tie"
+import "../engine/src/pngout.tie"
 import "../engine/src/present.tie"
 import "../host/src/win.tie"
 import "/std/args.tie"
@@ -41,6 +42,8 @@ import "/std/args.tie"
 const W: i64 = 460
 const H: i64 = 340
 const FONT: string = "C:/Windows/Fonts/consola.ttf"
+// 中文靠回退链补字：主面是等宽英文字体，不含 CJK 字形。
+const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
 
 // ---- 应用状态（应用层持有；框架不托管状态）----
 var g_count: i64 = 0          // 计数器
@@ -133,6 +136,7 @@ pub func view() -> i64 {
 func check() -> i64 {
     tiu_win.theme(0)
     var face = tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     if face < 0 {
         println("FAIL 字体装载")
         return 1
@@ -213,11 +217,27 @@ func main() -> i64 {
     if args.has("--check") {
         return check()
     }
+    if args.has("--shot") {
+        // 无窗口截图：同一帧循环跑一帧，把像素写成 PNG（文档与视觉回归用）。
+        tiu_win.theme(0)
+        tiu_win.load_font(FONT)
+        tiu_win.load_fallback(FALLBACK)
+        tiu_win.frame(W, H, view)
+        var fb = tiu_win.render(W, H)
+        var path = args.value("--shot")
+        if epng.save(fb, path) {
+            println("shot " + path)
+            return 0
+        }
+        println("FAIL 截图写盘失败 " + path)
+        return 1
+    }
     var rounds: i64 = 0
     if args.has("--demo") {
         rounds = 120
     }
     tiu_win.theme(0)
     tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     return tiu_win_host.run("tiu · 组件画廊", W, H, rounds, view)
 }

@@ -47,16 +47,28 @@ var g_clip_x1: i64 = 0
 var g_clip_y1: i64 = 0
 var g_clip_stk: table<i64> = []
 
-// 设置文本字体文件；下次文本绘制时惰性加载。
+// 设置文本字体文件（链首 = 主面）；下次文本绘制时惰性加载。
 pub func text_font(path: string) {
     g_tf_path = path
     g_tf_face = -2
+}
+
+// 追加回退字体文件：主面缺字时按装载顺序补。返回新的 face id（<0 = 失败）。
+// 回退面不参与行高与基线计算——那是主面的职责。
+pub func text_fallback(path: string) -> i64 {
+    var p = text_face_id()   // 先把链首（主面）装好，回退面才接得上
+    var f = efont.load(path)
+    if f >= 0 {
+        efont.chain_add(f)
+    }
+    return f
 }
 
 // 当前字体面 id（< 0 表加载失败，调用方回退位图）。
 pub func text_face_id() -> i64 {
     if g_tf_face == -2 {
         g_tf_face = efont.load(g_tf_path)
+        efont.chain_reset(g_tf_face)
     }
     return g_tf_face
 }
@@ -65,6 +77,10 @@ pub func text_face_id() -> i64 {
 // 字形」用同一 face：文本推进完全由该 face 的 advance 决定。
 pub func set_face(face: i64) {
     g_tf_face = face
+    // 换面即重建链：链首必须是当前面，回退面要重新追加。
+    if face >= 0 {
+        efont.chain_reset(face)
+    }
 }
 
 // 当前 face 值（-2 = 尚未尝试加载；-1 = 加载失败）。
@@ -269,37 +285,51 @@ func text_px(fb: FrameBuf, p: Parsed, i: i64, color: i64, alpha: i64) {
     if size < 1.0 {
         size = 1.0
     }
-    // op 的 y = 行盒顶；字形基线 = 盒顶 + ascent。
-    var baseline = dy + efont.ascent(face, size)
+    // op 的 y = 行盒顶。基线放在行盒的视觉中线上：
+    //   基线偏移 = 行盒高/2 + (ascent - descent)/2
+    // 直接用 `y + ascent` 会让中文首笔顶到盒顶（CJK 字形比西文 ascent 高），
+    // 行盒上沿一刀就削掉笔画。按视觉中线放置后，中文与西文共用同一条
+    // 基线，且两端都不压盒边。
+    // line_height 返回 26.6 定点，先除回像素再参与中线计算。
+    var lh = to_f64(efont.line_height(face, size)) / 64.0
+    // descent 按 hhea 惯例是负值（基线以下为负），所以这里用加号：
+    // 基线相对行盒中心的偏移 = (ascent + descent)/2
+    var base_off = lh / 2.0 + (efont.ascent(face, size) + efont.descent(face, size)) / 2.0
+    var baseline = dy + base_off
     var s = p.txt[i]
     var n = str_len(s)
     var pen = dx
     var ci: i64 = 0
     while ci < n {
         var cp = utfmin.to_cp(str_char(s, ci))
-        var e = efont.glyph_raster(face, cp, size)
-        if efont.atlas_valid(e) {
-            var gx0 = i64_round(pen) + efont.atlas_bx(e)
-            var gy0 = i64_round(baseline) + efont.atlas_by(e)
-            var gw = efont.atlas_w(e)
-            var gh = efont.atlas_h(e)
-            var j: i64 = 0
-            while j < gh {
-                var k: i64 = 0
-                while k < gw {
-                    var cov = efont.atlas_cov(e, j * gw + k)
-                    if cov > 0 {
-                        var a2 = (alpha * cov + 127) / 255
-                        if a2 > 0 {
-                            put_px(fb, gx0 + k, gy0 + j, color, a2)
+        // 字形归属面：主面优先，缺字走回退链；整链都没有则跳过该字。
+        var gf = efont.chain_face_for(cp)
+        if gf >= 0 {
+            var e = efont.glyph_raster(gf, cp, size)
+            if efont.atlas_valid(e) {
+                var gx0 = i64_round(pen) + efont.atlas_bx(e)
+                var gy0 = i64_round(baseline) + efont.atlas_by(e)
+                var gw = efont.atlas_w(e)
+                var gh = efont.atlas_h(e)
+                var j: i64 = 0
+                while j < gh {
+                    var k: i64 = 0
+                    while k < gw {
+                        var cov = efont.atlas_cov(e, j * gw + k)
+                        if cov > 0 {
+                            var a2 = (alpha * cov + 127) / 255
+                            if a2 > 0 {
+                                put_px(fb, gx0 + k, gy0 + j, color, a2)
+                            }
                         }
+                        k = k + 1
                     }
-                    k = k + 1
+                    j = j + 1
                 }
-                j = j + 1
             }
         }
-        pen = pen + to_f64(efont.advance(face, cp, size)) / 64.0
+        // 推进量取「负责该字的面」——与布局 measure_text 完全同源。
+        pen = pen + to_f64(efont.chain_advance(cp, size)) / 64.0
         ci = ci + 1
     }
 }

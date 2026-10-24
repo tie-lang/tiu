@@ -1,42 +1,43 @@
 type tie<class>
-// engine/src/utfmin.tie —— tiu 渲染引擎：最小 UTF-8 字符工具
+// engine/src/utfmin.tie —— tiu 渲染引擎：UTF-8 字符工具
 // ============================================================
-// tie 无「码点 → 任意字符」内建原语（std/utf.to_char 在 tiec 仓，
-// 引擎仓不引跨仓依赖）。可打印 ASCII 32..126 以固定表 + str_char
-// 映射（能力缺口如实记录；非可打印码点返回空串，不影响绘制表文本
-// 子集：文本位图字形仅消费 ASCII 可打印区）。
+// 这一层只做「码点 ↔ 单字符」的无损转换，不掺任何字体或字形知识。
 //
-// EN: minimal code-point → char for ASCII printable (32..126) via a
-// fixed table (tie has no builtin; std/utf lives in the tiec repo).
+// 为什么曾经只有 ASCII：早期文本绘制只消费 ASCII 可打印区，用一个固定
+// 表就能映射；但那等于把「界面只能用英文」写死进引擎。tie 的内建已经
+// 提供码点语义（`str_len`/`str_char` 按码点计，`char_code` 解 UTF-8，
+// `str_from_code` 编 UTF-8），所以这里直接委托，语义与其它语言的
+// UTF-8 编解码一致：任意码点（含 CJK、标点、emoji）都能往返。
+//
+// EN: UTF-8 helpers for the render engine — codepoint <-> single character,
+// delegated to tie's codepoint-aware string builtins.
 
 namespace utfmin {
 
-func ascii_tab() -> string {
-    return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-}
-
-// 码点 → 单字符字符串（32..126；越界返回空串）。
+// 码点 → 单字符（UTF-8 1..4 字节）。非法码点返回空串。
 pub func to_char(cp: i64) -> string {
-    if cp < 32 || cp > 126 {
+    if cp < 0 || cp > 0x10FFFF {
         return ""
     }
-    return str_char(ascii_tab(), cp - 32)
+    // 代理区（U+D800..U+DFFF）不是合法 Unicode 标量值。
+    if cp >= 0xD800 && cp <= 0xDFFF {
+        return ""
+    }
+    return str_from_code(cp)
 }
 
-// 单字符字符串 → 码点（32..126；非单字符/越界返回 0）。
+// 单字符（1..4 字节 UTF-8）→ 码点。空串或非单字符返回 0。
+// 0 是合法码点（NUL），调用方对 0 一律按「无字形」处理。
 pub func to_cp(c: string) -> i64 {
     if str_len(c) != 1 {
         return 0
     }
-    var tab = ascii_tab()
-    var i: i64 = 0
-    while i < 95 {
-        if str_char(tab, i) == c {
-            return i + 32
-        }
-        i = i + 1
-    }
-    return 0
+    return char_code(c)
+}
+
+// 码点个数（与 str_len 同义；保留此名让调用点读起来是「按字符」）。
+pub func count(s: string) -> i64 {
+    return str_len(s)
 }
 
 }

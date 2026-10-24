@@ -1,0 +1,105 @@
+type tie<class>
+// pngout.tie —— 帧缓冲 → PNG（截图、文档图示与视觉回归用）。
+// ============================================================
+// 软件光栅产出的帧缓冲是 0xAARRGGBB 的 table<i64>；本模块把它编成 PNG
+// （8 位 RGBA，逐行 filter=0），写盘走 bytes 模块的二进制写法。
+//
+// 为什么自己编码而不是只接平台截图：截图只能证明「上屏了什么」，没法在
+// 无人值守的自检里比对像素；PNG 是能入库、能进文档、能逐字节复算的产物。
+//
+// EN: frame buffer to PNG (RGBA8, per-row filter 0), for screenshots,
+// documentation figures and headless visual checks.
+import "./raster.tie"
+import "/std/bytes.tie"
+import "/std/zlib.tie"
+
+namespace epng {
+
+// 大端 4 字节（CRC / 长度字段用）。
+func be32(v: i64) -> table<i64> {
+    var t = table_new_i64()
+    table_push(t, (v >> 24) & 255)
+    table_push(t, (v >> 16) & 255)
+    table_push(t, (v >> 8) & 255)
+    table_push(t, v & 255)
+    return t
+}
+
+// 拼接两张字节表（规范 §13.1：按值表形参的写入不可观测，故返回新表）。
+func cat(a: table<i64>, b: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 0
+    var na = len(a)
+    while i < na {
+        table_push(out, a[i])
+        i = i + 1
+    }
+    i = 0
+    var nb = len(b)
+    while i < nb {
+        table_push(out, b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 一个 PNG 块：长度(4) + 类型(4) + 数据 + CRC32(类型+数据)(4)。
+func chunk(typ: string, data: table<i64>) -> table<i64> {
+    var body = cat(bytes.from_ascii(typ), data)
+    var out = cat(be32(len(data)), body)
+    return cat(out, be32(zlib.crc32(body)))
+}
+
+// RGBA8 原始扫描线：逐行先写 filter=0，再写 R,G,B,A。
+func scanlines(fb: FrameBuf) -> table<i64> {
+    var raw = table_new_i64()
+    var y: i64 = 0
+    while y < fb.h {
+        table_push(raw, 0)
+        var row = y * fb.w
+        var x: i64 = 0
+        while x < fb.w {
+            var v = fb.px[row + x]
+            table_push(raw, (v >> 16) & 255)
+            table_push(raw, (v >> 8) & 255)
+            table_push(raw, v & 255)
+            table_push(raw, (v >> 24) & 255)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return raw
+}
+
+// 帧缓冲 → PNG 字节串。
+pub func encode(fb: FrameBuf) -> table<i64> {
+    // 文件头 89 50 4E 47 0D 0A 1A 0A。
+    var sig = table_new_i64()
+    table_push(sig, 137)
+    table_push(sig, 80)
+    table_push(sig, 78)
+    table_push(sig, 71)
+    table_push(sig, 13)
+    table_push(sig, 10)
+    table_push(sig, 26)
+    table_push(sig, 10)
+
+    // IHDR：宽、高、位深 8、颜色类型 6（RGBA）、压缩 0、滤波 0、隔行 0。
+    var ihdr = cat(be32(fb.w), be32(fb.h))
+    table_push(ihdr, 8)
+    table_push(ihdr, 6)
+    table_push(ihdr, 0)
+    table_push(ihdr, 0)
+    table_push(ihdr, 0)
+
+    var out = cat(sig, chunk("IHDR", ihdr))
+    out = cat(out, chunk("IDAT", zlib.compress(scanlines(fb))))
+    out = cat(out, chunk("IEND", table_new_i64()))
+    return out
+}
+
+// 帧缓冲 → PNG 文件；成功 true。
+pub func save(fb: FrameBuf, path: string) -> bool {
+    return bytes.write(path, encode(fb))
+}
+}

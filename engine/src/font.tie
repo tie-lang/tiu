@@ -587,6 +587,79 @@ pub func face_path(face: i64) -> string {
 }
 
 // ============================================================
+// 字体链（typography 策略的唯一存放处）
+// ============================================================
+// 为什么放在这一层：字宽是「字形是否存在」的函数。光栅与布局必须查同一张链，
+// 否则布局按主字体算宽、光栅到回退面取字形，两处立刻失配（设计稿 §6）。
+// 链首 = 主面：行高与基线由它决定；后面的面只负责补缺字。
+
+var g_chain: table<i64> = []
+
+// 用给定面重置链。
+pub func chain_reset(face: i64) {
+    g_chain = []
+    if face >= 0 {
+        table_push(g_chain, face)
+    }
+}
+
+// 追加回退面（同面不重复；负数忽略）。
+pub func chain_add(face: i64) {
+    if face < 0 {
+        return
+    }
+    var i: i64 = 0
+    var n = len(g_chain)
+    while i < n {
+        if g_chain[i] == face {
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_chain, face)
+}
+
+pub func chain_count() -> i64 {
+    return len(g_chain)
+}
+
+pub func chain_at(i: i64) -> i64 {
+    if i < 0 || i >= len(g_chain) {
+        return 0 - 1
+    }
+    return g_chain[i]
+}
+
+// 主面 = 链首；决定行高与文本基线。
+pub func chain_primary() -> i64 {
+    return chain_at(0)
+}
+
+// 码位 → 负责它的面；整条链都没有则返回 -1。
+pub func chain_face_for(cp: i64) -> i64 {
+    var i: i64 = 0
+    var n = len(g_chain)
+    while i < n {
+        var f = g_chain[i]
+        if has_glyph(f, cp) {
+            return f
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 码位在链上的推进量（26.6）。缺字返回 0：不占位、不跳格，
+// 让「字体不含某字符」表现为缺字而不是错位。
+pub func chain_advance(cp: i64, size: f64) -> i64 {
+    var f = chain_face_for(cp)
+    if f < 0 {
+        return 0
+    }
+    return advance(f, cp, size)
+}
+
+// ============================================================
 // 度量
 // ============================================================
 pub func units_per_em(face: i64) -> i64 {

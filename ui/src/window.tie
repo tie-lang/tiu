@@ -49,6 +49,12 @@ pub func load_font(path: string) -> i64 {
     return g_wr_face
 }
 
+// 追加回退字体：主面缺字（典型是主面为等宽/TT 字体、界面用中文）时按序补。
+// 回退面不改变行高与基线——那由主面决定；只补字形与推进量。
+pub func load_fallback(path: string) -> i64 {
+    return erast.text_fallback(path)
+}
+
 pub func face() -> i64 {
     return g_wr_face
 }

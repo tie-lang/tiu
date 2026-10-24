@@ -96,11 +96,16 @@ namespace tiu_layout2 {
 // 字体面开关：装载后文本度量与光栅同源（见文件头 g_face 注释）。
 pub func set_face(f: i64) {
     g_face = f
+    // 度量与光栅共用 font.tie 的同一实例：换面必须重建链，链首 = 当前面。
+    if f >= 0 {
+        efont.chain_reset(f)
+    }
 }
 
 pub func face() -> i64 {
     return g_face
 }
+
 
 // ============================================================
 // 定点与单位换算
@@ -365,13 +370,17 @@ pub func measure_text(s: string, font_size: i64) -> i64 {
         return 0
     }
     if g_face >= 0 {
-        // 真值路径：逐字符累加 efont.advance（26.6），与光栅 pen 推进同源。
+        // 真值路径：逐字符累加字体链的 advance（26.6），与光栅 pen 推进同源。
+        // 链未初始化（布局先于装载被调用）时用当前主面补一个，保证两边查同一张链。
+        if efont.chain_count() <= 0 {
+            efont.chain_reset(g_face)
+        }
         var fd = to_f64(fs)
         var tot: i64 = 0
         var i: i64 = 0
         while i < n {
             var cp = utfmin.to_cp(str_char(s, i))
-            tot = tot + efont.advance(g_face, cp, fd)
+            tot = tot + efont.chain_advance(cp, fd)
             i = i + 1
         }
         return tot
