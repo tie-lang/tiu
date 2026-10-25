@@ -2,9 +2,9 @@ type tie<logic, unsafe:mem>
 // list_element.tie —— 元素语法列表示例：控制流在元素体内生成行，删除按钮用函数值事件。
 // ============================================================
 // 用法（tiu 仓根）：
-//   build\host\list_element.exe            一直运行到关窗
-//   build\host\list_element.exe --demo     跑 90 轮后自动退出
-//   build\host\list_element.exe --check    无窗口自检：帧循环 + 事件轴 + 像素断言
+//   _local_only\build\host\list_element.exe            一直运行到关窗
+//   _local_only\build\host\list_element.exe --demo     跑 90 轮后自动退出
+//   _local_only\build\host\list_element.exe --check    无窗口自检：帧循环 + 事件轴 + 像素断言
 //
 // EN: element-syntax list demo on the unified frame loop.
 import "../ui/src/window_host.tie"
@@ -17,9 +17,10 @@ import "../engine/src/present.tie"
 import "../host/src/win.tie"
 import "/std/args.tie"
 
-const W: i64 = 360
-const H: i64 = 320
+const W: i64 = 380
+const H: i64 = 360
 const FONT: string = "C:/Windows/Fonts/consola.ttf"
+const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
 
 var g_rows: i64 = 5
 
@@ -33,18 +34,31 @@ func on_del(id: i64, x: i64, y: i64, kind: string) -> i64 {
 pub func view() -> i64 {
     ui.reset()
     var i: i64 = 0
-    @ window "tiu · list" (size: 360x320) {
-        @ column "root" (w: fill, h: fill, pad: 12, gap: 6) {
-            @ heading "title" (text: "列表（" + to_string(g_rows) + " 项）")
-            @ scroll "body" (w: fill, h: fill, overflow: scroll) {
-                while i < g_rows {
-                    @ row "row" (w: fill, h: 34, gap: 8, pad: 4) {
-                        @ label "txt" (text: "第 " + to_string(i + 1) + " 行")
-                        @ button "del" (w: 64, h: 26, text: "删除", on_click: on_del) { }
+    @ window "tiu · list" (size: 380x360) {
+        @ column "root" (w: fill, h: fill, pad: 20, gap: 12) {
+            @ row "head" (w: fill, x: space-between, y: center) {
+                @ label "title" (text: "列表（" + to_string(g_rows) + " 项）", font-size: 18)
+                @ label "chip" (text: "滚轮可滚动", font-size: 12, h: 22, fg: "accent", bg: "accent-soft", radius: 6, pad-x: 8)
+            }
+            @ panel "card" (w: fill, h: fill, bg: "surface", stroke: "border", radius: 14, pad: 12, gap: 0, y: start) {
+                @ scroll "body" (w: fill, h: fill, gap: 6, pad-right: 10, overflow: scroll) {
+                    while i < g_rows {
+                        if i % 2 == 0 {
+                            @ row "row" (w: fill, h: 40, radius: 8, pad-x: 12, gap: 10, y: center, bg: "surface-alt", x: space-between) {
+                                @ label "txt" (text: "第 " + to_string(i + 1) + " 行", font-size: 14)
+                                @ button "del" (w: 60, h: 28, radius: 7, text: "删除", font-size: 12, bg: "transparent", stroke: "border-strong", fg: "fg-dim", on_click: on_del) { }
+                            }
+                        } else {
+                            @ row "row" (w: fill, h: 40, radius: 8, pad-x: 12, gap: 10, y: center, x: space-between) {
+                                @ label "txt" (text: "第 " + to_string(i + 1) + " 行", font-size: 14)
+                                @ button "del" (w: 60, h: 28, radius: 7, text: "删除", font-size: 12, bg: "transparent", stroke: "border-strong", fg: "fg-dim", on_click: on_del) { }
+                            }
+                        }
+                        i = i + 1
                     }
-                    i = i + 1
                 }
             }
+            @ label "foot" (text: "tiu ui · 软件光栅 · TTF 文本", font-size: 11, fg: "fg-dim")
         }
     }
     return ui.count()
@@ -54,6 +68,7 @@ pub func view() -> i64 {
 func check() -> i64 {
     tiu_win.theme(0)
     var face = tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     if face < 0 {
         println("FAIL 字体装载")
         return 1
@@ -68,6 +83,17 @@ func check() -> i64 {
         bad = bad + 1
     } else {
         println("OK 首帧 segs=" + to_string(segs) + " 首行墨迹=" + to_string(ink))
+    }
+    // 卡片底色必须与窗口底色不同（视觉系统生效）
+    var card = ui_bridge.node_of_ui(ui.find("card"))
+    var cr = tiu_tree.rect(card)
+    var bg = tiu_win.px(fb, 1, 1)
+    var cpx = tiu_win.px(fb, cr.x + 12, cr.y + cr.h / 2)
+    if cpx == bg {
+        println("FAIL 卡片底色与窗口底色相同")
+        bad = bad + 1
+    } else {
+        println("OK 卡片底色 " + to_string(cpx))
     }
     var t0 = ui.attr_of(ui.find("title"), "text")
     if t0 != "列表（5 项）" {
@@ -108,6 +134,7 @@ func main() -> i64 {
     }
     tiu_win.theme(0)
     tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     var rc = tiu_win_host.run("tiu · list", W, H, rounds, view)
     if rc == 0 {
         println("list 关闭：rounds=" + to_string(tiu_win_host.rounds()) + " presented=" + to_string(tiu_win_host.presented()))

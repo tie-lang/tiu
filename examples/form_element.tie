@@ -2,9 +2,9 @@ type tie<logic, unsafe:mem>
 // form_element.tie —— 元素语法表单示例：输入框、提交按钮、校验提示随状态重算。
 // ============================================================
 // 用法（tiu 仓根）：
-//   build\host\form_element.exe            一直运行到关窗
-//   build\host\form_element.exe --demo     跑 90 轮后自动退出
-//   build\host\form_element.exe --check    无窗口自检：帧循环 + 事件轴 + 像素断言
+//   _local_only\build\host\form_element.exe            一直运行到关窗
+//   _local_only\build\host\form_element.exe --demo     跑 90 轮后自动退出
+//   _local_only\build\host\form_element.exe --check    无窗口自检：帧循环 + 事件轴 + 像素断言
 //
 // 输入内容由外部赋值（g_user / g_mail）驱动；提交走函数值事件（on_click: on_submit）。
 //
@@ -19,9 +19,10 @@ import "../engine/src/present.tie"
 import "../host/src/win.tie"
 import "/std/args.tie"
 
-const W: i64 = 360
-const H: i64 = 300
+const W: i64 = 380
+const H: i64 = 340
 const FONT: string = "C:/Windows/Fonts/consola.ttf"
+const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
 
 var g_user: string = ""
 var g_mail: string = ""
@@ -46,15 +47,29 @@ func on_submit(id: i64, x: i64, y: i64, kind: string) -> i64 {
 
 pub func view() -> i64 {
     ui.reset()
-    @ window "tiu · form" (size: 360x300) {
-        @ column "root" (w: fill, h: fill, pad: 16, gap: 10) {
-            @ heading "title" (text: "注册")
-            @ input "user" (w: fill, h: 32, placeholder: "用户名", value: g_user)
-            @ input "mail" (w: fill, h: 32, placeholder: "邮箱", value: g_mail)
-            @ label "msg" (text: g_msg)
-            @ row "actions" (gap: 8) {
-                @ button "submit" (w: 96, h: 34, text: "提交", on_click: on_submit) { }
+    @ window "tiu · form" (size: 380x340) {
+        @ column "root" (w: fill, h: fill, pad: 20, gap: 14) {
+            @ row "head" (w: fill, x: space-between, y: center) {
+                @ label "title" (text: "注册", font-size: 20)
+                @ label "chip" (text: "表单校验", font-size: 12, h: 22, fg: "accent", bg: "accent-soft", radius: 6, pad-x: 8)
             }
+            @ panel "card" (w: fill, h: fill, bg: "surface", stroke: "border", radius: 14, pad: 20, gap: 8, y: start) {
+                @ label "lu" (text: "用户名", font-size: 12, fg: "fg-dim")
+                @ input "user" (w: fill, h: 36, radius: 8, bg: "surface-alt", stroke: "border", pad-x: 12, placeholder: "用户名", value: g_user)
+                @ label "lm" (text: "邮箱", font-size: 12, fg: "fg-dim")
+                @ input "mail" (w: fill, h: 36, radius: 8, bg: "surface-alt", stroke: "border", pad-x: 12, placeholder: "邮箱", value: g_mail)
+                if g_bad == 0 {
+                    @ label "msg" (text: g_msg, font-size: 13, fg: "fg-dim") { }
+                } else {
+                    @ label "msg" (text: g_msg, font-size: 13, fg: "accent-down") { }
+                }
+                @ row "line" (w: fill, h: 1, bg: "separator")
+                @ row "actions" (w: fill, gap: 10, y: end) {
+                    @ button "submit" (w: 120, h: 38, radius: 9, text: "提交", on_click: on_submit) { }
+                    @ label "tip" (text: "两项均为必填", font-size: 12, fg: "fg-dim")
+                }
+            }
+            @ label "foot" (text: "tiu ui · 软件光栅 · TTF 文本", font-size: 11, fg: "fg-dim")
         }
     }
     return ui.count()
@@ -64,6 +79,7 @@ pub func view() -> i64 {
 func check() -> i64 {
     tiu_win.theme(0)
     var face = tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     if face < 0 {
         println("FAIL 字体装载")
         return 1
@@ -80,6 +96,17 @@ func check() -> i64 {
         bad = bad + 1
     } else {
         println("OK 首帧 segs=" + to_string(segs) + " 按钮墨迹=" + to_string(ink))
+    }
+    // 卡片底色必须与窗口底色不同（视觉系统生效）
+    var card = ui_bridge.node_of_ui(ui.find("card"))
+    var cr = tiu_tree.rect(card)
+    var bg = tiu_win.px(fb, 1, 1)
+    var cpx = tiu_win.px(fb, cr.x + 12, cr.y + cr.h / 2)
+    if cpx == bg {
+        println("FAIL 卡片底色与窗口底色相同")
+        bad = bad + 1
+    } else {
+        println("OK 卡片底色 " + to_string(cpx))
     }
     // 缺邮箱：点击应被拒
     tiu_win.click_node(submit)
@@ -129,6 +156,7 @@ func main() -> i64 {
     g_user = "jiro"
     tiu_win.theme(0)
     tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     var rc = tiu_win_host.run("tiu · form", W, H, rounds, view)
     if rc == 0 {
         println("form 关闭：rounds=" + to_string(tiu_win_host.rounds()) + " presented=" + to_string(tiu_win_host.presented()))

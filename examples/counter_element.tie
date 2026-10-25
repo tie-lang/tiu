@@ -2,9 +2,9 @@ type tie<logic, unsafe:mem>
 // counter_element.tie —— 元素语法计数器示例：真实窗口 + 统一帧循环。
 // ============================================================
 // 用法（tiu 仓根，下同）：
-//   build\host\counter_element.exe            一直运行到关窗
-//   build\host\counter_element.exe --demo     跑 90 轮后自动退出（冒烟/自演示）
-//   build\host\counter_element.exe --check    无窗口自检：同一条帧循环 + 像素断言
+//   _local_only\build\host\counter_element.exe            一直运行到关窗
+//   _local_only\build\host\counter_element.exe --demo     跑 90 轮后自动退出（冒烟/自演示）
+//   _local_only\build\host\counter_element.exe --check    无窗口自检：同一条帧循环 + 像素断言
 //
 // 演示链路：元素语法写视图 → 帧循环重建/布局/差分 → 事件轴派发 → 状态变化 → 下一帧重绘。
 //
@@ -19,9 +19,10 @@ import "../engine/src/present.tie"
 import "../host/src/win.tie"
 import "/std/args.tie"
 
-const W: i64 = 360
-const H: i64 = 260
+const W: i64 = 380
+const H: i64 = 300
 const FONT: string = "C:/Windows/Fonts/consola.ttf"
+const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
 
 var g_count: i64 = 0
 
@@ -38,16 +39,30 @@ func on_dec(id: i64, x: i64, y: i64, kind: string) -> i64 {
     return 1
 }
 
+func on_reset(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_count = 0
+    return 1
+}
+
 pub func view() -> i64 {
     ui.reset()
-    @ window "tiu · counter" (size: 360x260) {
-        @ column "root" (w: fill, h: fill, pad: 16, gap: 8) {
-            @ heading "title" (text: "Counter")
-            @ label "value" (text: "计数 " + to_string(g_count))
-            @ row "ops" (gap: 8) {
-                @ button "inc" (w: 96, h: 32, text: "+1", on_click: on_inc) { }
-                @ button "dec" (w: 96, h: 32, text: "-1", on_click: on_dec) { }
+    @ window "tiu · counter" (size: 380x300) {
+        @ column "root" (w: fill, h: fill, pad: 20, gap: 14) {
+            @ row "head" (w: fill, x: space-between, y: center) {
+                @ label "title" (text: "计数器", font-size: 20)
+                @ label "chip" (text: "元素语法", font-size: 12, h: 22, fg: "accent", bg: "accent-soft", radius: 6, pad-x: 8)
             }
+            @ panel "card" (w: fill, h: fill, bg: "surface", stroke: "border", radius: 14, pad: 20, gap: 10, y: start) {
+                @ label "caption" (text: "当前计数", font-size: 13, fg: "fg-dim")
+                @ label "value" (text: "计数 " + to_string(g_count), font-size: 40)
+                @ label "hint" (text: "点击 +1 / -1 改变数值", font-size: 12, fg: "fg-dim")
+                @ row "ops" (w: fill, gap: 10, y: end) {
+                    @ button "inc" (w: 108, h: 38, radius: 9, text: "+1", on_click: on_inc) { }
+                    @ button "dec" (w: 108, h: 38, radius: 9, text: "-1", bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_dec) { }
+                    @ button "reset" (w: 108, h: 38, radius: 9, text: "归零", bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_reset) { }
+                }
+            }
+            @ label "foot" (text: "tiu ui · 软件光栅 · TTF 文本", font-size: 11, fg: "fg-dim")
         }
     }
     return ui.count()
@@ -67,6 +82,7 @@ func click(id: i64) {
 func check() -> i64 {
     tiu_win.theme(0)
     var face = tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     if face < 0 {
         println("FAIL 字体装载")
         return 1
@@ -87,6 +103,16 @@ func check() -> i64 {
         bad = bad + 1
     } else {
         println("OK 按钮有墨迹 ink=" + to_string(ink) + " rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
+    }
+    // 卡片底色与窗口底色必须可区分（视觉系统生效的证据）
+    var card = ui_bridge.node_of_ui(ui.find("card"))
+    var cr = tiu_tree.rect(card)
+    var cpx = tiu_win.px(fb, cr.x + 12, cr.y + cr.h / 2)
+    if cpx == bg {
+        println("FAIL 卡片底色与窗口底色相同")
+        bad = bad + 1
+    } else {
+        println("OK 卡片底色 " + to_string(cpx) + " 窗口 " + to_string(bg))
     }
     click(inc)
     var segs2 = tiu_win.frame(W, H, view)
@@ -127,5 +153,6 @@ func main() -> i64 {
     }
     tiu_win.theme(0)
     tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
     return tiu_win_host.run("tiu · counter", W, H, rounds, view)
 }
