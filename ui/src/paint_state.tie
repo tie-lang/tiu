@@ -21,6 +21,7 @@ type tie<class>
 //   -1 = 未设置；>= 0xFF000000 = 直接 ARGB（原样返回）。
 
 import "./theme.tie"
+import "./palette.tie"
 import "./props.tie"
 
 // 圆角默认值（属性未设 radius 时生效；属性值优先）。
@@ -70,6 +71,10 @@ pub func color_of(th: i64, cc: i64) -> i64 {
     }
     if cc == 0 {
         return 0x00000000
+    }
+    var ov = tpal.lookup(cc)
+    if ov != -1 {
+        return ov
     }
     if cc == 1 {
         return uth.bg(th)
@@ -139,14 +144,15 @@ pub func card_border(th: i64) -> i64 {
 
 // ---- 按钮 ----
 
+// 控件默认色也走 color_of，皮肤（theme 单元）才能接管按钮/输入框的默认配色。
 pub func button_bg(th: i64, hot: i64, act: i64) -> i64 {
     if act == 1 {
-        return uth.accent_down(th)
+        return color_of(th, 9)
     }
     if hot == 1 {
-        return uth.accent_hot(th)
+        return color_of(th, 8)
     }
-    return uth.accent(th)
+    return color_of(th, 7)
 }
 
 // ---- 列表行 / 分隔线 ----
@@ -174,26 +180,26 @@ pub func sep(th: i64) -> i64 {
 
 pub func input_bg(th: i64, focus: i64) -> i64 {
     if focus == 1 {
-        return mix(uth.surface_alt(th), uth.accent(th), 10)
+        return mix(color_of(th, 3), color_of(th, 7), 10)
     }
-    return uth.surface_alt(th)
+    return color_of(th, 3)
 }
 
 pub func input_border(th: i64, focus: i64) -> i64 {
     if focus == 1 {
-        return uth.accent(th)
+        return color_of(th, 7)
     }
-    return uth.border_strong(th)
+    return color_of(th, 5)
 }
 
 // ---- 焦点环 / 文本光标 ----
 
 pub func focus_ring(th: i64) -> i64 {
-    return uth.fg(th)
+    return color_of(th, 11)
 }
 
 pub func caret(th: i64) -> i64 {
-    return uth.accent(th)
+    return color_of(th, 7)
 }
 
 // ---- 图像占位框（无像素数据时） ----

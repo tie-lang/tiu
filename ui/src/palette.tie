@@ -1,0 +1,214 @@
+type tie<class>
+// palette.tie —— 皮肤与颜色覆盖（`theme 名 { 键: 值 }` 单元）
+// palette.tie — skins: per-token colour overrides written as `theme` units.
+// ============================================================
+// 语法（见 docs/designs/tiu-layout-syntax.md §8）：
+//
+//   theme 暖 {
+//       bg: "#1a1512"
+//       accent: "#ff8a5c"
+//       fg: "#f4efe9"
+//   }
+//
+//   @ window "..." (skin: 暖) { ... }
+//
+// 语义：
+//   * 皮肤只是 token → 颜色 的覆盖表，不改变控件结构，也不改变 dark/light 主题。
+//   * 未覆盖的 token 仍然走 `uth`（theme.tie）的默认值，因此皮肤可以只改一个 accent。
+//   * 同一皮肤内重复声明同一个 token 以后写的那条为准（与 style 的报错策略不同：
+//     皮肤是「调色」，手改一处不该让整个程序编不过）。
+//   * 值可以是 `#RRGGBB`、`#AARRGGBB`，或十进制 ARGB；其它写法视为无效，忽略并计数。
+//   * 皮肤跨帧保留（单元表由程序入口注册一次），选中的皮肤也只在一处确定：
+//     桥接每次构建前读 window 元素的 `skin` 属性。
+import "./theme.tie"
+
+var g_pa_names: table<string> = []
+var g_pa_sid: table<i64> = []
+var g_pa_key: table<string> = []
+var g_pa_argb: table<i64> = []
+var g_pa_sel: i64 = -1
+var g_pa_bad: i64 = 0
+
+namespace tpal {
+
+    // token 名 → 颜色码（与 paint_state.color_of 的分支一致）。
+    pub func token_code(key: string) -> i64 {
+        if key == "bg" { return 1 }
+        if key == "surface" { return 2 }
+        if key == "surface-alt" { return 3 }
+        if key == "border" { return 4 }
+        if key == "border-strong" { return 5 }
+        if key == "separator" { return 6 }
+        if key == "accent" { return 7 }
+        if key == "accent-hot" { return 8 }
+        if key == "accent-down" { return 9 }
+        if key == "accent-soft" { return 10 }
+        if key == "fg" { return 11 }
+        if key == "fg-dim" { return 12 }
+        if key == "on-accent" { return 13 }
+        if key == "shadow" { return 14 }
+        if key == "hover" { return 15 }
+        return -1
+    }
+
+    func hex_digit(ch: string) -> i64 {
+        if ch >= "0" && ch <= "9" { return char_code(ch) - 48 }
+        if ch >= "a" && ch <= "f" { return char_code(ch) - 87 }
+        if ch >= "A" && ch <= "F" { return char_code(ch) - 55 }
+        return -1
+    }
+
+    // "#RRGGBB" / "#AARRGGBB" / 十进制 ARGB → ARGB；无效返回 -1。
+    pub func parse_color(s: string) -> i64 {
+        var t = trim(s)
+        // 单元声明里的值保留书写原文，字符串字面量带引号，这里去掉。
+        if str_len(t) >= 2 && str_char(t, 0) == "\"" && str_char(t, str_len(t) - 1) == "\"" {
+            t = str_sub_bytes(t, 1, str_len(t) - 1)
+        }
+        if t == "" {
+            return -1
+        }
+        if str_char(t, 0) == "#" {
+            var n = str_len(t) - 1
+            if n != 6 && n != 8 {
+                return -1
+            }
+            var v: i64 = 0
+            var i: i64 = 1
+            while i < str_len(t) {
+                var d = hex_digit(str_char(t, i))
+                if d < 0 {
+                    return -1
+                }
+                v = (v << 4) | d
+                i = i + 1
+            }
+            if n == 6 {
+                return 0xFF000000 | v
+            }
+            return v
+        }
+        var k: i64 = 0
+        while k < str_len(t) {
+            var ch = str_char(t, k)
+            if ch < "0" || ch > "9" {
+                return -1
+            }
+            k = k + 1
+        }
+        return to_i64(t)
+    }
+
+    pub func reset() {
+        g_pa_names = table_new_string()
+        g_pa_sid = []
+        g_pa_key = table_new_string()
+        g_pa_argb = []
+        g_pa_sel = -1
+        g_pa_bad = 0
+    }
+
+    func skin_of(name: string) -> i64 {
+        var i: i64 = 0
+        while i < len(g_pa_names) {
+            if g_pa_names[i] == name {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    pub func add(name: string) -> i64 {
+        var id = skin_of(name)
+        if id >= 0 {
+            return id
+        }
+        var nid = len(g_pa_names)
+        table_push(g_pa_names, name)
+        return nid
+    }
+
+    // 返回 0 = 已登记，-1 = 值无法解析（被忽略）。
+    pub func add_decl(name: string, key: string, value: string) -> i64 {
+        var cc = token_code(key)
+        var argb = parse_color(value)
+        if cc < 0 || argb < 0 {
+            g_pa_bad = g_pa_bad + 1
+            return -1
+        }
+        var id = add(name)
+        // 同皮肤同 token 覆盖：后写赢。
+        var i: i64 = 0
+        while i < len(g_pa_key) {
+            if g_pa_sid[i] == id && g_pa_key[i] == key {
+                g_pa_argb[i] = argb
+                return 0
+            }
+            i = i + 1
+        }
+        table_push(g_pa_sid, id)
+        table_push(g_pa_key, key)
+        table_push(g_pa_argb, argb)
+        return 0
+    }
+
+    pub func select(name: string) -> i64 {
+        if name == "" {
+            g_pa_sel = -1
+            return -1
+        }
+        g_pa_sel = skin_of(name)
+        return g_pa_sel
+    }
+
+    pub func selected() -> string {
+        if g_pa_sel < 0 || g_pa_sel >= len(g_pa_names) {
+            return ""
+        }
+        return g_pa_names[g_pa_sel]
+    }
+
+    pub func has(name: string) -> bool {
+        return skin_of(name) >= 0
+    }
+
+    pub func skin_count() -> i64 {
+        return len(g_pa_names)
+    }
+
+    pub func decl_count(name: string) -> i64 {
+        var id = skin_of(name)
+        if id < 0 {
+            return 0
+        }
+        var n: i64 = 0
+        var i: i64 = 0
+        while i < len(g_pa_key) {
+            if g_pa_sid[i] == id {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        return n
+    }
+
+    pub func bad_count() -> i64 {
+        return g_pa_bad
+    }
+
+    // 当前皮肤对颜色码 cc 的覆盖；-1 = 没有覆盖。
+    pub func lookup(cc: i64) -> i64 {
+        if g_pa_sel < 0 {
+            return -1
+        }
+        var i: i64 = 0
+        while i < len(g_pa_key) {
+            if g_pa_sid[i] == g_pa_sel && token_code(g_pa_key[i]) == cc {
+                return g_pa_argb[i]
+            }
+            i = i + 1
+        }
+        return -1
+    }
+}

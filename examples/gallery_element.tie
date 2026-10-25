@@ -87,6 +87,23 @@ func on_pick_c(id: i64, x: i64, y: i64, kind: string) -> i64 {
 // ---- 样式单元：按名引用，内联属性优先 ----
 // 这里刻意只写「会被复用、且不同控件要一致」的部分；几何（w/h）留在元素上，
 // 因为同一张卡片在窄屏与宽屏的宽度来源不同，写进样式反而要开新样式。
+// 皮肤：只覆盖需要改的 token，其余仍走 theme.tie 的 dark/light 默认值。
+// EN: a skin overrides a few tokens; the rest still come from the dark/light theme.
+theme 暖 {
+    bg: "#171310"
+    surface: "#221c17"
+    surface-alt: "#2b241d"
+    accent: "#ff8a5c"
+    accent-hot: "#ffa273"
+    accent-down: "#e97445"
+    accent-soft: "#3a2a22"
+    fg: "#f4ece4"
+    fg-dim: "#ab9a8c"
+    border: "#3a3129"
+    border-strong: "#4d4136"
+    separator: "#312922"
+}
+
 style card {
     bg: surface
     stroke: border
@@ -126,7 +143,7 @@ style item {
 pub func view() -> i64 {
     g_frames = g_frames + 1
     ui.reset()
-    @ window "tiu · 组件画廊" (size: 560x420, bg: "bg") {
+    @ window "tiu · 组件画廊" (size: 560x420, bg: "bg", skin: 暖) {
         @ column "root" (w: fill, h: fill, pad: 24, gap: 18) {
             // 页头：标题 / 副标题 / 右侧状态徽标
             @ row "head" (w: fill, x: space-between, y: center, gap: 16) {
@@ -235,11 +252,12 @@ func check() -> i64 {
     }
     var fb = tiu_win.render(W, H)
     var bg = tiu_win.px(fb, 1, 1)
-    if bg != 0xFF12141A {
-        println("FAIL 窗口底色不是 bg token px=" + to_string(bg))
+    // 期望值来自 `theme 暖` 皮肤覆盖；换皮肤时这两处断言要一起改。
+    if bg != 0xFF171310 {
+        println("FAIL 窗口底色不是皮肤 bg px=" + to_string(bg))
         bad = bad + 1
     } else {
-        println("OK 窗口底色 bg token")
+        println("OK 窗口底色 bg token（皮肤 暖 覆盖）")
     }
 
     // 1) 按钮真的画出墨迹，且矩形来自布局求解
@@ -253,11 +271,20 @@ func check() -> i64 {
         println("OK 按钮有墨迹 ink=" + to_string(ink) + " rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
     }
 
+    // 1b) 皮肤真的接管了 token：主按钮底色 = 皮肤里的 accent (#ff8a5c)
+    var apx = tiu_win.px(fb, r.x + r.w - 8, r.y + r.h / 2)
+    if apx != 0xFFFF8A5C {
+        println("FAIL 主按钮底色不是皮肤 accent px=" + to_string(apx))
+        bad = bad + 1
+    } else {
+        println("OK 皮肤 accent 生效 #FF8A5C")
+    }
+
     // 2) 卡片铺的是 surface 底色（取卡片右下角内侧，避开文字）
     var card = ui_bridge.node_of_ui(ui.find("card1"))
     var rc = tiu_tree.rect(card)
     var cpx = tiu_win.px(fb, rc.x + rc.w - 6, rc.y + rc.h - 6)
-    if cpx != 0xFF191C23 {
+    if cpx != 0xFF221C17 {
         println("FAIL 卡片底色不是 surface px=" + to_string(cpx))
         bad = bad + 1
     } else {
@@ -303,7 +330,7 @@ func check() -> i64 {
     if g_pick != "选项 B" {
         println("FAIL 列表选择未生效 pick=" + g_pick)
         bad = bad + 1
-    } else if spx != 0xFF1B2A45 {
+    } else if spx != 0xFF3A2A22 {
         println("FAIL 选中行底色不是 accent-soft px=" + to_string(spx))
         bad = bad + 1
     } else {

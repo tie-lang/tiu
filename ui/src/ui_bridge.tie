@@ -480,6 +480,7 @@ pub func build_at(w: i64, h: i64) -> i64 {
     // 样式：每帧先失效声明缓存，再把 `style: 名` 的声明摊到节点上。
     // 必须在发射节点之前做——桥接只读属性，不看样式单元。
     tiu_style.reset()
+    tiu_style.apply_skin()
     tiu_style.apply_all()
     tiu_build.begin()
     var roots = ui.root_count()
@@ -533,6 +534,7 @@ pub func build_frame(w: i64, h: i64) -> i64 {
     g_view_h = h
     // 样式：view() 每帧重建元素树，声明得重新摊一次。
     // `build_at` 是整树重建（自带 reset）；这里是增量帧，不能漏。
+    tiu_style.apply_skin()
     tiu_style.apply_all()
     if tiu_tree.root() < 0 {
         ledger_clear()

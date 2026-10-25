@@ -27,6 +27,7 @@ type tie<class>
 // EN: `style: <name>`; inline attributes always win, so the pass only fills
 // EN: keys the node does not already declare.
 import "/std/ui.tie" as ui
+import "./palette.tie"
 
 // 解析结果：三张平行表（样式名 / 键 / 值），按声明顺序。
 var g_parsed: i64 = 0
@@ -107,6 +108,7 @@ namespace tiu_style {
     // 单元表每帧重建，解析结果必须跟着失效。
     pub func reset() {
         g_parsed = 0
+        tpal.reset()
         g_owner = table_new_string()
         g_key = table_new_string()
         g_val = table_new_string()
@@ -121,6 +123,15 @@ namespace tiu_style {
         var n = ui.unit_count()
         var u: i64 = 0
         while u < n {
+            if ui.unit_kind_at(u) == "theme" {
+                var tname = ui.unit_name_at(u)
+                var tparts = decl_parts(ui.unit_payload_at(u))
+                var t: i64 = 0
+                while t + 1 < len(tparts) {
+                    tpal.add_decl(tname, tparts[t], tparts[t + 1])
+                    t = t + 2
+                }
+            }
             if ui.unit_kind_at(u) == "style" {
                 var name = ui.unit_name_at(u)
                 var parts = decl_parts(ui.unit_payload_at(u))
@@ -167,6 +178,27 @@ namespace tiu_style {
             i = i + 1
         }
         return n
+    }
+
+    // 按 window 元素的 `skin` 属性选定皮肤；无 window 或无该属性时保持当前选择。
+    pub func apply_skin() -> i64 {
+        // 皮肤也在单元表里，先解析再选，否则选到的是空表。
+        if g_parsed == 0 {
+            parse()
+        }
+        var n = ui.count()
+        var i: i64 = 0
+        while i < n {
+            if ui.kind_at(i) == "window" {
+                var sk = ui.attr_of(i, "skin")
+                if sk != "" {
+                    return tpal.select(sk)
+                }
+                return -1
+            }
+            i = i + 1
+        }
+        return -1
     }
 
     // 把样式声明摊到所有引用它的节点上；返回实际写入的属性条数。
