@@ -360,6 +360,44 @@ func dist_cross(n: i64, a_cross: i64) -> i64 {
 //   过渡约定（稿 §6，字形表就绪前）：advance = font_size × 3 / 5，
 //   即每字符 0.6 em；返回 26.6 定点总宽度。
 //   TODO(font-link): 与光栅共用同一份 advance（稿 §6 末条），接入后删除此估算。
+// 文本按显式换行符切行：返回第 i 行的子串（不复制，逐字符扫描）。
+pub func line_count(s: string) -> i64 {
+    var n = str_len(s)
+    var i: i64 = 0
+    var cnt: i64 = 1
+    while i < n {
+        if char_code(str_char(s, i)) == 10 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+pub func line_at(s: string, idx: i64) -> string {
+    var n = str_len(s)
+    var i: i64 = 0
+    var cur: i64 = 0
+    var out: string = ""
+    while i < n {
+        var ch = str_char(s, i)
+        if char_code(ch) == 10 {
+            if cur == idx {
+                return out
+            }
+            cur = cur + 1
+            out = ""
+        } else if cur == idx {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    if cur == idx {
+        return out
+    }
+    return ""
+}
+
 pub func measure_text(s: string, font_size: i64) -> i64 {
     var fs = font_size
     if fs <= 0 {
@@ -376,19 +414,36 @@ pub func measure_text(s: string, font_size: i64) -> i64 {
             efont.chain_reset(g_face)
         }
         var fd = to_f64(fs)
-        var tot: i64 = 0
+        // 有显式换行时逐行度量，宽度取最长行（与光栅逐行绘制的宽度一致）。
+        var cur: i64 = 0
+        var best: i64 = 0
         var i: i64 = 0
         while i < n {
-            var cp = utfmin.to_cp(str_char(s, i))
-            tot = tot + efont.chain_advance(cp, fd)
+            var ch = str_char(s, i)
+            if char_code(ch) == 10 {
+                if cur > best {
+                    best = cur
+                }
+                cur = 0
+            } else {
+                cur = cur + efont.chain_advance(utfmin.to_cp(ch), fd)
+            }
             i = i + 1
         }
-        return tot
+        if cur > best {
+            best = cur
+        }
+        return best
     }
     // 未装字体时的过渡估算：advance(fs) = fs × 3/5 px。
     // 总宽按整串一次算（不是逐字截断再相加），保证「宽度 = Σadvance」精确成立：
     //   advance(fs) = fs × 3/5 px ⇒ 总宽 = fs × 3/5 × n，定点后一次除法。
-    return (fs * 3 * FP_ONE * n) / 5;
+    var lines = line_count(s)
+    if lines <= 1 {
+        return (fs * 3 * FP_ONE * n) / 5
+    }
+    // 多行时每行去掉一个换行符，宽度取最长行。
+    return (fs * 3 * FP_ONE * (n - (lines - 1))) / 5;
 }
 
 // 文本单行高度 = 字号（稿 §6：行高按字号；折行未接入，见文件头 I3）
@@ -503,7 +558,7 @@ func content_hug(n: i64, axis: i64) -> i64 {
         if axis == 0 {
             return measure_text(tiu_tree.text_of(n), tget(s_font, n))
         }
-        return text_line_h(tget(s_font, n))
+        return text_line_h(tget(s_font, n)) * line_count(tiu_tree.text_of(n))
     }
     if ty == 7 {
         // Image：尚无固有尺寸通道（资源句柄只到绘制层），hug 记 0

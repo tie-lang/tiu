@@ -447,7 +447,19 @@ func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     if fg < 0 {
         fg = uth.fg(st.th)
     }
-    return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(fg))
+    var lines = tiu_layout2.line_count(s)
+    if lines <= 1 {
+        return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(fg))
+    }
+    var lh = to_f64(tiu_layout2.to_px(tiu_layout2.text_line_h(fs)))
+    var y = to_f64(r.y)
+    var i: i64 = 0
+    while i < lines {
+        d = dl.text_p(d, tiu_layout2.line_at(s, i), to_f64(r.x), y, to_f64(fs), solid(fg))
+        y = y + lh
+        i = i + 1
+    }
+    return d
 }
 
 // Button：圆角底色 + 居中标签；hot/active 换底色，focus 加 1px 焦点环。

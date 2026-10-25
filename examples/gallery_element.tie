@@ -227,7 +227,8 @@ pub func view() -> i64 {
             // 页脚
             @ row "foot" (w: fill, x: space-between, y: end) {
                 @ label "ver" (text: "tiu ui · software raster · TTF 文本", font-size: 12, fg: "fg-dim")
-                @ label "hint2" (text: "点击「+1」或列表项试试", font-size: 12, fg: "fg-dim")
+                @ label "hint2" (text: "点击「+1」或列表项试试
+滚轮滚动列表 · 皮肤换色", font-size: 12, fg: "fg-dim")
             }
         }
     }
