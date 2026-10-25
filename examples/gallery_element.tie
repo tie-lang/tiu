@@ -84,6 +84,44 @@ func on_pick_c(id: i64, x: i64, y: i64, kind: string) -> i64 {
 // 列表行的配色不靠运行时拼接：选不选中渲染两棵不同的子树。
 // （`bg` 是字面量属性键，值在编译期捕获；要随状态变化就换渲染分支。）
 
+// ---- 样式单元：按名引用，内联属性优先 ----
+// 这里刻意只写「会被复用、且不同控件要一致」的部分；几何（w/h）留在元素上，
+// 因为同一张卡片在窄屏与宽屏的宽度来源不同，写进样式反而要开新样式。
+style card {
+    bg: surface
+    stroke: border
+    radius: 12
+    pad: 18
+    gap: 12
+    y: start
+}
+
+style chip {
+    bg: accent-soft
+    radius: 8
+    pad-x: 10
+    pad-y: 5
+    gap: 6
+    y: center
+}
+
+style ghostbtn {
+    w: 84
+    h: 34
+    bg: transparent
+    stroke: border-strong
+    fg: fg
+}
+
+style item {
+    w: fill
+    h: 36
+    radius: 8
+    pad-x: 12
+    gap: 10
+    y: center
+}
+
 // ---- 视图：整棵树用元素语法写 ----
 pub func view() -> i64 {
     g_frames = g_frames + 1
@@ -96,7 +134,7 @@ pub func view() -> i64 {
                     @ label "title" (text: "tiu · 组件画廊", font-size: 22, fg: "fg")
                     @ label "sub" (text: "元素语法 · 布局求解 · 绘制桥 · 事件轴", font-size: 13, fg: "fg-dim")
                 }
-                @ row "chip" (bg: "accent-soft", radius: 8, pad-x: 10, pad-y: 5, gap: 6, y: center) {
+                @ row "chip" (style: chip) {
                     @ label "chipdot" (text: "●", font-size: 11, fg: "accent")
                     @ label "chiptxt" (text: "软件光栅", font-size: 12, fg: "accent")
                 }
@@ -108,60 +146,60 @@ pub func view() -> i64 {
             // 主体：两张卡片
             @ row "body" (w: fill, h: fill, gap: 18, y: start) {
                 // 卡片一：计数器
-                @ panel "card1" (w: 1fr, bg: "surface", stroke: "border", radius: 12, pad: 18, gap: 12, y: start) {
+                @ panel "card1" (style: card, w: 1fr) {
                     @ label "s1" (text: "计数器", font-size: 13, fg: "fg-dim")
                     @ label "count" (text: "计数 " + to_string(g_count), font-size: 28, fg: "fg")
                     @ row "btns" (w: fill, gap: 8, y: end) {
                         @ button "inc" (text: "+1", w: 84, h: 34, on_click: on_inc)
-                        @ button "dec" (text: "-1", w: 84, h: 34, bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_dec)
-                        @ button "reset" (text: "归零", w: 84, h: 34, bg: "transparent", stroke: "border-strong", fg: "fg", on_click: on_reset)
+                        @ button "dec" (text: "-1", w: 84, h: 34, style: ghostbtn, on_click: on_dec)
+                        @ button "reset" (text: "归零", w: 84, h: 34, style: ghostbtn, on_click: on_reset)
                     }
                 }
 
                 // 卡片二：列表选择
-                @ panel "card2" (w: 1fr, bg: "surface", stroke: "border", radius: 12, pad: 18, gap: 10, y: start) {
+                @ panel "card2" (style: card, w: 1fr, gap: 10) {
                     @ label "s2" (text: "列表 · 点击选择", font-size: 13, fg: "fg-dim")
                     @ scroll "items" (w: fill, h: 132, gap: 6, pad-right: 10, overflow: scroll) {
                         if g_pick == "选项 A" {
-                            @ row "ra" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_a) {
+                            @ row "ra" (style: item, bg: "accent-soft", on_click: on_pick_a) {
                                 @ row "ra_bar" (w: 3, h: fill, radius: 2, bg: "accent")
                                 @ label "ra_txt" (text: "选项 A", font-size: 14, fg: "accent")
                             }
                         } else {
-                            @ row "ra" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_a) {
+                            @ row "ra" (style: item, on_click: on_pick_a) {
                                 @ row "ra_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
                                 @ label "ra_txt" (text: "选项 A", font-size: 14, fg: "fg")
                             }
                         }
                         if g_pick == "选项 B" {
-                            @ row "rb" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_b) {
+                            @ row "rb" (style: item, bg: "accent-soft", on_click: on_pick_b) {
                                 @ row "rb_bar" (w: 3, h: fill, radius: 2, bg: "accent")
                                 @ label "rb_txt" (text: "选项 B", font-size: 14, fg: "accent")
                             }
                         } else {
-                            @ row "rb" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_b) {
+                            @ row "rb" (style: item, on_click: on_pick_b) {
                                 @ row "rb_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
                                 @ label "rb_txt" (text: "选项 B", font-size: 14, fg: "fg")
                             }
                         }
                         if g_pick == "选项 C" {
-                            @ row "rc" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, bg: "accent-soft", on_click: on_pick_c) {
+                            @ row "rc" (style: item, bg: "accent-soft", on_click: on_pick_c) {
                                 @ row "rc_bar" (w: 3, h: fill, radius: 2, bg: "accent")
                                 @ label "rc_txt" (text: "选项 C", font-size: 14, fg: "accent")
                             }
                         } else {
-                            @ row "rc" (w: fill, h: 36, radius: 8, pad-x: 12, gap: 10, y: center, on_click: on_pick_c) {
+                            @ row "rc" (style: item, on_click: on_pick_c) {
                                 @ row "rc_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
                                 @ label "rc_txt" (text: "选项 C", font-size: 14, fg: "fg")
                             }
                         }
-                        @ row "rd" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                        @ row "rd" (style: item, bg: "surface-alt") {
                             @ label "rd_txt" (text: "选项 D · 只在滚动区里", font-size: 14, fg: "fg-dim")
                         }
-                        @ row "re" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                        @ row "re" (style: item, bg: "surface-alt") {
                             @ label "re_txt" (text: "选项 E · 滚轮试试", font-size: 14, fg: "fg-dim")
                         }
-                        @ row "rf" (w: fill, h: 36, radius: 8, pad-x: 12, y: center, bg: "surface-alt") {
+                        @ row "rf" (style: item, bg: "surface-alt") {
                             @ label "rf_txt" (text: "选项 F · 最近一条", font-size: 14, fg: "fg-dim")
                         }
                     }
