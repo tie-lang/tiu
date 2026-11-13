@@ -438,6 +438,80 @@ func edge_ring(d: DrawList, r: Rect, c: i64) -> DrawList {
 
 // Text：按节点字号绘制；有折行缓存时逐行走缓存，否则按显式换行切行。
 // 文本从内容盒左上角起排（pad 计入），与布局度量用的内容宽保持一致。
+// 内容盒宽（像素，负值归 0）：对齐与省略号都在内容盒内计算。
+func text_content_w(r: Rect, id: i64) -> i64 {
+    var w = r.w - tiu_props.pad_l(id) - tiu_props.pad_r(id)
+    if w < 0 {
+        return 0
+    }
+    return w
+}
+
+// 一行文本的起排 x：start 左对齐；center/end 在内容盒内居中/靠右；
+// 行比内容盒还宽时退回左对齐（此时按 overflow 决定裁剪还是省略）。
+func text_line_x(r: Rect, id: i64, line: string, fs: i64) -> i64 {
+    var x0 = r.x + tiu_props.pad_l(id)
+    var al = tiu_props.text_align(id)
+    if al == 0 {
+        return x0
+    }
+    var cw = text_content_w(r, id)
+    var lw = tiu_layout2.to_px(tiu_layout2.measure_text(line, fs))
+    if cw <= lw {
+        return x0
+    }
+    if al == 1 {
+        return x0 + (cw - lw) / 2
+    }
+    return x0 + (cw - lw)
+}
+
+// 单行超宽时截成「放得下的前缀 + …」：预留省略号宽度，逐字累加 advance。
+// 比较全程用 26.6 定点（逐字取整会在长串上漂移到多塞或少塞一个字）；
+// 省略号本身都放不下时返回空串，由调用方按空文本处理。
+func ellipsize(s: string, fs: i64, cw: i64) -> string {
+    var cwfp = tiu_layout2.to_fp(cw)
+    var ell = tiu_layout2.measure_text("…", fs)
+    if ell > cwfp {
+        return ""
+    }
+    var budget = cwfp - ell
+    var n = str_len(s)
+    var acc: i64 = 0
+    var cut: i64 = 0
+    var i: i64 = 0
+    var go: i64 = 1
+    while i < n && go == 1 {
+        var adv = tiu_layout2.advance_of(str_char(s, i), fs)
+        if acc + adv > budget {
+            go = 0
+        } else {
+            acc = acc + adv
+            cut = i + 1
+            i = i + 1
+        }
+    }
+    var sb = string_builder()
+    var k: i64 = 0
+    while k < cut {
+        sb_append(sb, str_char(s, k))
+        k = k + 1
+    }
+    sb_append(sb, "…")
+    return sb_build(sb)
+}
+
+// 画一行：按 text-align 定 x；声明了 overflow: ellipsis 且单行超宽时先截断。
+func text_draw_line(d: DrawList, r: Rect, id: i64, one: string, fs: i64, fg: i64, y: f64, cw: i64, ell: i64) -> DrawList {
+    var s = one
+    if ell == 1 && cw > 0 {
+        if tiu_layout2.measure_text(s, fs) > tiu_layout2.to_fp(cw) {
+            s = ellipsize(s, fs, cw)
+        }
+    }
+    return dl.text_p(d, s, to_f64(text_line_x(r, id, s, fs)), y, to_f64(fs), solid(fg))
+}
+
 func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     var s = tiu_tree.text_of(id)
     if str_len(s) == 0 {
@@ -448,16 +522,20 @@ func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     if fg < 0 {
         fg = uth.fg(st.th)
     }
-    var x = to_f64(r.x + tiu_props.pad_l(id))
     var y0 = to_f64(r.y + tiu_props.pad_t(id))
     var lh = to_f64(tiu_layout2.to_px(tiu_layout2.text_line_h(fs)))
+    var cw = text_content_w(r, id)
+    var ell: i64 = 0
+    if tiu_props.overflow(id) == 4 {
+        ell = 1
+    }
     // 断行结果由布局阶段 4 算好缓存：这里只消费，行数必然与布局一致。
     var wc = tiu_layout2.wrap_count(id)
     if wc >= 1 {
         var yw = y0
         var j: i64 = 0
         while j < wc {
-            d = dl.text_p(d, tiu_layout2.wrap_line(id, j), x, yw, to_f64(fs), solid(fg))
+            d = text_draw_line(d, r, id, tiu_layout2.wrap_line(id, j), fs, fg, yw, cw, ell)
             yw = yw + lh
             j = j + 1
         }
@@ -465,12 +543,12 @@ func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     }
     var lines = tiu_layout2.line_count(s)
     if lines <= 1 {
-        return dl.text_p(d, s, x, y0, to_f64(fs), solid(fg))
+        return text_draw_line(d, r, id, s, fs, fg, y0, cw, ell)
     }
     var y = y0
     var i: i64 = 0
     while i < lines {
-        d = dl.text_p(d, tiu_layout2.line_at(s, i), x, y, to_f64(fs), solid(fg))
+        d = text_draw_line(d, r, id, tiu_layout2.line_at(s, i), fs, fg, y, cw, ell)
         y = y + lh
         i = i + 1
     }

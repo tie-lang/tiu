@@ -39,7 +39,8 @@ type tie<class>
 //   examples\counter.tie 仍走旧路径，两者并行存在直到控件工厂切换。
 //
 // 已知未实现（均在报告里列出）：grid 的 rows（稿允许，本次交付按任务书只做
-//   cols + 行高 hug）；文本 text-align 与 overflow:ellipsis；样式表合并（§8）。
+//   cols + 行高 hug）；样式表合并（§8）；关键字形式的 overflow: ellipsis
+//   （策略已实现，语法层待扩 tie 主仓的 Overflow 枚举）。
 
 import "./tree.tie"
 import "./props.tie"
@@ -134,6 +135,11 @@ pub func to_px(v: i64) -> i64 {
         return (v + FP_HALF) / FP_ONE
     }
     return -((-v + FP_HALF) / FP_ONE)
+}
+
+// 整数像素 → 定点（供光栅侧做同一套度量：对齐与省略号都要按定点判断放不放得下）
+pub func to_fp(px: i64) -> i64 {
+    return fpx(px)
 }
 
 // 定点 → 文本（保留两位小数；explain 与诊断共用，不做取整）
@@ -507,6 +513,11 @@ func adv_of(ch: string, fs: i64) -> i64 {
         return efont.chain_advance(utfmin.to_cp(ch), to_f64(fs))
     }
     return (fs * 3 * FP_ONE) / 5
+}
+
+// 光栅侧的同一个度量：省略号要逐字判断「放不放得下」，必须与断行用同一份 advance。
+pub func advance_of(ch: string, fs: i64) -> i64 {
+    return adv_of(ch, fs)
 }
 
 // 从 from 起一行的结束下标（不含）：返回 from 表示此处即换行（空行）；

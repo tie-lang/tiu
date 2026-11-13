@@ -77,6 +77,7 @@ var g_dy: table<i64> = []
 var g_radius: table<i64> = []
 var g_font: table<i64> = []      // 0 = 未显式设置（继承；见 font_size_own）
 var g_wrap: table<i64> = []      // 文本折行：-1 未声明（按控件默认）/ 0 关 / 1 开（§6）
+var g_align: table<i64> = []     // 文本对齐：0 start / 1 center / 2 end（§6）
 
 // ---- 样式名（静态引用，§8）----
 var g_style: table<string> = []
@@ -226,6 +227,8 @@ pub func pad_l(id: i64) -> i64 { return get(g_padl, id, 0) }
 //        1 开（宽度确定后贪心断行）
 pub func set_wrap(id: i64, v: i64) { put(g_wrap, id, v) }
 pub func wrap_kind(id: i64) -> i64 { return get(g_wrap, id, -1) }
+pub func set_text_align(id: i64, c: i64) { put(g_align, id, c) }
+pub func text_align(id: i64) -> i64 { return get(g_align, id, 0) }
 
 // 主轴相邻子项间距（§3：只接受长度；grid 同时作用于行列）
 pub func set_gap(id: i64, g: i64) { put(g_gap, id, g) }
@@ -523,6 +526,7 @@ pub func reset() {
     g_radius = table_new_i64()
     g_font = table_new_i64()
     g_wrap = table_new_i64()
+    g_align = table_new_i64()
     g_style = table_new_string()
     g_bg = table_new_i64()
     g_fg = table_new_i64()

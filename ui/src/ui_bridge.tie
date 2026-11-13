@@ -175,6 +175,10 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_overflow(node, aparse.overflow_code(s))
     }
+    s = ui.attr_of(uid, "text-align")
+    if s != "" {
+        tiu_props.set_text_align(node, aparse.align_code(s))
+    }
     s = ui.attr_of(uid, "anchor")
     if s != "" {
         tiu_props.set_anchor(node, aparse.anchor_code(s))
@@ -377,6 +381,7 @@ func reset_props(node: i64) {
     tiu_props.set_radius(node, 0)
     tiu_props.set_font_size(node, 0)
     tiu_props.set_wrap(node, 0 - 1)
+    tiu_props.set_text_align(node, 0)
     tiu_props.set_style(node, "")
     tiu_props.set_bg(node, 0 - 1)
     tiu_props.set_fg(node, 0 - 1)

@@ -163,6 +163,9 @@ place(container):
 * **高度细化阶段**：定宽文本按已解析内容宽断行 → 重算自身与祖先的 hug 高 → 重跑一次尺寸求解（宽度不变 ⇒ 断行不变 ⇒ 立即收敛；`ratio` 把高度折回宽度的写法最多再迭代两轮）。没有折行发生时该阶段不产生任何几何变化。
 * **布局与光栅共用一份断行结果**：断行时把每行文本缓存进布局状态，绘制按节点 id 逐行取用，行数天然一致（不再各自按 `\n` 重新切分）。
 * `wrap` 未在语法降级表登记，走 §9 的未登记键通道（`ui.attr_str`）落库，因此扩这个开关不需要改 tie 主仓。
+* **对齐**：`text-align` 的 `start`/`center`/`end` 在内容盒（扣掉左右内边距）内按该行字形宽度偏移；单行、显式换行的每一行、折行的每一行都走同一条路径，所以对齐只改横向位置、不改布局矩形。行宽超过内容盒时退回左对齐，`end` 不会把文字推出盒子。
+* **省略号**：`overflow: ellipsis` 的单行超宽文本按累计 advance 截断到「内容盒宽 − 省略号宽」，末尾补 `…`；逐字用 26.6 定点比较，避免逐字取整累积漂移。折行已把宽度消耗掉时不会走到省略号路径。
+* `text-align` 同样走 §9 未登记键通道；`overflow` 是登记键，关键字形式的 `overflow: ellipsis` 需先扩 tie 主仓的 `Overflow` 枚举，当前用属性通道 `ui.attr_str("overflow", "ellipsis")` 或 `tiu_props.set_overflow(id, 4)` 可达。
 
 度量结果按 `(字体, 字号, 文本)` 缓存；断行结果按 `(字体, 字号, 宽度, 文本)` 缓存——当前实现按节点缓存断行结果（一次布局内有效），跨帧缓存待接入。
 
@@ -298,7 +301,8 @@ ui.end()
 
 ## 13. 未决 / Open items
 
-* `text-align` 与文本 `overflow: ellipsis`：尚未实现，当前文本一律从内容盒左上角起排。
+* 关键字形式的 `overflow: ellipsis`：tiu 侧已实现该策略（属性通道可达），但语法层要把 `ellipsis` 加进 tie 主仓的 `Overflow` 枚举才算完整——需改 `std/ui.tie` 的 `enum Overflow` 与 `overflow_attr`、`lib/front/pstmt_ui.tie` 的 `ui_enum_variant`/`ui_enum_words`，并重编 tiec。
+* `text-align` 的 `justify`（两端对齐）不在规划内；当前只有 `start`/`center`/`end`。
 * 断行结果的跨帧缓存：现在每次布局重算一次，尚未按 `(字体, 字号, 宽度, 文本)` 命中复用。
 * `grid` 的 `span` 与自动流密集填充（暂不支持，先按固定列 + 行优先）。
 * 动画与布局的关系（变换不触发重排；尺寸动画走后置几何）。
