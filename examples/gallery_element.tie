@@ -160,6 +160,12 @@ pub func view() -> i64 {
             // 分隔线：1px 高的行，颜色取 separator
             @ row "line" (w: fill, h: 1, bg: "separator")
 
+            // 文本折行：定宽段落按内容宽贪心断行（label 的 wrap 默认为开）
+            @ panel "card0" (style: card, w: fill, gap: 6) {
+                @ label "wrap_s" (text: "文本折行 · soft wrap", font-size: 13, fg: "fg-dim")
+                @ label "wrap_p" (text: "宽度确定后贪心断行：空格之后可断，CJK 与长串在宽度边界硬断，显式换行优先；布局度量与光栅共用同一份断行结果。", w: fill, font-size: 13, fg: "fg")
+            }
+
             // 主体：两张卡片
             @ row "body" (w: fill, h: fill, gap: 18, y: start) {
                 // 卡片一：计数器
@@ -281,10 +287,10 @@ func check() -> i64 {
         println("OK 皮肤 accent 生效 #FF8A5C")
     }
 
-    // 2) 卡片铺的是 surface 底色（取卡片右下角内侧，避开文字）
+    // 2) 卡片铺的是 surface 底色（取卡片右侧中部，避开圆角与文字：圆角内取样会落到窗口底色上）
     var card = ui_bridge.node_of_ui(ui.find("card1"))
     var rc = tiu_tree.rect(card)
-    var cpx = tiu_win.px(fb, rc.x + rc.w - 6, rc.y + rc.h - 6)
+    var cpx = tiu_win.px(fb, rc.x + rc.w - 12, rc.y + rc.h / 2)
     if cpx != 0xFF221C17 {
         println("FAIL 卡片底色不是 surface px=" + to_string(cpx))
         bad = bad + 1
@@ -364,6 +370,15 @@ func check() -> i64 {
         bad = bad + 1
     } else {
         println("OK 滚轮滚动 off=" + to_string(off3) + " 画面已变")
+    }
+
+    // 7) 布局诊断：折行细化后不该有溢出/矛盾（§5、§6）
+    var dn = tiu_layout2.diag_count()
+    if dn != 0 {
+        println("FAIL 布局诊断 " + to_string(dn) + " 条 " + tiu_layout2.diag_at(0))
+        bad = bad + 1
+    } else {
+        println("OK 布局无诊断")
     }
 
     if bad == 0 {

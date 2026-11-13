@@ -287,6 +287,15 @@ namespace aparse {
         return v
     }
 
+    // ---- 开关 ----
+    // 布尔取值：true/yes/on/1 → 1；false/no/off/0 → 0；其余（含空）→ 1（出现即视为开）。
+    pub func bool_code(s: string) -> i64 {
+        if s == "false" || s == "no" || s == "off" || s == "0" {
+            return 0
+        }
+        return 1
+    }
+
     // ---- 颜色 ----
     // token 名 → 码（0..15）；`#RRGGBB` / `#AARRGGBB` → 直接 ARGB；未设置 / 未知 → -1。
     // 属性表里存码而非色值：换肤时不需要重建树。

@@ -5,12 +5,14 @@ type tie<class>
 // ============================================================
 // 设计依据：_local_only/design/layout-syntax.md §3/§4/§5/§7（属性真源见 props.tie）。
 //
-// 求解顺序（一次 layout 五个阶段，全部同步完成，无迭代收敛）：
+// 求解顺序（一次 layout 六个阶段；只有阶段 4 会重跑 2)+3)，最多两轮）：
 //   0) 字号继承：前序 dfs，font-size 是唯一可继承属性（em 的基准；根默认 16）
 //   1) measure_hug：**后序**算每节点内容 hug（文本度量 / 主轴 Σ+gap / 交叉轴 max）
 //   2) 根：以「窗口内容盒」为父给盒解析根的两轴尺寸（含 ratio 耦合与 clamp）
 //   3) distribute + place：**前序**逐节点给子项分尺寸、落位、判溢出
-//   4) commit：把 26.6 定点四舍五入成整数像素写回树（set_rect）
+//   4) 折行细化：**后序**按已解析的内容宽重新度量文本行数与 hug 高，容器随之更新；
+//      只有在行数真变化时才用新高度重跑 2)+3)（宽度不变 ⇒ 断行不变 ⇒ 至多两轮收敛）
+//   5) commit：把 26.6 定点四舍五入成整数像素写回树（set_rect）
 //
 // 取整规则：内部一律 26.6 定点（1 单位 = 1/64 像素，FP_ONE=64）；分配时用整数
 //   除法向下取整 + 最大余数法补齐（份额之和恰好等于可用量，不产生累计漂移）；
@@ -21,8 +23,12 @@ type tie<class>
 //   I1 clamp 到 min/max 后让出的空间**不回灌**主轴——留在主轴由分布词吸收，
 //      避免「分配→夹取→再分配」的迭代收敛（本实现一次分配即定稿）。
 //   I2 rest < 0 时不压缩 hug 子项，直接判溢出（溢出只记录，不改几何）。
-//   I3 文本折行依赖字形度量，尚未接入：文本 hug 高固定为一行（见 measure_text）。
+//   I3 文本折行与字形度量同源（adv_of 与 measure_text 查同一条字体链）：文本 hug 宽仍取
+//      最长行（max-content），hug 高按「已解析内容宽下的断行行数」——折行只在阶段 4
+//      （宽度已知）发生，因此阶段 1 的文本高始终按显式换行算。
 //   I4 每节点保留约束来源（父给盒 s_aw/s_ah、自身意图、min/max、结果）供 explain。
+//   I5 折行只改高度不改宽度：阶段 4 重跑求解时宽度求解结果是同一组数，断行结果因此
+//      不再变化；若仍变化（ratio 耦合把高度折回宽度这种病态写法），最多再迭代两轮。
 //
 // 溢出（§5）：判定在 place 之后；clip / scroll 只记录裁剪位（s_ov），
 //   scroll 的滚动量是节点状态（tree.set_scroll），本模块不动它；
@@ -33,7 +39,7 @@ type tie<class>
 //   examples\counter.tie 仍走旧路径，两者并行存在直到控件工厂切换。
 //
 // 已知未实现（均在报告里列出）：grid 的 rows（稿允许，本次交付按任务书只做
-//   cols + 行高 hug）；文本折行；样式表合并（§8，属性表尚无样式展开）。
+//   cols + 行高 hug）；文本 text-align 与 overflow:ellipsis；样式表合并（§8）。
 
 import "./tree.tie"
 import "./props.tie"
@@ -90,6 +96,12 @@ var s_ok: table<i64> = []     // 定尺寸位：1=w 2=h（子项 % 的分母是�
 var g_win_w: i64 = 0          // 窗口内容盒（定点）
 var g_win_h: i64 = 0
 var g_diag: table<string> = []
+
+// ---- 折行（阶段 4）：宽度已解析后才断行 ----
+var g_text_wrap: i64 = 0      // 1 = 处于折行细化阶段（content_hug 按已解析宽度断行）
+var g_lbuf: table<string> = []   // 断行结果：每行子串，按节点区间共享（g_loff / g_lcnt 索引）
+var g_loff: table<i64> = []   // 节点 → 在 g_lbuf 中的起点
+var g_lcnt: table<i64> = []   // 节点 → 行数（0 = 无缓存，光栅走显式换行路径）
 
 namespace tiu_layout2 {
 
@@ -446,7 +458,7 @@ pub func measure_text(s: string, font_size: i64) -> i64 {
     return (fs * 3 * FP_ONE * (n - (lines - 1))) / 5;
 }
 
-// 文本单行高度 = 字号（稿 §6：行高按字号；折行未接入，见文件头 I3）
+// 文本单行高度：行高由字体给出（ascent + descent，见 efont.line_height），无字体时退化为字号
 pub func text_line_h(font_size: i64) -> i64 {
     var fs = font_size
     if fs <= 0 {
@@ -456,6 +468,160 @@ pub func text_line_h(font_size: i64) -> i64 {
         return efont.line_height(g_face, to_f64(fs))
     }
     return fs * FP_ONE
+}
+
+// ============================================================
+// 折行（稿 §6：宽度确定后贪心断行）
+//   断行机会：空格之后、显式换行之前；CJK 无空格 ⇒ 任意处可断（放不下就断）。
+//   断行结果按节点缓存成 (start,end) 偏移对，布局与光栅共用这一份，
+//   保证「布局量到的行数 = 光栅画出的行数」。
+// ============================================================
+
+// 是否折行：显式 wrap 优先，未声明时 text 折、button/input 不折（§6）。
+func wrap_on(n: i64) -> i64 {
+    var w = tiu_props.wrap_kind(n)
+    if w >= 0 {
+        return w
+    }
+    if tiu_tree.ty_of(n) == 2 {
+        return 1
+    }
+    return 0
+}
+
+// 定宽折行可用宽（内容盒，定点）：只在阶段 4 调用，此时 s_w 来自刚完成的一轮求解。
+func wrap_width(n: i64) -> i64 {
+    var w = tget(s_w, n) - pad_s(n, 0) - pad_e(n, 0)
+    if w < 0 {
+        return 0
+    }
+    return w
+}
+
+// 单码点 advance（26.6），与 measure_text 查同一条字体链（I3）。
+func adv_of(ch: string, fs: i64) -> i64 {
+    if g_face >= 0 {
+        if efont.chain_count() <= 0 {
+            efont.chain_reset(g_face)
+        }
+        return efont.chain_advance(utfmin.to_cp(ch), to_f64(fs))
+    }
+    return (fs * 3 * FP_ONE) / 5
+}
+
+// 从 from 起一行的结束下标（不含）：返回 from 表示此处即换行（空行）；
+// 单字超宽时返回 from + 1，照排一个字，避免死循环。
+func wrap_line_end(s: string, from: i64, fs: i64, w: i64) -> i64 {
+    var n = str_len(s)
+    var i = from
+    var cur: i64 = 0
+    var brk = from
+    while i < n {
+        var ch = str_char(s, i)
+        if char_code(ch) == 10 {
+            return i
+        }
+        var adv = adv_of(ch, fs)
+        if i > from && cur + adv > w {
+            if brk > from {
+                return brk
+            }
+            return i
+        }
+        cur = cur + adv
+        i = i + 1
+        if char_code(ch) == 32 {
+            brk = i
+        }
+    }
+    return n
+}
+
+// 折行并写缓存；返回行数（空串 1 行；结尾换行补一个空行，与 line_count 一致）。
+// 缓存直接存每行子串（不存字节偏移：str_char 的索引空间与 str_sub_bytes 的字节
+// 空间不保证同一套，逐字符取子串可绕开这个假设）。
+func wrap_build(n: i64, cw: i64) -> i64 {
+    var s = tiu_tree.text_of(n)
+    var fs = tget(s_font, n)
+    var n1 = str_len(s)
+    var off = len(g_lbuf)
+    var cnt: i64 = 0
+    var st: i64 = 0
+    while st < n1 {
+        var e = wrap_line_end(s, st, fs, cw)
+        // 行尾空格不进绘制（软换行处的空格既不进行尾也不进行首）
+        var te = e
+        while te > st && char_code(str_char(s, te - 1)) == 32 {
+            te = te - 1
+        }
+        var sb = string_builder()
+        var k = st
+        while k < te {
+            sb_append(sb, str_char(s, k))
+            k = k + 1
+        }
+        table_push(g_lbuf, sb_build(sb))
+        cnt = cnt + 1
+        if e >= n1 {
+            st = n1
+        } else {
+            if char_code(str_char(s, e)) == 10 {
+                st = e + 1
+            } else {
+                st = e
+            }
+            // 行首空格不占位（软换行处的空格既不断行也不进下一行）
+            while st < n1 && char_code(str_char(s, st)) == 32 {
+                st = st + 1
+            }
+        }
+    }
+    if cnt == 0 {
+        table_push(g_lbuf, "")
+        cnt = 1
+    } else {
+        if char_code(str_char(s, n1 - 1)) == 10 {
+            table_push(g_lbuf, "")
+            cnt = cnt + 1
+        }
+    }
+    twrite(g_loff, n, off)
+    twrite(g_lcnt, n, cnt)
+    return cnt
+}
+
+// 阶段 4 的一轮：清缓存后**后序**重算 hug（文本按已解析宽度断行，容器随子项更新）。
+// 返回 hug 高是否发生变化的标志（=1 说明要拿新高度再排一次）。
+func refine_heights() -> i64 {
+    g_lbuf = table_new_string()
+    g_loff = table_new_i64()
+    g_lcnt = table_new_i64()
+    var order = tiu_tree.dfs_order()
+    var changed: i64 = 0
+    var i = len(order) - 1
+    while i >= 0 {
+        var n = order[i]
+        var old = tget(s_hh, n)
+        measure_hug(n)
+        if tget(s_hh, n) != old {
+            changed = 1
+        }
+        i = i - 1
+    }
+    return changed
+}
+
+// 一轮完整求解（阶段 2 + 3）：根尺寸 + 前序 distribute/place。
+// 诊断在每轮开始时清空，因此最终留下的只有最后一轮（真实几何）的诊断。
+func solve_all(root: i64) {
+    g_diag = table_new_string()
+    resolve_root(root)
+    var order = tiu_tree.dfs_order()
+    var i: i64 = 0
+    while i < len(order) {
+        solve_children(order[i])
+        i = i + 1
+    }
 }
 
 // ============================================================
@@ -554,9 +720,16 @@ func ratio_from(base: i64, a: i64, b: i64, axis: i64) -> i64 {
 func content_hug(n: i64, axis: i64) -> i64 {
     var ty = tiu_tree.ty_of(n)
     if ty == 2 || ty == 3 || ty == 6 {
-        // Text / Button / TextInput：字形度量（宽度 = Σadvance，高度 = 一行）
+        // Text / Button / TextInput：字形度量（宽度 = Σadvance / 最长行；高度 = 行高 × 行数）
         if axis == 0 {
             return measure_text(tiu_tree.text_of(n), tget(s_font, n))
+        }
+        // 阶段 4（宽度已解析）才按折行算行数；阶段 1 一律按显式换行（I3）。
+        if g_text_wrap == 1 && wrap_on(n) == 1 {
+            var cw = wrap_width(n)
+            if cw > 0 {
+                return text_line_h(tget(s_font, n)) * wrap_build(n, cw)
+            }
         }
         return text_line_h(tget(s_font, n)) * line_count(tiu_tree.text_of(n))
     }
@@ -1600,15 +1773,24 @@ pub func layout(root: i64, win_w: i64, win_h: i64) {
         measure_hug(order[i])
         i = i - 1
     }
-    // 阶段 2：根尺寸（窗口内容盒）
-    resolve_root(root)
-    // 阶段 3：前序 distribute + place + 溢出
-    i = 0
-    while i < len(order) {
-        solve_children(order[i])
-        i = i + 1
+    // 阶段 2 + 3：根尺寸与前序 distribute / place / 溢出
+    solve_all(root)
+    // 阶段 4：折行细化——按已解析的内容宽断行并更新 hug 高，行数真变化才重排。
+    //   宽度求解与高度无关（hug 宽取 max-content），所以重排后宽度是同一组数、
+    //   断行不再变化；只有 ratio 把高度折回宽度的病态写法才需要再迭代，上限两轮（I5）。
+    g_text_wrap = 1
+    var need = refine_heights()
+    var it: i64 = 0
+    while need == 1 && it < 2 {
+        solve_all(root)
+        it = it + 1
+        need = refine_heights()
     }
-    // 阶段 4：落树（定点 → 整数像素，四舍五入）
+    if need == 1 {
+        solve_all(root)
+    }
+    g_text_wrap = 0
+    // 阶段 5：落树（定点 → 整数像素，四舍五入）
     i = 0
     while i < len(order) {
         var n2 = order[i]
@@ -1624,6 +1806,24 @@ pub func hug_w(id: i64) -> i64 {
 
 pub func hug_h(id: i64) -> i64 {
     return hug_of(id, 1)
+}
+
+// 折行结果（布局与光栅共用同一份）：行数（0 = 未折行，调用方走显式换行路径）
+pub func wrap_count(id: i64) -> i64 {
+    return tget(g_lcnt, id)
+}
+
+// 第 i 行的子串（越界返回空串）
+pub func wrap_line(id: i64, i: i64) -> string {
+    var cnt = tget(g_lcnt, id)
+    if i < 0 || i >= cnt {
+        return ""
+    }
+    var off = tget(g_loff, id)
+    if off < 0 || off + i >= len(g_lbuf) {
+        return ""
+    }
+    return g_lbuf[off + i]
 }
 
 // 溢出位：0 无 / 1 x / 2 y / 3 两轴

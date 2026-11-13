@@ -233,6 +233,11 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_font_size(node, aparse.len_of(s))
     }
+    // 折行开关（§6）：未声明时留 -1，由布局按控件类型取默认。
+    s = ui.attr_of(uid, "wrap")
+    if s != "" {
+        tiu_props.set_wrap(node, aparse.bool_code(s))
+    }
     s = ui.attr_of(uid, "style")
     if s != "" {
         tiu_props.set_style(node, s)
@@ -371,6 +376,7 @@ func reset_props(node: i64) {
     tiu_props.set_gap(node, 0)
     tiu_props.set_radius(node, 0)
     tiu_props.set_font_size(node, 0)
+    tiu_props.set_wrap(node, 0 - 1)
     tiu_props.set_style(node, "")
     tiu_props.set_bg(node, 0 - 1)
     tiu_props.set_fg(node, 0 - 1)

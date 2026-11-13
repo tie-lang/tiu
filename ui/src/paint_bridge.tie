@@ -436,7 +436,8 @@ func edge_ring(d: DrawList, r: Rect, c: i64) -> DrawList {
     return dl.rect(d, to_f64(r.x + r.w - 1), to_f64(r.y), 1.0, to_f64(r.h), solid(c))
 }
 
-// Text：按节点字号在布局矩形左上角绘制单行（基线由引擎取 ascent）。
+// Text：按节点字号绘制；有折行缓存时逐行走缓存，否则按显式换行切行。
+// 文本从内容盒左上角起排（pad 计入），与布局度量用的内容宽保持一致。
 func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     var s = tiu_tree.text_of(id)
     if str_len(s) == 0 {
@@ -447,15 +448,29 @@ func text_node(d: DrawList, id: i64, r: Rect, st: PState) -> DrawList {
     if fg < 0 {
         fg = uth.fg(st.th)
     }
+    var x = to_f64(r.x + tiu_props.pad_l(id))
+    var y0 = to_f64(r.y + tiu_props.pad_t(id))
+    var lh = to_f64(tiu_layout2.to_px(tiu_layout2.text_line_h(fs)))
+    // 断行结果由布局阶段 4 算好缓存：这里只消费，行数必然与布局一致。
+    var wc = tiu_layout2.wrap_count(id)
+    if wc >= 1 {
+        var yw = y0
+        var j: i64 = 0
+        while j < wc {
+            d = dl.text_p(d, tiu_layout2.wrap_line(id, j), x, yw, to_f64(fs), solid(fg))
+            yw = yw + lh
+            j = j + 1
+        }
+        return d
+    }
     var lines = tiu_layout2.line_count(s)
     if lines <= 1 {
-        return dl.text_p(d, s, to_f64(r.x), to_f64(r.y), to_f64(fs), solid(fg))
+        return dl.text_p(d, s, x, y0, to_f64(fs), solid(fg))
     }
-    var lh = to_f64(tiu_layout2.to_px(tiu_layout2.text_line_h(fs)))
-    var y = to_f64(r.y)
+    var y = y0
     var i: i64 = 0
     while i < lines {
-        d = dl.text_p(d, tiu_layout2.line_at(s, i), to_f64(r.x), y, to_f64(fs), solid(fg))
+        d = dl.text_p(d, tiu_layout2.line_at(s, i), x, y, to_f64(fs), solid(fg))
         y = y + lh
         i = i + 1
     }
