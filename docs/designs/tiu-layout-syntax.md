@@ -85,7 +85,7 @@ y: start | center | end | space-between | space-around | space-evenly
 * `gap`：主轴相邻子项间距，只接受长度。
 * **无 margin**：没有外边距、没有塌陷、没有负值、没有"百分比按宽度解析"。单侧间隔用 `@ spacer` 或包一层带 `pad` 的容器。
 
-`grid`：`cols: 3`（等分）、`cols: [120, fill, 2fr]`；行高默认 `hug`，可给 `rows: [48, hug]`；`gap` 同时作用于行列。跨列 `span` 暂不支持。
+`grid`：`cols: 3`（等分）、`cols: [120, fill, 2fr]`；行高默认 `hug`，可给 `rows: [48, hug]`；`gap` 同时作用于行列。轨道写法支持 `hug`/`fill`/`fr`/`px`/`%`/`em`/`pt`/`vw`/`vh` 与裸数字（等同 `px`）。跨列 `span` 暂不支持。
 
 `overlay`：子项按 `anchor` 落位，见 §7。
 
@@ -301,10 +301,9 @@ ui.end()
 
 ## 13. 未决 / Open items
 
-* 关键字形式的 `overflow: ellipsis`：tiu 侧已实现该策略（属性通道可达），但语法层要把 `ellipsis` 加进 tie 主仓的 `Overflow` 枚举才算完整——需改 `std/ui.tie` 的 `enum Overflow` 与 `overflow_attr`、`lib/front/pstmt_ui.tie` 的 `ui_enum_variant`/`ui_enum_words`，并重编 tiec。
 * `text-align` 的 `justify`（两端对齐）不在规划内；当前只有 `start`/`center`/`end`。
 * 断行结果的跨帧缓存：现在每次布局重算一次，尚未按 `(字体, 字号, 宽度, 文本)` 命中复用。
-* `grid` 的 `span` 与自动流密集填充（暂不支持，先按固定列 + 行优先）。
+* `grid` 的跨列 `span` 与自动流密集填充（暂不支持，先按固定列 + 行优先；列与行轨道均已实现）。
 * 动画与布局的关系（变换不触发重排；尺寸动画走后置几何）。
 * CJK 字体：TrueType 轮廓可用系统 `simsun.ttc`/`msyh.ttc`，需 TTC 解析；CFF/OTF 大字库不在范围内。
 * `ch`（字符宽）单位：需要字符度量约定，暂不提供。

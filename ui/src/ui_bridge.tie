@@ -229,6 +229,16 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_gap(node, aparse.len_of(s))
     }
+    // 网格轨道表（§3）：`cols: 3` 等分、`cols: [120, fill, 2fr]` 逐项给出。
+    // kind 码与系数编码都在 layout2，解析也放那边（tracks_apply），这里只递属性串。
+    s = ui.attr_of(uid, "cols")
+    if s != "" {
+        tiu_layout2.tracks_apply(node, s, 0)
+    }
+    s = ui.attr_of(uid, "rows")
+    if s != "" {
+        tiu_layout2.tracks_apply(node, s, 1)
+    }
     s = ui.attr_of(uid, "radius")
     if s != "" {
         tiu_props.set_radius(node, aparse.len_of(s))
@@ -387,6 +397,7 @@ func reset_props(node: i64) {
     tiu_props.set_fg(node, 0 - 1)
     tiu_props.set_border(node, 0 - 1)
     tiu_props.clear_cols(node)
+    tiu_props.clear_rows(node)
 }
 
 // 布局之后调用：矩形与上一帧不同 -> 换新版本号。

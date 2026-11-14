@@ -94,6 +94,13 @@ var g_pool_k: table<i64> = []    // 池：列 kind
 var g_pool_a: table<i64> = []    // 池：列系数 a
 var g_pool_b: table<i64> = []    // 池：列系数 b
 
+// ---- 网格行高表（§3 `rows: [48, hug]`）：与列表同构，池独立 ----
+var g_row_off: table<i64> = []   // 该节点行区间在池中的起点
+var g_row_n: table<i64> = []     // 该节点行数
+var g_rpool_k: table<i64> = []   // 池：行 kind
+var g_rpool_a: table<i64> = []   // 池：行系数 a
+var g_rpool_b: table<i64> = []   // 池：行系数 b
+
 namespace tiu_props {
 // ---------- 内部：表读写 ----------
 
@@ -367,6 +374,67 @@ pub func col_b(id: i64, i: i64) -> i64 {
     return g_pool_b[get(g_col_off, id, 0) + i]
 }
 
+// ---------- 网格行高表 ----------
+// 与列同构：规格在共享池中按节点连续存放，追加不在池尾时整体搬到池尾。
+
+pub func clear_rows(id: i64) {
+    if id < 0 {
+        return
+    }
+    put(g_row_off, id, 0)
+    put(g_row_n, id, 0)
+}
+
+pub func add_row(id: i64, kind: i64, a: i64, b: i64) {
+    if id < 0 {
+        return
+    }
+    var n = get(g_row_n, id, 0)
+    if n > 0 {
+        var st = get(g_row_off, id, 0)
+        if st + n != len(g_rpool_k) {
+            var tail = len(g_rpool_k)
+            var i: i64 = 0
+            while i < n {
+                table_push(g_rpool_k, g_rpool_k[st + i])
+                table_push(g_rpool_a, g_rpool_a[st + i])
+                table_push(g_rpool_b, g_rpool_b[st + i])
+                i = i + 1
+            }
+            put(g_row_off, id, tail)
+        }
+    } else {
+        put(g_row_off, id, len(g_rpool_k))
+    }
+    table_push(g_rpool_k, kind)
+    table_push(g_rpool_a, a)
+    table_push(g_rpool_b, b)
+    put(g_row_n, id, n + 1)
+}
+
+pub func row_count(id: i64) -> i64 { return get(g_row_n, id, 0) }
+
+pub func row_kind(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= row_count(id) {
+        return 0
+    }
+    return g_rpool_k[get(g_row_off, id, 0) + i]
+}
+
+pub func row_a(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= row_count(id) {
+        return 0
+    }
+    return g_rpool_a[get(g_row_off, id, 0) + i]
+}
+
+pub func row_b(id: i64, i: i64) -> i64 {
+    if i < 0 || i >= row_count(id) {
+        return 0
+    }
+    return g_rpool_b[get(g_row_off, id, 0) + i]
+}
+
 // ---------- 词汇的文本形式（explain / 诊断共用）----------
 
 // 尺寸系数 → 文本（百分之一还原为小数）
@@ -536,5 +604,10 @@ pub func reset() {
     g_pool_k = table_new_i64()
     g_pool_a = table_new_i64()
     g_pool_b = table_new_i64()
+    g_row_off = table_new_i64()
+    g_row_n = table_new_i64()
+    g_rpool_k = table_new_i64()
+    g_rpool_a = table_new_i64()
+    g_rpool_b = table_new_i64()
 }
 }

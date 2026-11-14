@@ -38,9 +38,8 @@ type tie<class>
 // 与旧路径的关系：layout.tie 是旧求解器，**本文件不引用、不修改它**；
 //   examples\counter.tie 仍走旧路径，两者并行存在直到控件工厂切换。
 //
-// 已知未实现（均在报告里列出）：grid 的 rows（稿允许，本次交付按任务书只做
-//   cols + 行高 hug）；样式表合并（§8）；关键字形式的 overflow: ellipsis
-//   （策略已实现，语法层待扩 tie 主仓的 Overflow 枚举）。
+// 已知未实现（均在报告里列出）：grid 的跨列 span 与自动流密集填充；
+//   样式表合并（§8）。
 
 import "./tree.tie"
 import "./props.tie"
@@ -195,6 +194,224 @@ func c_vh(a: i64) -> i64 {
 // pct：父内容盒（已扣 pad）的百分比（§2 规则 2）
 func c_pct(a: i64, base: i64) -> i64 {
     return (a * base) / 10000
+}
+
+// ============================================================
+// 轨道表解析（§3）：`cols: 3` 等同分三轨，`cols: [120, fill, 2fr]` 逐项给出。
+// 解析放在本文件是因为 kind 码就是上面的 K_*，系数编码也与 c_* 同源
+// （px / pct / em / pt / vw / vh 一律按 1/100 存 a），别处另存一套码会漂。
+// 方括号里的裸数字按 px 解释；不带括号的单个数按「等分 n 轨」解释。
+// ============================================================
+
+// "12.5" → 1250（1/100，最多两位小数）；非法字符返回 -1
+func num100(s: string) -> i64 {
+    var n = str_len(s)
+    if n <= 0 {
+        return 0 - 1
+    }
+    var ip: i64 = 0
+    var fp: i64 = 0
+    var fdig: i64 = 0
+    var seen: bool = false
+    var i: i64 = 0
+    while i < n {
+        var c = char_code(str_char(s, i))
+        if c == 46 {
+            if seen {
+                return 0 - 1
+            }
+            seen = true
+        } else if c >= 48 && c <= 57 {
+            if seen {
+                if fdig < 2 {
+                    fp = fp * 10 + (c - 48)
+                    fdig = fdig + 1
+                }
+            } else {
+                ip = ip * 10 + (c - 48)
+            }
+        } else {
+            return 0 - 1
+        }
+        i = i + 1
+    }
+    while fdig < 2 {
+        fp = fp * 10
+        fdig = fdig + 1
+    }
+    return ip * 100 + fp
+}
+
+func has_suffix(s: string, suf: string) -> bool {
+    var ns = str_len(s)
+    var nf = str_len(suf)
+    if nf > ns {
+        return false
+    }
+    var i: i64 = 0
+    while i < nf {
+        if str_char(s, ns - nf + i) != str_char(suf, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 轨道项的单位后缀长度（0 = 无单位）
+func track_unit_len(t: string) -> i64 {
+    if has_suffix(t, "fr") || has_suffix(t, "em") || has_suffix(t, "pt") || has_suffix(t, "px") {
+        return 2
+    }
+    if has_suffix(t, "vw") || has_suffix(t, "vh") {
+        return 2
+    }
+    if has_suffix(t, "%") {
+        return 1
+    }
+    return 0
+}
+
+// 单项 → kind（无法识别返回 -1）
+func track_kind(t: string) -> i64 {
+    if t == "hug" {
+        return K_HUG
+    }
+    if t == "fill" {
+        return K_FILL
+    }
+    if has_suffix(t, "fr") {
+        return K_FR
+    }
+    if has_suffix(t, "em") {
+        return K_EM
+    }
+    if has_suffix(t, "pt") {
+        return K_PT
+    }
+    if has_suffix(t, "px") {
+        return K_PX
+    }
+    if has_suffix(t, "vw") {
+        return K_VW
+    }
+    if has_suffix(t, "vh") {
+        return K_VH
+    }
+    if has_suffix(t, "%") {
+        return K_PCT
+    }
+    if num100(t) >= 0 {
+        return K_PX
+    }
+    return 0 - 1
+}
+
+// 按码点切片：tie 没有内建切片，逐字拼（字节索引会切碎 UTF-8）
+func str_slice(s: string, from: i64, cnt: i64) -> string {
+    var n = str_len(s)
+    var b = string_builder()
+    var i = from
+    var stop = from + cnt
+    while i < stop && i < n {
+        if i >= 0 {
+            sb_append(b, str_char(s, i))
+        }
+        i = i + 1
+    }
+    return sb_build(b)
+}
+
+// 单项 → 系数 a（hug / fill 无系数，fr 裸写按 1fr = 100）
+func track_a(t: string) -> i64 {
+    if t == "hug" || t == "fill" {
+        return 0
+    }
+    if t == "fr" {
+        return 100
+    }
+    var cut = str_len(t) - track_unit_len(t)
+    var v = num100(str_slice(t, 0, cut))
+    if v < 0 {
+        return 0
+    }
+    return v
+}
+
+// 按逗号切分（值里没有空格：语法层是词法原文拼接）
+func track_split(s: string) -> table<string> {
+    var out: table<string> = []
+    var n = str_len(s)
+    var b = string_builder()
+    var i: i64 = 0
+    while i < n {
+        var ch = str_char(s, i)
+        if char_code(ch) == 44 {
+            table_push(out, sb_build(b))
+            b = string_builder()
+        } else {
+            sb_append(b, ch)
+        }
+        i = i + 1
+    }
+    table_push(out, sb_build(b))
+    return out
+}
+
+func add_track(id: i64, axis: i64, kd: i64, a: i64) {
+    if axis == 0 {
+        tiu_props.add_col(id, kd, a, 0)
+    } else {
+        tiu_props.add_row(id, kd, a, 0)
+    }
+}
+
+// 解析轨道表并写入属性表，返回轨道数（0 = 未声明或全部无法识别）。
+// axis: 0 = 列（`cols`），1 = 行（`rows`）。
+pub func tracks_apply(id: i64, spec: string, axis: i64) -> i64 {
+    if axis == 0 {
+        tiu_props.clear_cols(id)
+    } else {
+        tiu_props.clear_rows(id)
+    }
+    var s = spec
+    var listed: i64 = 0
+    var ns = str_len(s)
+    if ns >= 2 {
+        if char_code(str_char(s, 0)) == 91 {
+            listed = 1
+            s = str_slice(s, 1, ns - 2)
+        }
+    }
+    var toks = track_split(s)
+    var cnt = len(toks)
+    // `cols: 3`：单个数 = 等分 n 轨
+    if listed == 0 && cnt == 1 {
+        var v = num100(toks[0])
+        if v > 0 && v % 100 == 0 {
+            var k: i64 = 0
+            var c = v / 100
+            while k < c {
+                add_track(id, axis, K_FR, 100)
+                k = k + 1
+            }
+            return c
+        }
+    }
+    var i: i64 = 0
+    var added: i64 = 0
+    while i < cnt {
+        var t = toks[i]
+        if str_len(t) > 0 {
+            var kd = track_kind(t)
+            if kd >= 0 {
+                add_track(id, axis, kd, track_a(t))
+                added = added + 1
+            }
+        }
+        i = i + 1
+    }
+    return added
 }
 
 // ============================================================
@@ -822,7 +1039,8 @@ func legacy_off(c: i64, axis: i64) -> i64 {
 // grid 内容 hug：宽 = Σ列宽 + gap；高 = Σ行高 + gap（行高取行内最高子项）
 func grid_content_hug(n: i64, axis: i64) -> i64 {
     var cnt = kid_count(n)
-    if cnt == 0 {
+    var rtr = tiu_props.row_count(n)
+    if cnt == 0 && rtr == 0 {
         return 0
     }
     var cols = tiu_props.col_count(n)
@@ -830,6 +1048,9 @@ func grid_content_hug(n: i64, axis: i64) -> i64 {
         cols = 1
     }
     var rows = (cnt + cols - 1) / cols
+    if rtr > rows {
+        rows = rtr
+    }
     var gap = gap_fp(n)
     var acc: i64 = 0
     if axis == 0 {
@@ -875,17 +1096,37 @@ func grid_content_hug(n: i64, axis: i64) -> i64 {
         if r2 > 0 {
             acc = acc + gap
         }
+        // 显式行轨道（§3 `rows: [48, hug]`）：定值轨道直接给高，
+        // 其余（hug / fill / fr / pct）取行内最高子项——与列的 hug 口径一致。
         var mh: i64 = 0
-        var c2: i64 = 0
-        while c2 < cols {
-            var k2 = child_at(n, r2 * cols + c2)
-            if k2 >= 0 {
-                var hv = child_hug(k2, 1)
-                if hv > mh {
-                    mh = hv
+        var rkd = K_HUG
+        var rka: i64 = 0
+        if r2 < tiu_props.row_count(n) {
+            rkd = tiu_props.row_kind(n, r2)
+            rka = tiu_props.row_a(n, r2)
+        }
+        if rkd == K_PX {
+            mh = c_px(rka)
+        } else if rkd == K_EM {
+            mh = c_em(rka, tget(s_font, n))
+        } else if rkd == K_PT {
+            mh = c_pt(rka)
+        } else if rkd == K_VW {
+            mh = c_vw(rka)
+        } else if rkd == K_VH {
+            mh = c_vh(rka)
+        } else {
+            var c2: i64 = 0
+            while c2 < cols {
+                var k2 = child_at(n, r2 * cols + c2)
+                if k2 >= 0 {
+                    var hv = child_hug(k2, 1)
+                    if hv > mh {
+                        mh = hv
+                    }
                 }
+                c2 = c2 + 1
             }
-            c2 = c2 + 1
         }
         acc = acc + mh
         r2 = r2 + 1
@@ -1383,7 +1624,13 @@ func solve_grid(n: i64) {
     if cnt > 0 {
         rows = (cnt + cols - 1) / cols
     }
-    if cnt == 0 {
+    // 显式行轨道（§3 `rows: [48, hug]`）可能比内容所需更多：行数取两者较大者，
+    // 多出来的行只有轨道高度、没有子项（站位循环里靠 idx < cnt 跳过）。
+    var rtr = tiu_props.row_count(n)
+    if rtr > rows {
+        rows = rtr
+    }
+    if cnt == 0 && rows == 0 {
         finish_overflow(n, 0, 0, 0, 0)
         return
     }
@@ -1461,24 +1708,89 @@ func solve_grid(n: i64) {
         }
         c = c + 1
     }
-    // --- 2) 行高：hug（行内最高子项；fill/fr/pct 子项按自身 hug 参与）---
+    // --- 2) 行高：显式轨道（§3 `rows: [48, hug]`）优先，缺位按 hug ---
+    // hug 行取行内最高子项；fill / fr 行按权重分剩余高度（与列同一套分配）。
+    var rtr = tiu_props.row_count(n)
     var heights = table_new_i64()
+    var hwts = table_new_i64()
+    var hdef: i64 = 0
+    var hflex: i64 = 0
     var r2: i64 = 0
     while r2 < rows {
-        var mh: i64 = 0
-        var c2: i64 = 0
-        while c2 < cols {
-            var k2 = child_at(n, r2 * cols + c2)
-            if k2 >= 0 {
-                var hv = child_hug(k2, 1)
-                if hv > mh {
-                    mh = hv
+        var rkd = K_HUG
+        var rka: i64 = 0
+        if r2 < rtr {
+            rkd = tiu_props.row_kind(n, r2)
+            rka = tiu_props.row_a(n, r2)
+        }
+        var hv2: i64 = 0
+        if rkd == K_FILL || rkd == K_FR {
+            var hwt: i64 = 100
+            if rkd == K_FR {
+                hwt = rka
+                if hwt <= 0 {
+                    hwt = 100
                 }
             }
-            c2 = c2 + 1
+            table_push(hwts, hwt)
+            hflex = hflex + 1
+        } else {
+            if rkd == K_PX {
+                hv2 = c_px(rka)
+            } else if rkd == K_EM {
+                hv2 = c_em(rka, tget(s_font, n))
+            } else if rkd == K_PT {
+                hv2 = c_pt(rka)
+            } else if rkd == K_VW {
+                hv2 = c_vw(rka)
+            } else if rkd == K_VH {
+                hv2 = c_vh(rka)
+            } else if rkd == K_PCT {
+                hv2 = c_pct(rka, ah)
+            } else {
+                // hug 行：行内最高子项（fill/fr/pct 子项按自身 hug 参与）
+                var c2: i64 = 0
+                while c2 < cols {
+                    var k2 = child_at(n, r2 * cols + c2)
+                    if k2 >= 0 {
+                        var kh2 = child_hug(k2, 1)
+                        if kh2 > hv2 {
+                            hv2 = kh2
+                        }
+                    }
+                    c2 = c2 + 1
+                }
+            }
+            hdef = hdef + hv2
         }
-        table_push(heights, mh)
+        table_push(heights, hv2)
         r2 = r2 + 1
+    }
+    if hflex > 0 {
+        var hrest = ah - gap * (rows - 1) - hdef
+        var hshares = table_new_i64()
+        if hrest > 0 {
+            hshares = distribute(hrest, hwts)
+        } else {
+            var hz: i64 = 0
+            while hz < hflex {
+                table_push(hshares, 0)
+                hz = hz + 1
+            }
+        }
+        var hfi: i64 = 0
+        r2 = 0
+        while r2 < rows {
+            var rkd2 = K_HUG
+            if r2 < rtr {
+                rkd2 = tiu_props.row_kind(n, r2)
+            }
+            if rkd2 == K_FILL || rkd2 == K_FR {
+                heights[r2] = hshares[hfi]
+                hfi = hfi + 1
+            }
+            r2 = r2 + 1
+        }
     }
     // --- 3) 轨道合计与剩余分布（dist_x 管列、dist_y 管行）---
     var wsum: i64 = 0
