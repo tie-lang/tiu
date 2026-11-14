@@ -50,13 +50,21 @@ tiu 全部以 **tie 语言**实现，用自举 tiec 编译（要求本机克隆
 - [`examples/counter.tie`](examples/counter.tie) —— **计数器应用**：声明式界面 + 绝对定位 +
   主题切换 + 按钮三态（悬停 / 按下）+ 状态驱动重绘。启动后先自演示一遍（合成点击），
   之后可手动交互，按 `ESC` 或关闭窗口退出。
+- [`examples/board_element.tie`](examples/board_element.tie) —— **任务看板**：元素语法写整棵树，
+  网格列轨道 `cols: 3` 与显式行轨道 `rows: [hug, 200]`、跨列 `span: 2`、滚动待办区、
+  按钮与列表项的「事件 → 状态 → 重绘」闭环。`--check` 用九条断言自查几何与像素
+  （跨列铺满整行、统计卡等分、选中行底色、空闲帧零段、滚轮位移、布局无诊断）。
 
 一键构建并运行（tiu 仓根；需先按上节准备好工具链）：
 
 ```powershell
-..\tiec\compiler\tiec.exe examples\build.tie -o build\example_build.exe
-build\example_build.exe
+..\tie\_local_only\bin\tiec.exe examples\build.tie -o _local_only\bin\example_build.exe --no-warn --no-cache
+_local_only\bin\example_build.exe
 ```
+
+`example_build.exe` 逐个构建 `counter_element` / `form_element` / `list_element` /
+`gallery_element` / `board_element` 五个示例，并各自跑一遍 `--check`（无窗口自检）；
+加 `--demo` 则以真实窗口各跑 120 轮。
 
 EN: `examples/counter.tie` is a runnable counter app wiring all layers together
 (declarative build, absolute layout, theme switching, three-state buttons,

@@ -1,0 +1,434 @@
+type tie<logic, unsafe:mem>
+// examples/board_element.tie —— tiu 示例：任务看板（元素语法 + 网格轨道 + 滚动区）
+// ============================================================
+// EN: tiu sample — a small task board written in element syntax. It exercises the
+// grid track syntax (`cols: 3`), cross-column `span`, scroll containers and the
+// event → state → re-render loop, without computing a single coordinate by hand.
+//
+// 这一例专门走「布局就是数据」的几个点：
+//   @ grid (cols: 3)     列轨道写在元素上，tiec 原样捕获成字符串，布局期解析
+//   span: 2              跨两列：宽度 = 两列之和 + 列间距（不手算）
+//   rows: [hug, hug]     行轨道显式声明，行高不再只由子项撑开
+//   @ scroll             溢出策略 scroll：滚轮改滚动量，画面跟着变
+//   if / else 两棵子树   颜色属性是编译期捕获的字面量，随状态换色就换子树
+//
+// 运行（tiu 仓根，先跑 examples/build.tie 构建）：
+//   board_element.exe           打开窗口，关窗退出
+//   board_element.exe --demo    跑 120 轮自动退出
+//   board_element.exe --check   无窗口自检：同一条帧循环 + 像素断言
+//   board_element.exe --shot p  无窗口渲染一帧写 PNG
+
+import "../ui/src/window_host.tie"
+import "../ui/src/tree.tie"
+import "../ui/src/ui_bridge.tie"
+import "../api/src/color.tie"
+import "../api/src/paint.tie"
+import "../api/src/canvas.tie"
+import "../engine/src/ir_load.tie"
+import "../engine/src/raster.tie"
+import "../engine/src/pngout.tie"
+import "../engine/src/present.tie"
+import "../host/src/win.tie"
+import "/std/args.tie"
+
+const W: i64 = 720
+const H: i64 = 520
+const FONT: string = "C:/Windows/Fonts/consola.ttf"
+// 主面是等宽英文字体，不含 CJK 字形；中文由回退链补字。
+const FALLBACK: string = "C:/Windows/Fonts/Deng.ttf"
+
+// ---- 应用状态（应用层持有，框架不托管状态）----
+var g_done: i64 = 12
+var g_pick: string = "设计评审"
+var g_frames: i64 = 0
+
+// ---- 事件处理器：签名由 std/ui 约定 (节点, x, y, 事件名) -> i64 ----
+func on_done(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_done = g_done + 1
+    return 1
+}
+
+func on_undo(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    if g_done > 0 {
+        g_done = g_done - 1
+    }
+    return 1
+}
+
+func on_pick_a(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "设计评审"
+    return 1
+}
+
+func on_pick_b(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "接口对齐"
+    return 1
+}
+
+func on_pick_c(id: i64, x: i64, y: i64, kind: string) -> i64 {
+    g_pick = "回归验证"
+    return 1
+}
+
+// ---- 皮肤：只覆盖需要改的 token，其余仍走 theme.tie 的默认值 ----
+theme 夜蓝 {
+    bg: "#0f1319"
+    surface: "#171d26"
+    surface-alt: "#1f2733"
+    accent: "#5cc8ff"
+    accent-hot: "#8ad8ff"
+    accent-down: "#3f9fce"
+    accent-soft: "#1b2f3d"
+    fg: "#e8f0f7"
+    fg-dim: "#93a3b4"
+    border: "#26303c"
+    border-strong: "#374453"
+    separator: "#212a35"
+}
+
+style card {
+    bg: surface
+    stroke: border
+    radius: 12
+    pad: 16
+    gap: 8
+    y: start
+}
+
+style stat {
+    bg: surface
+    stroke: border
+    radius: 12
+    pad-x: 16
+    pad-y: 12
+    gap: 4
+    y: start
+}
+
+style chip {
+    bg: accent-soft
+    radius: 8
+    pad-x: 10
+    pad-y: 5
+    gap: 6
+    y: center
+}
+
+style ghostbtn {
+    w: 76
+    h: 32
+    bg: transparent
+    stroke: border-strong
+    fg: fg
+}
+
+style task {
+    w: fill
+    h: 34
+    radius: 8
+    pad-x: 12
+    gap: 10
+    y: center
+}
+
+// ---- 视图：整棵树用元素语法写 ----
+pub func view() -> i64 {
+    g_frames = g_frames + 1
+    ui.reset()
+    @ window "tiu · 任务看板" (size: 720x520, bg: "bg", skin: 夜蓝) {
+        @ column "root" (w: fill, h: fill, pad: 22, gap: 14) {
+            // 页头
+            @ row "head" (w: fill, x: space-between, y: center, gap: 16) {
+                @ column "titles" (gap: 4) {
+                    @ label "title" (text: "任务看板", font-size: 22, fg: "fg")
+                    @ label "sub" (text: "网格轨道 · 跨列 · 滚动区 · 事件轴", font-size: 12, fg: "fg-dim")
+                }
+                @ row "chip" (style: chip) {
+                    @ label "chipdot" (text: "●", font-size: 11, fg: "accent")
+                    @ label "chiptxt" (text: "TIE 二进制", font-size: 12, fg: "accent")
+                }
+            }
+
+            @ row "line" (w: fill, h: 1, bg: "separator")
+
+            // 三张统计卡：同一行等分（1fr × 3 + gap）
+            @ row "stats" (w: fill, gap: 12, y: start) {
+                @ panel "s1" (style: stat, w: 1fr) {
+                    @ label "s1k" (text: "已完成", font-size: 12, fg: "fg-dim")
+                    @ label "s1v" (text: to_string(g_done), font-size: 28, fg: "fg")
+                    @ label "s1h" (text: "今日累计 · 点「+1」增加", font-size: 11, fg: "fg-dim", w: fill, overflow: ellipsis)
+                }
+                @ panel "s2" (style: stat, w: 1fr) {
+                    @ label "s2k" (text: "进行中", font-size: 12, fg: "fg-dim")
+                    @ label "s2v" (text: "4", font-size: 28, fg: "fg")
+                    @ label "s2h" (text: "三项在评审、一项在实现", font-size: 11, fg: "fg-dim", w: fill, overflow: ellipsis)
+                }
+                @ panel "s3" (style: stat, w: 1fr) {
+                    @ label "s3k" (text: "本周完成率", font-size: 12, fg: "fg-dim")
+                    @ label "s3v" (text: "87%", font-size: 28, fg: "accent")
+                    @ label "s3h" (text: "较上周 +6 个百分点", font-size: 11, fg: "fg-dim", w: fill, overflow: ellipsis)
+                }
+            }
+
+            // 看板主体：三列网格，第一张卡跨两列
+            @ grid "board" (w: fill, h: fill, cols: 3, gap: 12, rows: [hug, 200]) {
+                @ panel "wide" (style: card, w: fill, span: 2) {
+                    @ label "wide_k" (text: "跨两列 · span: 2", font-size: 12, fg: "fg-dim")
+                    @ label "wide_t" (text: "宽度 = 两列之和 + 列间距，由布局求解给出，元素上不写像素。", font-size: 13, fg: "fg", w: fill)
+                }
+                @ panel "side" (style: card, w: fill) {
+                    @ label "side_k" (text: "第三列", font-size: 12, fg: "fg-dim")
+                    @ label "side_v" (text: "3", font-size: 22, fg: "accent")
+                    @ label "side_h" (text: "项在评审中", font-size: 11, fg: "fg-dim")
+                }
+                @ panel "list" (style: card, w: fill, h: fill, span: 3) {
+                    @ row "listhead" (w: fill, x: space-between, y: center) {
+                        @ label "list_k" (text: "待办 · 点击选择", font-size: 12, fg: "fg-dim")
+                        @ label "picked" (text: "当前：" + g_pick, font-size: 12, fg: "accent")
+                    }
+                    @ scroll "tasks" (w: fill, h: fill, gap: 6, pad-right: 10, overflow: scroll) {
+                        if g_pick == "设计评审" {
+                            @ row "ta" (style: task, bg: "accent-soft", on_click: on_pick_a) {
+                                @ row "ta_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "ta_txt" (text: "设计评审 · 布局语法与网格轨道", font-size: 13, fg: "accent")
+                            }
+                        } else {
+                            @ row "ta" (style: task, on_click: on_pick_a) {
+                                @ row "ta_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "ta_txt" (text: "设计评审 · 布局语法与网格轨道", font-size: 13, fg: "fg")
+                            }
+                        }
+                        if g_pick == "接口对齐" {
+                            @ row "tb" (style: task, bg: "accent-soft", on_click: on_pick_b) {
+                                @ row "tb_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "tb_txt" (text: "接口对齐 · ui_bridge 属性契约", font-size: 13, fg: "accent")
+                            }
+                        } else {
+                            @ row "tb" (style: task, on_click: on_pick_b) {
+                                @ row "tb_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "tb_txt" (text: "接口对齐 · ui_bridge 属性契约", font-size: 13, fg: "fg")
+                            }
+                        }
+                        if g_pick == "回归验证" {
+                            @ row "tc" (style: task, bg: "accent-soft", on_click: on_pick_c) {
+                                @ row "tc_bar" (w: 3, h: fill, radius: 2, bg: "accent")
+                                @ label "tc_txt" (text: "回归验证 · 探针与黄金矩形", font-size: 13, fg: "accent")
+                            }
+                        } else {
+                            @ row "tc" (style: task, on_click: on_pick_c) {
+                                @ row "tc_bar" (w: 3, h: fill, radius: 2, bg: "transparent")
+                                @ label "tc_txt" (text: "回归验证 · 探针与黄金矩形", font-size: 13, fg: "fg")
+                            }
+                        }
+                        @ row "td" (style: task, bg: "surface-alt") {
+                            @ label "td_txt" (text: "整理发布清单 · 只在滚动区里", font-size: 13, fg: "fg-dim")
+                        }
+                        @ row "te" (style: task, bg: "surface-alt") {
+                            @ label "te_txt" (text: "写变更说明 · 滚轮试试", font-size: 13, fg: "fg-dim")
+                        }
+                    }
+                }
+            }
+
+            // 页脚：动作按钮 + 提示
+            @ row "foot" (w: fill, x: space-between, y: center) {
+                @ row "acts" (gap: 8) {
+                    @ button "done" (text: "+1", w: 76, h: 32, on_click: on_done)
+                    @ button "undo" (text: "-1", w: 76, h: 32, style: ghostbtn, on_click: on_undo)
+                }
+                @ label "hint" (text: "点列表项切换选中 · 滚轮滚动待办", font-size: 12, fg: "fg-dim")
+            }
+        }
+    }
+    return ui.count()
+}
+
+// ---- 自检：不建窗口，但走与真实运行完全相同的 frame/render ----
+func check() -> i64 {
+    tiu_win.theme(0)
+    var face = tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
+    if face < 0 {
+        println("FAIL 字体装载")
+        return 1
+    }
+    var bad: i64 = 0
+
+    var segs = tiu_win.frame(W, H, view)
+    if segs <= 0 {
+        println("FAIL 首帧无绘制段 segs=" + to_string(segs))
+        bad = bad + 1
+    }
+    var fb = tiu_win.render(W, H)
+    var bg = tiu_win.px(fb, 1, 1)
+    // 期望值来自 `theme 夜蓝` 皮肤覆盖；换皮肤时这两处断言要一起改。
+    if bg != 0xFF0F1319 {
+        println("FAIL 窗口底色不是皮肤 bg px=" + to_string(bg))
+        bad = bad + 1
+    } else {
+        println("OK 窗口底色 bg token（皮肤 夜蓝 覆盖）")
+    }
+
+    // 1) 网格：三列等分 + 跨两列的卡片宽度 = 两列之和 + 一个列间距
+    var wide = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("wide")))
+    var side = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("side")))
+    var grid = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("board")))
+    // 跨列宽度由列轨道与列间距决定；三列等分时 652/3 有余数，所以不写死像素值，
+    // 而是断言「两列 + 一个 gap + 第三列 = 整条内容宽」——余数怎么分都不会破。
+    if wide.w + 12 + side.w != grid.w {
+        println("FAIL 跨列未铺满 grid=" + to_string(grid.w) + " wide=" + to_string(wide.w) + " side=" + to_string(side.w))
+        bad = bad + 1
+    } else if side.x != wide.x + wide.w + 12 {
+        println("FAIL 跨列后下一列位置 x=" + to_string(side.x))
+        bad = bad + 1
+    } else if wide.w <= side.w + 12 {
+        println("FAIL 跨列没有跨过一列 wide=" + to_string(wide.w) + " side=" + to_string(side.w))
+        bad = bad + 1
+    } else {
+        println("OK 跨列铺满 " + to_string(wide.w) + " + 12 + " + to_string(side.w) + " = " + to_string(grid.w))
+    }
+
+    // 2) 统计卡等分：三张卡同宽
+    var s1 = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("s1")))
+    var s2 = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("s2")))
+    var s3 = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("s3")))
+    if s1.w != s2.w || s2.w != s3.w {
+        println("FAIL 统计卡未等分 " + to_string(s1.w) + "/" + to_string(s2.w) + "/" + to_string(s3.w))
+        bad = bad + 1
+    } else {
+        println("OK 统计卡等分 w=" + to_string(s1.w))
+    }
+
+    // 3) 按钮有墨迹，且矩形来自布局求解
+    var dn = ui_bridge.node_of_ui(ui.find("done"))
+    var r = tiu_tree.rect(dn)
+    var ink = tiu_win.ink(fb, r.x + 3, r.y + 3, r.w - 6, r.h - 6, bg)
+    if ink <= 0 {
+        println("FAIL 按钮无墨迹 rect=" + to_string(r.x) + "," + to_string(r.y) + " " + to_string(r.w) + "x" + to_string(r.h))
+        bad = bad + 1
+    } else {
+        println("OK 按钮有墨迹 ink=" + to_string(ink))
+    }
+
+    // 4) 点击 → 事件轴 → 状态 → 下一帧文本更新
+    var cx = r.x + r.w / 2
+    var cy = r.y + r.h / 2
+    tiu_app.on_mouse_move(cx, cy)
+    tiu_app.on_mouse_down(cx, cy)
+    tiu_app.on_mouse_up(cx, cy)
+    var segs2 = tiu_win.frame(W, H, view)
+    var txt = ui.attr_of(ui.find("s1v"), "text")
+    if g_done != 13 {
+        println("FAIL 计数未增加 done=" + to_string(g_done))
+        bad = bad + 1
+    } else if txt != "13" {
+        println("FAIL 文本未更新 text=" + txt)
+        bad = bad + 1
+    } else if segs2 <= 0 {
+        println("FAIL 事件帧无绘制段")
+        bad = bad + 1
+    } else {
+        println("OK 点击后重绘 segs=" + to_string(segs2) + " text=" + txt)
+    }
+
+    // 5) 列表项点击：选中进状态，选中行铺 accent-soft
+    var tb = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("tb")))
+    var mx = tb.x + tb.w / 2
+    var my = tb.y + tb.h / 2
+    tiu_app.on_mouse_move(mx, my)
+    tiu_app.on_mouse_down(mx, my)
+    tiu_app.on_mouse_up(mx, my)
+    // 采样前把指针移开：行处于 hover 时会叠加高亮，届时像素不等于基准色。
+    tiu_app.on_mouse_move(2, 2)
+    tiu_win.frame(W, H, view)
+    var fb2 = tiu_win.render(W, H)
+    var tb2 = tiu_tree.rect(ui_bridge.node_of_ui(ui.find("tb")))
+    var spx = tiu_win.px(fb2, tb2.x + tb2.w - 6, tb2.y + tb2.h / 2)
+    if g_pick != "接口对齐" {
+        println("FAIL 列表选择未生效 pick=" + g_pick)
+        bad = bad + 1
+    } else if spx != 0xFF1B2F3D {
+        println("FAIL 选中行底色不是 accent-soft px=" + to_string(spx))
+        bad = bad + 1
+    } else {
+        println("OK 列表选择 pick=" + g_pick)
+    }
+
+    // 6) 空闲帧零重绘
+    var segs3 = tiu_win.frame(W, H, view)
+    if segs3 != 0 {
+        println("FAIL 空闲帧仍有绘制段 segs=" + to_string(segs3))
+        bad = bad + 1
+    } else {
+        println("OK 空闲帧零段 " + tiu_win.report())
+    }
+
+    // 7) 滚轮：悬停在待办区滚动，滚动量与画面都要变
+    var tasks = ui_bridge.node_of_ui(ui.find("tasks"))
+    var tr = tiu_tree.rect(tasks)
+    var fb3 = tiu_win.render(W, H)
+    tiu_app.on_wheel(tr.x + tr.w / 2, tr.y + 20, 3)
+    var off3 = tiu_tree.scroll_of(tasks)
+    var fb4 = tiu_win.render(W, H)
+    // 沿滚动区左侧一列取样比对：滚动一格就要有像素变化（只看单点会落在留白上）。
+    var changed: i64 = 0
+    var yy = tr.y + 4
+    while yy < tr.y + tr.h - 4 {
+        if tiu_win.px(fb3, tr.x + 40, yy) != tiu_win.px(fb4, tr.x + 40, yy) {
+            changed = changed + 1
+        }
+        yy = yy + 7
+    }
+    if off3 <= 0 {
+        println("FAIL 滚轮未改变滚动量 off=" + to_string(off3))
+        bad = bad + 1
+    } else if changed == 0 {
+        println("FAIL 滚动后画面未变化 off=" + to_string(off3))
+        bad = bad + 1
+    } else {
+        println("OK 滚轮滚动 off=" + to_string(off3) + " 变化采样=" + to_string(changed))
+    }
+
+    // 8) 布局诊断：折行细化与网格轨道都不该产生溢出/矛盾
+    var dgn = tiu_layout2.diag_count()
+    if dgn != 0 {
+        println("FAIL 布局诊断 " + to_string(dgn) + " 条 " + tiu_layout2.diag_at(0))
+        bad = bad + 1
+    } else {
+        println("OK 布局无诊断")
+    }
+
+    if bad == 0 {
+        println("board ok")
+    }
+    return bad
+}
+
+func main() -> i64 {
+    if args.has("--check") {
+        return check()
+    }
+    if args.has("--shot") {
+        // 无窗口截图：同一帧循环跑一帧，把像素写成 PNG（文档与视觉回归用）。
+        tiu_win.theme(0)
+        tiu_win.load_font(FONT)
+        tiu_win.load_fallback(FALLBACK)
+        tiu_win.frame(W, H, view)
+        var fb = tiu_win.render(W, H)
+        var path = args.value("--shot")
+        if epng.save(fb, path) {
+            println("shot " + path)
+            return 0
+        }
+        println("FAIL 截图写盘失败 " + path)
+        return 1
+    }
+    var rounds: i64 = 0
+    if args.has("--demo") {
+        rounds = 120
+    }
+    tiu_win.theme(0)
+    tiu_win.load_font(FONT)
+    tiu_win.load_fallback(FALLBACK)
+    return tiu_win_host.run("tiu · 任务看板", W, H, rounds, view)
+}
