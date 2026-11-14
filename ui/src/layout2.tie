@@ -101,6 +101,8 @@ var g_text_wrap: i64 = 0      // 1 = 处于折行细化阶段（content_hug 按�
 var g_lbuf: table<string> = []   // 断行结果：每行子串，按节点区间共享（g_loff / g_lcnt 索引）
 var g_loff: table<i64> = []   // 节点 → 在 g_lbuf 中的起点
 var g_lcnt: table<i64> = []   // 节点 → 行数（0 = 无缓存，光栅走显式换行路径）
+var g_lsig: table<string> = []  // 节点 → 上次断行时的 (文本, 字号, 宽度) 签名（跨帧复用判据）
+var g_wrap_builds: i64 = 0      // 真正做过断行的次数（缓存命中不计；探针与诊断用）
 
 namespace tiu_layout2 {
 
@@ -764,12 +766,37 @@ func wrap_line_end(s: string, from: i64, fs: i64, w: i64) -> i64 {
     return n
 }
 
+// 字符串表按 id 读写（与 tget/twrite 同形，只换元素类型）。
+func swrite(t: ref table<string>, id: i64, v: string) {
+    if id < 0 {
+        return
+    }
+    while len(t) <= id {
+        table_push(t, "")
+    }
+    t[id] = v
+}
+
+func sread(t: table<string>, id: i64) -> string {
+    if id < 0 || id >= len(t) {
+        return ""
+    }
+    return t[id]
+}
+
 // 折行并写缓存；返回行数（空串 1 行；结尾换行补一个空行，与 line_count 一致）。
 // 缓存直接存每行子串（不存字节偏移：str_char 的索引空间与 str_sub_bytes 的字节
 // 空间不保证同一套，逐字符取子串可绕开这个假设）。
 func wrap_build(n: i64, cw: i64) -> i64 {
     var s = tiu_tree.text_of(n)
     var fs = tget(s_font, n)
+    // 跨帧复用：断行只由 (文本, 字号, 宽度) 决定（§6），三者都没变就直接用上次的结果。
+    // 行串存在 g_lbuf 里按区间共享，命中时不重排也不重算，只在缓存膨胀时才整体清空。
+    var sig = s + "|" + to_string(fs) + "|" + to_string(cw)
+    if tget(g_lcnt, n) > 0 && sread(g_lsig, n) == sig {
+        return tget(g_lcnt, n)
+    }
+    g_wrap_builds = g_wrap_builds + 1
     var n1 = str_len(s)
     var off = len(g_lbuf)
     var cnt: i64 = 0
@@ -814,15 +841,38 @@ func wrap_build(n: i64, cw: i64) -> i64 {
     }
     twrite(g_loff, n, off)
     twrite(g_lcnt, n, cnt)
+    swrite(g_lsig, n, sig)
     return cnt
+}
+
+// 清空断行缓存（行串池 + 区间 + 签名一起清）；下一次布局全量重排一次。
+pub func clear_wrap_cache() -> i64 {
+    g_lbuf = table_new_string()
+    g_loff = table_new_i64()
+    g_lcnt = table_new_i64()
+    g_lsig = table_new_string()
+    return 0
+}
+
+// 累计真正断行过的次数（缓存命中不计）。
+pub func wrap_builds() -> i64 {
+    return g_wrap_builds
+}
+
+pub func reset_wrap_builds() -> i64 {
+    g_wrap_builds = 0
+    return 0
 }
 
 // 阶段 4 的一轮：清缓存后**后序**重算 hug（文本按已解析宽度断行，容器随子项更新）。
 // 返回 hug 高是否发生变化的标志（=1 说明要拿新高度再排一次）。
 func refine_heights() -> i64 {
-    g_lbuf = table_new_string()
-    g_loff = table_new_i64()
-    g_lcnt = table_new_i64()
+    // 不走「每轮清缓存」：断行结果按 (文本, 字号, 宽度) 跨帧复用，改文本或改宽度的
+    // 节点签名随之变化，自然重排。只在行串池膨胀到上限时整体清空（清空后下一轮
+    // 全量重排一次，代价有界）。
+    if len(g_lbuf) > 24000 {
+        clear_wrap_cache()
+    }
     var order = tiu_tree.dfs_order()
     var changed: i64 = 0
     var i = len(order) - 1
@@ -2246,11 +2296,19 @@ pub func hug_h(id: i64) -> i64 {
 
 // 折行结果（布局与光栅共用同一份）：行数（0 = 未折行，调用方走显式换行路径）
 pub func wrap_count(id: i64) -> i64 {
+    // 关掉折行（wrap:false / button 等）的节点即使上一次布局留过缓存也不再用它：
+    // 缓存是按 (文本, 字号, 宽度) 复用的，开关变化不在签名里，必须在这里挡住。
+    if wrap_on(id) == 0 {
+        return 0
+    }
     return tget(g_lcnt, id)
 }
 
 // 第 i 行的子串（越界返回空串）
 pub func wrap_line(id: i64, i: i64) -> string {
+    if wrap_on(id) == 0 {
+        return ""
+    }
     var cnt = tget(g_lcnt, id)
     if i < 0 || i >= cnt {
         return ""
