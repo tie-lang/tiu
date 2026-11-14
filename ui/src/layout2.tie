@@ -38,8 +38,7 @@ type tie<class>
 // 与旧路径的关系：layout.tie 是旧求解器，**本文件不引用、不修改它**；
 //   examples\counter.tie 仍走旧路径，两者并行存在直到控件工厂切换。
 //
-// 已知未实现（均在报告里列出）：grid 的跨列 span 与自动流密集填充；
-//   样式表合并（§8）。
+// 已知未实现（均在报告里列出）：样式表合并（§8）；grid 的 hug 列宽不含跨列子项（§3）。
 
 import "./tree.tie"
 import "./props.tie"
@@ -1037,6 +1036,93 @@ func legacy_off(c: i64, axis: i64) -> i64 {
 }
 
 // grid 内容 hug：宽 = Σ列宽 + gap；高 = Σ行高 + gap（行高取行内最高子项）
+// 网格占位（§3 span / dense）：把子项按顺序落到 (行, 列) 网格上，返回占位所需行数。
+// 两张平行表按子项序号写行号与列号——求解与 hug 度量共用同一份占位结果，
+// 否则「所见单元格」与「所算单元格」会漂。写回靠 ref 形参（按值表的写入不可观测）。
+// dense = 0：流式光标前进，跨列子项在行尾放不下就换行（默认）；
+// dense = 1：每项都从左上角重新找第一个放得下的位置，于是小项能填进大项留下的洞。
+func grid_place(n: i64, cnt: i64, cols: i64, dense: i64, ref o_row: table<i64>, ref o_col: table<i64>) -> i64 {
+    var occ = table_new_i64()
+    var rows: i64 = 0
+    var r: i64 = 0
+    var c: i64 = 0
+    var i: i64 = 0
+    while i < cnt {
+        var k = child_at(n, i)
+        var sp = tiu_props.span_of(k)
+        if sp > cols {
+            sp = cols
+        }
+        if sp < 1 {
+            sp = 1
+        }
+        if dense == 1 {
+            r = 0
+            var found: i64 = 0
+            while found == 0 {
+                while len(occ) < (r + 1) * cols {
+                    table_push(occ, 0)
+                }
+                c = 0
+                while c + sp <= cols && found == 0 {
+                    var free: i64 = 1
+                    var j: i64 = 0
+                    while j < sp {
+                        if occ[r * cols + c + j] != 0 {
+                            free = 0
+                        }
+                        j = j + 1
+                    }
+                    if free == 1 {
+                        found = 1
+                    } else {
+                        c = c + 1
+                    }
+                }
+                if found == 0 {
+                    r = r + 1
+                }
+            }
+        } else {
+            if c + sp > cols {
+                r = r + 1
+                c = 0
+            }
+        }
+        if r + 1 > rows {
+            rows = r + 1
+        }
+        while len(occ) < rows * cols {
+            table_push(occ, 0)
+        }
+        var j2: i64 = 0
+        while j2 < sp {
+            occ[r * cols + c + j2] = 1
+            j2 = j2 + 1
+        }
+        table_push(o_row, r)
+        table_push(o_col, c)
+        c = c + sp
+        i = i + 1
+    }
+    return rows
+}
+
+// 单元格占的行号（无占位结果时按旧的行优先序号回退，供老路径调用）。
+func cell_row(o_row: table<i64>, idx: i64, cols: i64) -> i64 {
+    if idx < len(o_row) {
+        return o_row[idx]
+    }
+    return idx / cols
+}
+
+func cell_col(o_col: table<i64>, idx: i64, cols: i64) -> i64 {
+    if idx < len(o_col) {
+        return o_col[idx]
+    }
+    return idx % cols
+}
+
 func grid_content_hug(n: i64, axis: i64) -> i64 {
     var cnt = kid_count(n)
     var rtr = tiu_props.row_count(n)
@@ -1047,7 +1133,9 @@ func grid_content_hug(n: i64, axis: i64) -> i64 {
     if cols <= 0 {
         cols = 1
     }
-    var rows = (cnt + cols - 1) / cols
+    var o_row = table_new_i64()
+    var o_col = table_new_i64()
+    var rows = grid_place(n, cnt, cols, tiu_props.dense_of(n), o_row, o_col)
     if rtr > rows {
         rows = rtr
     }
@@ -1072,18 +1160,20 @@ func grid_content_hug(n: i64, axis: i64) -> i64 {
             } else if kd == K_VH {
                 acc = acc + c_vh(ca)
             } else {
-                // hug / fill / fr / pct 列：列内子项最大 hug
+                // hug / fill / fr / pct 列：列内单格子项最大 hug。
+                // 跨列子项不参与单列 hug——它的宽度由它占的几列合起来给，
+                // 让它去撑单列会把相邻列一起抬宽（§3：span 只影响占位，不影响轨道求解）。
                 var mx: i64 = 0
-                var r: i64 = 0
-                while r < rows {
-                    var k = child_at(n, r * cols + c)
-                    if k >= 0 {
+                var ii: i64 = 0
+                while ii < cnt {
+                    var k = child_at(n, ii)
+                    if cell_col(o_col, ii, cols) == c && tiu_props.span_of(k) == 1 {
                         var hw = child_hug(k, 0)
                         if hw > mx {
                             mx = hw
                         }
                     }
-                    r = r + 1
+                    ii = ii + 1
                 }
                 acc = acc + mx
             }
@@ -1116,16 +1206,16 @@ func grid_content_hug(n: i64, axis: i64) -> i64 {
         } else if rkd == K_VH {
             mh = c_vh(rka)
         } else {
-            var c2: i64 = 0
-            while c2 < cols {
-                var k2 = child_at(n, r2 * cols + c2)
-                if k2 >= 0 {
+            var ii2: i64 = 0
+            while ii2 < cnt {
+                var k2 = child_at(n, ii2)
+                if cell_row(o_row, ii2, cols) == r2 {
                     var hv = child_hug(k2, 1)
                     if hv > mh {
                         mh = hv
                     }
                 }
-                c2 = c2 + 1
+                ii2 = ii2 + 1
             }
         }
         acc = acc + mh
@@ -1621,8 +1711,11 @@ func solve_grid(n: i64) {
     var aw = content_box(n, 0)
     var ah = content_box(n, 1)
     var rows: i64 = 0
+    // 占位（§3 span / dense）：行数由实际落位决定，跨列子项可能提前换行。
+    var o_row = table_new_i64()
+    var o_col = table_new_i64()
     if cnt > 0 {
-        rows = (cnt + cols - 1) / cols
+        rows = grid_place(n, cnt, cols, tiu_props.dense_of(n), o_row, o_col)
     }
     // 显式行轨道（§3 `rows: [48, hug]`）可能比内容所需更多：行数取两者较大者，
     // 多出来的行只有轨道高度、没有子项（站位循环里靠 idx < cnt 跳过）。
@@ -1669,16 +1762,16 @@ func solve_grid(n: i64) {
                 v = c_pct(ca, aw)
             } else {
                 var mx: i64 = 0
-                var r: i64 = 0
-                while r < rows {
-                    var k = child_at(n, r * cols + c)
-                    if k >= 0 {
+                var ii: i64 = 0
+                while ii < cnt {
+                    var k = child_at(n, ii)
+                    if cell_col(o_col, ii, cols) == c && tiu_props.span_of(k) == 1 {
                         var hw = child_hug(k, 0)
                         if hw > mx {
                             mx = hw
                         }
                     }
-                    r = r + 1
+                    ii = ii + 1
                 }
                 v = mx
             }
@@ -1710,7 +1803,6 @@ func solve_grid(n: i64) {
     }
     // --- 2) 行高：显式轨道（§3 `rows: [48, hug]`）优先，缺位按 hug ---
     // hug 行取行内最高子项；fill / fr 行按权重分剩余高度（与列同一套分配）。
-    var rtr = tiu_props.row_count(n)
     var heights = table_new_i64()
     var hwts = table_new_i64()
     var hdef: i64 = 0
@@ -1749,16 +1841,16 @@ func solve_grid(n: i64) {
                 hv2 = c_pct(rka, ah)
             } else {
                 // hug 行：行内最高子项（fill/fr/pct 子项按自身 hug 参与）
-                var c2: i64 = 0
-                while c2 < cols {
-                    var k2 = child_at(n, r2 * cols + c2)
-                    if k2 >= 0 {
+                var ii3: i64 = 0
+                while ii3 < cnt {
+                    var k2 = child_at(n, ii3)
+                    if cell_row(o_row, ii3, cols) == r2 {
                         var kh2 = child_hug(k2, 1)
                         if kh2 > hv2 {
                             hv2 = kh2
                         }
                     }
-                    c2 = c2 + 1
+                    ii3 = ii3 + 1
                 }
             }
             hdef = hdef + hv2
@@ -1817,21 +1909,48 @@ func solve_grid(n: i64) {
     var gxx = dist_gap(tiu_props.dist_x(n), ex_w, cols)
     var offy = dist_off(tiu_props.dist_y(n), ex_h, rows)
     var gyy = dist_gap(tiu_props.dist_y(n), ex_h, rows)
-    // --- 4) 落位：行优先，单元格左上角对齐 ---
-    var idx: i64 = 0
-    var ycur = pad_s(n, 1) + offy
+    // --- 4) 落位：按占位表逐项定位，单元格左上角对齐 ---
+    // 列/行前缀各自累加轨道高与分布余量；跨列子项的宽度 = 它占的几列之和 + 列间距。
+    var xo = table_new_i64()
+    var yo = table_new_i64()
+    var xacc = pad_s(n, 0) + offx
+    c = 0
+    while c < cols {
+        table_push(xo, xacc)
+        xacc = xacc + widths[c] + gap + gxx
+        c = c + 1
+    }
+    var yacc = pad_s(n, 1) + offy
     r2 = 0
     while r2 < rows {
-        var xcur = pad_s(n, 0) + offx
-        var c3: i64 = 0
-        while c3 < cols {
-            if idx < cnt {
-                var k = child_at(n, idx)
-                var cw = widths[c3]
-                var chh = heights[r2]
-                // 约束来源：grid 子项的父给盒就是单元格（% / min / max 的基数）
-                twrite(s_aw, k, cw)
-                twrite(s_ah, k, chh)
+        table_push(yo, yacc)
+        yacc = yacc + heights[r2] + gap + gyy
+        r2 = r2 + 1
+    }
+    var idx: i64 = 0
+    while idx < cnt {
+        var k = child_at(n, idx)
+        var cr = cell_row(o_row, idx, cols)
+        var cc = cell_col(o_col, idx, cols)
+        var sp = tiu_props.span_of(k)
+        if sp > cols {
+            sp = cols
+        }
+        if sp < 1 {
+            sp = 1
+        }
+        var cw = widths[cc]
+        var jj: i64 = 1
+        while jj < sp {
+            cw = cw + gap + gxx + widths[cc + jj]
+            jj = jj + 1
+        }
+        var chh = heights[cr]
+        var xcur = xo[cc]
+        var ycur = yo[cr]
+        // 约束来源：grid 子项的父给盒就是单元格（% / min / max 的基数）
+        twrite(s_aw, k, cw)
+        twrite(s_ah, k, chh)
                 var kw = kind_of(k, 0)
                 var kh = kind_of(k, 1)
                 var sw: i64 = 0
@@ -1871,12 +1990,6 @@ func solve_grid(n: i64) {
                 twrite(s_x, k, tget(s_x, n) + xcur)
                 twrite(s_y, k, tget(s_y, n) + ycur)
                 idx = idx + 1
-                xcur = xcur + cw + gap + gxx
-            }
-            c3 = c3 + 1
-        }
-        ycur = ycur + heights[r2] + gap + gyy
-        r2 = r2 + 1
     }
     var ovx: i64 = 0
     var ovy: i64 = 0

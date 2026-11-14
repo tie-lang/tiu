@@ -252,6 +252,15 @@ func apply_props(uid: i64, node: i64) {
     if s != "" {
         tiu_props.set_wrap(node, aparse.bool_code(s))
     }
+    // 网格跨列数与密集填充（§3）：未声明时保持缺省（span 1、dense 关）。
+    s = ui.attr_of(uid, "span")
+    if s != "" {
+        tiu_props.set_span(node, aparse.len_of(s))
+    }
+    s = ui.attr_of(uid, "dense")
+    if s != "" {
+        tiu_props.set_dense(node, aparse.bool_code(s))
+    }
     s = ui.attr_of(uid, "style")
     if s != "" {
         tiu_props.set_style(node, s)
@@ -392,6 +401,8 @@ func reset_props(node: i64) {
     tiu_props.set_font_size(node, 0)
     tiu_props.set_wrap(node, 0 - 1)
     tiu_props.set_text_align(node, 0)
+    tiu_props.set_span(node, 1)
+    tiu_props.set_dense(node, 0)
     tiu_props.set_style(node, "")
     tiu_props.set_bg(node, 0 - 1)
     tiu_props.set_fg(node, 0 - 1)
