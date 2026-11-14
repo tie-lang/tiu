@@ -3,7 +3,7 @@
 
 **日期** / Date: 2026-10-23 · **类型** / Type: 语法与语义设计（tiu 全量实现的几何契约）
 **依据** / Basis: 下列约束共同定义几何契约——控件工厂为唯一真源、布局语法按显式尺寸意图重设计、文本走 TTF 光栅、允许修改引擎软件内核、事件轴一次到位、`ui/src/app.tie` 承担单帧循环、布局属性类型化 · `docs/designs/tiu-render-engine.md` · `docs/designs/tiu-event-system.md` · `docs/designs/tiu-drawing-api.md`
-**关联实现** / Implementation: `ui/src/layout2.tie` · `ui/src/props.tie` · `ui/src/tree.tie` · `ui/src/paint_bridge.tie` · `ui/src/paint_state.tie` · `ui/src/ui_bridge.tie` · `ui/src/attr_parse.tie` · `ui/src/app.tie` · `ui/src/view.tie` · `engine/src/{font,glyph,raster}.tie` · `api/src/drawlist.tie` · `lib/front/pstmt_ui.tie`（tie 仓）
+**关联实现** / Implementation: `ui/src/layout2.tie` · `ui/src/props.tie` · `ui/src/tree.tie` · `ui/src/paint_bridge.tie` · `ui/src/paint_state.tie` · `ui/src/ui_bridge.tie` · `ui/src/attr_parse.tie` · `ui/src/app.tie` · `ui/src/view.tie` · `ui/src/view_hook.tie` · `engine/src/{font,glyph,raster}.tie` · `api/src/drawlist.tie` · `lib/front/pstmt_ui.tie`（tie 仓）
 
 > EXEC BRIEF: Defines the geometry contract for tiu's UI layer. Three commitments:
 > (1) **one solver** — four containers (`row`/`column`/`grid`/`overlay`) share one size
@@ -304,6 +304,7 @@ ui.end()
 * `text-align` 的 `justify`（两端对齐）不在规划内；当前只有 `start`/`center`/`end`。
 * 断行结果的跨帧缓存：现在每次布局重算一次，尚未按 `(字体, 字号, 宽度, 文本)` 命中复用。
 * `grid` 的 `hug` 列宽只由单格子项决定，跨列子项不参与；若将来要让跨列子项摊派列宽，需先定分摊规则。
+* view 形参的期值由 `tiu_vhook.build_at` / `build_frame` 在整树构建之前写入单元状态（元素体构建期读），跨帧缓存未做——每帧重写一次，量级是形参个数。
 * 动画与布局的关系（变换不触发重排；尺寸动画走后置几何）。
 * CJK 字体：TrueType 轮廓可用系统 `simsun.ttc`/`msyh.ttc`，需 TTC 解析；CFF/OTF 大字库不在范围内。
 * `ch`（字符宽）单位：需要字符度量约定，暂不提供。

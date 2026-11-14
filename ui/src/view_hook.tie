@@ -1,0 +1,82 @@
+type tie<class>
+// view_hook.tie —— 视图单元接线：渲染前钩子 + 形参绑定
+// EN: view-unit wiring — a before-build hook plus typed parameter binding.
+// ============================================================
+// 依据：docs/designs/tiu-layout-syntax.md §2（view 把外部状态映射为界面结构）；
+//   tie 侧实现见 lib/front/pstmt_ui.tie 的 ui_view_unit：view 形参在单元体内
+//   被声明成「从单元状态取值」的局部变量（ui.view_state_*），因此渲染之前必须
+//   有人把宿主状态写进那张表，元素体才看得见当期值。
+// 语义：
+//   - build_at / build_frame 是「渲染前钩子」：先跑 before()，再做整树构建与
+//     布局。顺序是有意义的——元素体在构建期读 ui.view_state_*，若先构建后同步，
+//     这一帧显示的就是上一帧的值。
+//   - before() 里既可以写状态，也可以自己起元素树（ui.begin…ui.end）：钩子跑完
+//     才发射，所以钩子建的树当帧生效。
+//   - bind_* 只是 ui.view_state_set_* 的薄封装，固定视图类别（默认 "view"），
+//     免得每个调用点都重复写类别名。
+// 编译：..\tiec\compiler\tiec.exe --no-cache ui\src\view_hook.tie（探针见 _local_only/probes/view_hook_probe.tie）
+
+import "./ui_bridge.tie"
+import "/std/ui.tie" as ui
+
+namespace tiu_vhook {
+// 视图类别：与 view 声明处的 ui.view_begin(kind, name) 第一参数一致。
+var g_kind: string = "view"
+// 钩子被调用的次数（诊断与探针用；不影响渲染）。
+var g_runs: i64 = 0
+
+// 切换视图类别。返回 0 便于在表达式位置串联。
+pub func kind(k: string) -> i64 {
+    g_kind = k
+    return 0
+}
+
+pub func kind_of() -> string {
+    return g_kind
+}
+
+pub func runs() -> i64 {
+    return g_runs
+}
+
+pub func reset_runs() -> i64 {
+    g_runs = 0
+    return 0
+}
+
+// ---- 形参绑定：写的是「单元状态」，元素体读到的就是这里写进去的值 ----
+
+pub func bind_i64(unit: string, name: string, v: i64) -> i64 {
+    return ui.view_state_set_i64(g_kind, unit, name, v)
+}
+
+pub func bind_bool(unit: string, name: string, v: i64) -> i64 {
+    return ui.view_state_set_bool(g_kind, unit, name, v)
+}
+
+pub func bind_f64(unit: string, name: string, v: f64) -> f64 {
+    return ui.view_state_set_f64(g_kind, unit, name, v)
+}
+
+pub func bind_str(unit: string, name: string, v: string) -> i64 {
+    return ui.view_state_set_str(g_kind, unit, name, v)
+}
+
+pub func bind_strs(unit: string, name: string, v: table<string>) -> i64 {
+    return ui.view_state_set_strs(g_kind, unit, name, v)
+}
+
+// 渲染前钩子（整树重建）。返回根节点 id，空视图 -1。
+pub func build_at(w: i64, h: i64, before: fn() -> i64) -> i64 {
+    g_runs = g_runs + 1
+    before()
+    return ui_bridge.build_at(w, h)
+}
+
+// 渲染前钩子（增量帧）。语义同 build_at，只是保留型树不重置。
+pub func build_frame(w: i64, h: i64, before: fn() -> i64) -> i64 {
+    g_runs = g_runs + 1
+    before()
+    return ui_bridge.build_frame(w, h)
+}
+}
