@@ -164,8 +164,9 @@ pub func view() -> i64 {
             // 末行按 text-align 在内容盒内取右沿。
             @ panel "card0" (style: card, w: fill, gap: 6) {
                 @ label "wrap_s" (text: "文本折行 · soft wrap", font-size: 13, fg: "fg-dim")
-                @ label "wrap_p" (text: "宽度确定后贪心断行：空格之后可断，CJK 与长串在宽度边界硬断，显式换行优先；布局度量与光栅共用同一份断行结果。", w: fill, font-size: 13, fg: "fg")
+                @ label "wrap_p" (text: "贪心断行：空格可断、CJK 按宽度硬断；布局与光栅共用一份结果。", w: fill, font-size: 13, fg: "fg")
                 @ label "align_p" (text: "text-align = end：这一段贴内容盒右沿", w: fill, font-size: 13, fg: "fg-dim", text-align: end)
+                @ label "ell_p" (text: "overflow = ellipsis：单行超宽时截断并补省略号", w: 200, wrap: false, font-size: 13, fg: "fg-dim", overflow: ellipsis)
             }
 
             // 主体：两张卡片
